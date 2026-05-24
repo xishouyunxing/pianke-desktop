@@ -100,6 +100,101 @@ fn token_guard_rejects_wrong_token_and_allows_valid_token() {
 }
 
 #[test]
+fn frontend_compat_endpoints_keep_expected_shape() {
+    let token = "compat-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let a = photos.path().join("BURST_0001.jpg");
+    let b = photos.path().join("BURST_0002.jpg");
+    write_jpg(&a, 45);
+    fs::copy(&a, &b).expect("copy identical jpg");
+
+    let client = Client::new();
+    let capabilities: Value = client
+        .get(format!("{base}/api/capabilities"))
+        .header("X-Token", token)
+        .send()
+        .expect("capabilities response")
+        .json()
+        .expect("capabilities json");
+    assert_eq!(capabilities["face_aware"], false);
+    assert_eq!(capabilities["backend"], "rust-fast");
+    assert_eq!(capabilities["engines"], json!(["fast"]));
+
+    let start_resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start response");
+    assert!(start_resp.status().is_success());
+    wait_for_done(&client, &base, token);
+
+    let confirm: Value = client
+        .post(format!("{base}/api/confirm_prescreen"))
+        .header("X-Token", token)
+        .send()
+        .expect("confirm response")
+        .json()
+        .expect("confirm json");
+    assert_eq!(confirm["async"], true);
+    assert_eq!(confirm["all_paths"].as_array().expect("all_paths").len(), 2);
+
+    let progress: Value = client
+        .get(format!("{base}/api/grouping_progress?since=0"))
+        .header("X-Token", token)
+        .send()
+        .expect("grouping progress response")
+        .json()
+        .expect("grouping progress json");
+    assert_eq!(progress["status"], "done");
+    assert!(progress["groups"].as_array().expect("groups").len() >= 1);
+    assert!(progress["total"].as_u64().expect("total") >= 1);
+    assert!(progress["multi"].as_u64().expect("multi") >= 1);
+    assert!(progress.get("error").is_some());
+
+    let preview: Value = client
+        .get(format!("{base}/api/preview_groups"))
+        .header("X-Token", token)
+        .send()
+        .expect("preview response")
+        .json()
+        .expect("preview json");
+    let first = preview["groups"]
+        .as_array()
+        .expect("preview groups")
+        .first()
+        .expect("preview group")
+        .as_object()
+        .expect("preview group object");
+    for key in [
+        "id",
+        "size",
+        "samples",
+        "best_path",
+        "earliest_dt",
+        "span_seconds",
+    ] {
+        assert!(first.contains_key(key), "missing preview field {key}");
+    }
+
+    let unavailable = client
+        .get(format!("{base}/api/llm_models"))
+        .header("X-Token", token)
+        .send()
+        .expect("unavailable response");
+    assert_eq!(unavailable.status(), 501);
+    let unavailable_json: Value = unavailable.json().expect("unavailable json");
+    assert_eq!(unavailable_json["unavailable"], true);
+    assert!(unavailable_json["error"].as_str().unwrap_or("").len() > 0);
+}
+
+#[test]
 fn fast_main_flow_copies_winner_and_loser_without_moving_sources() {
     let token = "flow-token";
     let (_backend, _handle, base) = start_test_backend(token);
