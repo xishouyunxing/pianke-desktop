@@ -567,6 +567,16 @@ $("folder-input").addEventListener("input", (e) => {
   requestFolderPeek(e.target.value.trim());
 });
 
+window.addEventListener("message", (event) => {
+  const data = event.data || {};
+  if (data.type !== "pianke:set-folder" || typeof data.folder !== "string") return;
+  const folder = data.folder.trim();
+  if (!folder) return;
+  $("folder-input").value = folder;
+  $("start-error").textContent = "";
+  requestFolderPeek(folder);
+});
+
 const dropZone = $("folder-drop");
 ["dragover", "dragenter"].forEach((e) =>
   dropZone.addEventListener(e, (ev) => {

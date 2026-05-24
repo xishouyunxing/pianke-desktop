@@ -1,0 +1,14 @@
+# Fast desktop runtime: small, local-only dependency set.
+#
+# Expert mode remains optional because torch/insightface/pyiqa/transformers
+# add several GB and are fragile for first-time users.
+
+Pillow>=10.0
+imagehash>=4.3
+flask>=3.0
+pillow-heif>=0.16
+numpy>=1.26
+scipy>=1.11
+opencv-contrib-python>=4.9
+rawpy>=0.18
+piexif>=1.1.3

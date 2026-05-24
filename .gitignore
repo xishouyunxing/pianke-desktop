@@ -50,6 +50,15 @@ job-*.log
 *.swp
 *.swo
 
+# ===== Desktop / Node / Rust =====
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/python/
+*.msi
+*.exe
+
 # .claude 里 launch.json 含本机绝对路径，不入库
 .claude/
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -1520,6 +1521,13 @@ def _security_check():
     origin = request.headers.get("Origin", "")
     referer = request.headers.get("Referer", "")
 
+    # Desktop shell / script access: a valid token wins before Origin/Referer
+    # checks, because Tauri pages use their own local asset origin.
+    if SCRIPT_TOKEN:
+        tok = request.headers.get("X-Token") or request.args.get("token") or ""
+        if hmac.compare_digest(tok, SCRIPT_TOKEN):
+            return None
+
     if origin:
         if origin in allowed_origins:
             return None
@@ -1536,11 +1544,6 @@ def _security_check():
         return jsonify({"error": "forbidden referer"}), 403
 
     # 没 Origin / Referer：脚本访问。允许 GET 只读，拒绝修改请求。
-    if SCRIPT_TOKEN:
-        tok = request.headers.get("X-Token") or request.args.get("token")
-        if tok == SCRIPT_TOKEN:
-            return None
-
     if request.method == "GET":
         return None
     return jsonify({"error": "POST 需要浏览器 Origin 或 X-Token"}), 403
@@ -2095,6 +2098,17 @@ def _run_job(folder: str, dry_run: bool, mode: str, wipe_cache: bool,
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/api/desktop/health")
+def api_desktop_health():
+    """轻量健康检查，给 Tauri 桌面壳确认 Flask worker 已经可用。"""
+    return jsonify({
+        "ok": True,
+        "desktop": os.environ.get("PIANKE_DESKTOP") == "1",
+        "token_required": bool(SCRIPT_TOKEN),
+        "state_schema": STATE_SCHEMA,
+    })
 
 
 @app.route("/api/ark_key", methods=["GET"])
