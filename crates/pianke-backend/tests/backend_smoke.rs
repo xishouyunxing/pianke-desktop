@@ -272,14 +272,191 @@ fn fast_main_flow_copies_winner_and_loser_without_moving_sources() {
 }
 
 #[test]
+fn move_mode_moves_files_and_undo_restores_sources() {
+    let token = "move-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let a = photos.path().join("MOVE_0001.jpg");
+    let b = photos.path().join("MOVE_0002.jpg");
+    write_jpg(&a, 35);
+    fs::copy(&a, &b).expect("copy identical jpg");
+
+    let client = Client::new();
+    let start_resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "move",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start response");
+    assert!(start_resp.status().is_success());
+    wait_for_done(&client, &base, token);
+
+    let group_resp: Value = client
+        .get(format!("{base}/api/group"))
+        .header("X-Token", token)
+        .send()
+        .expect("group response")
+        .json()
+        .expect("group json");
+    let left = group_resp["group"]["left"]
+        .as_str()
+        .expect("left path")
+        .to_string();
+    let right = group_resp["group"]["right"]
+        .as_str()
+        .expect("right path")
+        .to_string();
+
+    let choose_resp = client
+        .post(format!("{base}/api/choose"))
+        .header("X-Token", token)
+        .json(&json!({"loser": "right"}))
+        .send()
+        .expect("choose response");
+    assert!(choose_resp.status().is_success());
+
+    assert!(!PathBuf::from(&left).exists(), "winner source was moved");
+    assert!(!PathBuf::from(&right).exists(), "loser source was moved");
+    assert!(photos
+        .path()
+        .join("winners")
+        .join(file_name(&left))
+        .exists());
+    assert!(photos
+        .path()
+        .join("losers")
+        .join(file_name(&right))
+        .exists());
+
+    let undo_resp: Value = client
+        .post(format!("{base}/api/undo"))
+        .header("X-Token", token)
+        .send()
+        .expect("undo response")
+        .json()
+        .expect("undo json");
+    assert_eq!(undo_resp["done"], false);
+    assert!(PathBuf::from(&left).exists(), "undo restores winner source");
+    assert!(PathBuf::from(&right).exists(), "undo restores loser source");
+    assert!(
+        !photos
+            .path()
+            .join("winners")
+            .join(file_name(&left))
+            .exists(),
+        "undo removes winner target"
+    );
+    assert!(
+        !photos
+            .path()
+            .join("losers")
+            .join(file_name(&right))
+            .exists(),
+        "undo removes loser target"
+    );
+}
+
+#[test]
+fn move_mode_reopen_group_restores_sources() {
+    let token = "reopen-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let a = photos.path().join("REOPEN_0001.jpg");
+    let b = photos.path().join("REOPEN_0002.jpg");
+    write_jpg(&a, 55);
+    fs::copy(&a, &b).expect("copy identical jpg");
+
+    let client = Client::new();
+    let start_resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "move",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start response");
+    assert!(start_resp.status().is_success());
+    wait_for_done(&client, &base, token);
+
+    let group_resp: Value = client
+        .get(format!("{base}/api/group"))
+        .header("X-Token", token)
+        .send()
+        .expect("group response")
+        .json()
+        .expect("group json");
+    let group_id = group_resp["group"]["id"]
+        .as_str()
+        .expect("group id")
+        .to_string();
+    let left = group_resp["group"]["left"]
+        .as_str()
+        .expect("left path")
+        .to_string();
+    let right = group_resp["group"]["right"]
+        .as_str()
+        .expect("right path")
+        .to_string();
+
+    let choose_resp = client
+        .post(format!("{base}/api/choose"))
+        .header("X-Token", token)
+        .json(&json!({"loser": "right"}))
+        .send()
+        .expect("choose response");
+    assert!(choose_resp.status().is_success());
+    assert!(!PathBuf::from(&left).exists());
+    assert!(!PathBuf::from(&right).exists());
+
+    let reopen: Value = client
+        .post(format!("{base}/api/reopen_group"))
+        .header("X-Token", token)
+        .json(&json!({"group_id": group_id}))
+        .send()
+        .expect("reopen response")
+        .json()
+        .expect("reopen json");
+    assert_eq!(reopen["ok"], true);
+    assert_eq!(reopen["failed"].as_array().expect("failed").len(), 0);
+    assert!(
+        PathBuf::from(&left).exists(),
+        "reopen restores winner source"
+    );
+    assert!(
+        PathBuf::from(&right).exists(),
+        "reopen restores loser source"
+    );
+    assert!(!photos
+        .path()
+        .join("winners")
+        .join(file_name(&left))
+        .exists());
+    assert!(!photos
+        .path()
+        .join("losers")
+        .join(file_name(&right))
+        .exists());
+}
+
+#[test]
 fn raw_with_jpg_companion_is_copied_together() {
     let token = "raw-token";
     let (_backend, _handle, base) = start_test_backend(token);
     let photos = tempfile::tempdir().expect("photos dir");
     let raw = photos.path().join("PAIR_0001.CR2");
     let jpg = photos.path().join("PAIR_0001.JPG");
+    let xmp = photos.path().join("PAIR_0001.XMP");
     fs::write(&raw, b"fake raw primary").expect("write raw");
     write_jpg(&jpg, 90);
+    fs::write(&xmp, b"<xmpmeta />").expect("write xmp");
 
     let client = Client::new();
     let resp = client
@@ -298,8 +475,57 @@ fn raw_with_jpg_companion_is_copied_together() {
 
     assert!(raw.exists(), "copy mode keeps raw primary");
     assert!(jpg.exists(), "copy mode keeps jpg companion");
+    assert!(xmp.exists(), "copy mode keeps xmp companion");
     assert!(photos.path().join("winners").join("PAIR_0001.CR2").exists());
     assert!(photos.path().join("winners").join("PAIR_0001.JPG").exists());
+    assert!(photos.path().join("winners").join("PAIR_0001.XMP").exists());
+}
+
+#[test]
+fn move_mode_moves_raw_jpg_xmp_companions_together() {
+    let token = "raw-move-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let raw = photos.path().join("MOVEPAIR_0001.CR2");
+    let jpg = photos.path().join("MOVEPAIR_0001.JPG");
+    let xmp = photos.path().join("MOVEPAIR_0001.XMP");
+    fs::write(&raw, b"fake raw primary").expect("write raw");
+    write_jpg(&jpg, 110);
+    fs::write(&xmp, b"<xmpmeta />").expect("write xmp");
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "move",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start response");
+    assert!(resp.status().is_success());
+    wait_for_done(&client, &base, token);
+
+    assert!(!raw.exists(), "move mode moves raw primary");
+    assert!(!jpg.exists(), "move mode moves jpg companion");
+    assert!(!xmp.exists(), "move mode moves xmp companion");
+    assert!(photos
+        .path()
+        .join("winners")
+        .join("MOVEPAIR_0001.CR2")
+        .exists());
+    assert!(photos
+        .path()
+        .join("winners")
+        .join("MOVEPAIR_0001.JPG")
+        .exists());
+    assert!(photos
+        .path()
+        .join("winners")
+        .join("MOVEPAIR_0001.XMP")
+        .exists());
 }
 
 fn file_name(path: &str) -> String {

@@ -39,6 +39,7 @@ const RAW_EXTS: &[&str] = &[
     ".pef", ".rwl", ".srw", ".x3f",
 ];
 const UNSUPPORTED_IMAGE_EXTS: &[&str] = &[".heic", ".heif"];
+const SIDECAR_EXTS: &[&str] = &[".xmp"];
 
 #[derive(Debug)]
 pub struct ServerOptions {
@@ -478,10 +479,10 @@ async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> 
             "Rust Fast 后端第一轮仅支持 fast 模式",
         );
     }
-    if req.mode != "copy" {
+    if req.mode != "copy" && req.mode != "move" {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "Rust Fast 后端第一轮仅支持 copy 模式",
+            "Rust Fast 后端仅支持 copy / move 模式",
         );
     }
     let folder = PathBuf::from(&req.folder);
@@ -712,11 +713,17 @@ fn scan_folder(folder: &Path) -> Vec<ScanPair> {
             .filter(|p| UNSUPPORTED_IMAGE_EXTS.contains(&ext_lower(p).as_str()))
             .cloned()
             .collect::<Vec<_>>();
+        let sidecars = files
+            .iter()
+            .filter(|p| SIDECAR_EXTS.contains(&ext_lower(p).as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
         if let Some(primary) = raws.first().cloned() {
             let companions = raws
                 .iter()
                 .skip(1)
                 .chain(images.iter())
+                .chain(sidecars.iter())
                 .cloned()
                 .collect::<Vec<_>>();
             out.push(ScanPair {
@@ -727,7 +734,12 @@ fn scan_folder(folder: &Path) -> Vec<ScanPair> {
         } else if let Some(primary) = images.first().cloned() {
             out.push(ScanPair {
                 primary: primary.clone(),
-                companions: images.iter().skip(1).cloned().collect(),
+                companions: images
+                    .iter()
+                    .skip(1)
+                    .chain(sidecars.iter())
+                    .cloned()
+                    .collect(),
                 analysis: Some(primary),
             });
         } else if let Some(primary) = unsupported.first().cloned() {
@@ -760,6 +772,7 @@ fn scan_dir(root: &Path, dir: &Path, groups: &mut HashMap<(PathBuf, String), Vec
         if !IMAGE_EXTS.contains(&ext.as_str())
             && !RAW_EXTS.contains(&ext.as_str())
             && !UNSUPPORTED_IMAGE_EXTS.contains(&ext.as_str())
+            && !SIDECAR_EXTS.contains(&ext.as_str())
         {
             continue;
         }
@@ -1154,6 +1167,7 @@ async fn undo(State(ctx): State<AppCtx>) -> Response {
     };
     if let Some(entry) = session.undo_stack.pop() {
         if entry.group_index < session.groups.len() {
+            let _ = revert_group_files(session, entry.group_index);
             session.groups[entry.group_index] = entry.group;
             session.current_group = entry.group_index;
         }
@@ -1185,13 +1199,14 @@ async fn reopen_group(State(ctx): State<AppCtx>, Json(req): Json<ReopenRequest>)
     let Some(session) = state.session.as_mut() else {
         return json_error(StatusCode::BAD_REQUEST, "没有会话");
     };
+    let mut failed = Vec::new();
     if let Some(idx) = session.groups.iter().position(|g| g.id == req.group_id) {
-        let images = session.groups[idx].images.clone();
-        session.groups[idx] = GroupState::new(images);
+        failed = revert_group_files(session, idx);
+        reset_group_for_reopen(&mut session.groups[idx]);
         session.current_group = idx;
     }
     let _ = save_state(session);
-    Json(json!({"ok": true, "failed": []})).into_response()
+    Json(json!({"ok": true, "failed": failed})).into_response()
 }
 
 fn mutate_current_group<F>(ctx: AppCtx, f: F) -> Response
@@ -1404,6 +1419,7 @@ fn apply_group(session: &mut SessionState, idx: usize) -> Result<(), String> {
         return Ok(());
     }
     if session.dry_run {
+        session.groups[idx].applied = true;
         return Ok(());
     }
     let folder = PathBuf::from(&session.folder);
@@ -1411,26 +1427,59 @@ fn apply_group(session: &mut SessionState, idx: usize) -> Result<(), String> {
     let lose_dir = folder.join("losers");
     fs::create_dir_all(&win_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&lose_dir).map_err(|e| e.to_string())?;
+    let mode = session.mode.clone();
     let group = &mut session.groups[idx];
     let mut failed = false;
-    if let Some(winner) = &group.winner {
-        if copy_with_companions(winner, &win_dir, session.companions.get(winner)).is_err() {
-            failed = true;
+    if let Some(winner) = group.winner.clone() {
+        match transfer_with_companions(&winner, &win_dir, session.companions.get(&winner), &mode) {
+            Ok(result) => {
+                record_transfer(group, &winner, "winner", &result);
+                if mode == "move" {
+                    group.winner = Some(result.main_target);
+                }
+            }
+            Err(_) => failed = true,
         }
     }
-    for winner in &group.extra_winners {
-        if copy_with_companions(winner, &win_dir, session.companions.get(winner)).is_err() {
-            failed = true;
+    let mut new_extra_winners = Vec::with_capacity(group.extra_winners.len());
+    for winner in group.extra_winners.clone() {
+        match transfer_with_companions(&winner, &win_dir, session.companions.get(&winner), &mode) {
+            Ok(result) => {
+                record_transfer(group, &winner, "winner", &result);
+                if mode == "move" {
+                    new_extra_winners.push(result.main_target);
+                } else {
+                    new_extra_winners.push(winner);
+                }
+            }
+            Err(_) => {
+                failed = true;
+                new_extra_winners.push(winner);
+            }
         }
     }
-    for loser in &group.losers {
-        if copy_with_companions(loser, &lose_dir, session.companions.get(loser)).is_err() {
-            failed = true;
+    group.extra_winners = new_extra_winners;
+    let mut new_losers = Vec::with_capacity(group.losers.len());
+    for loser in group.losers.clone() {
+        match transfer_with_companions(&loser, &lose_dir, session.companions.get(&loser), &mode) {
+            Ok(result) => {
+                record_transfer(group, &loser, "loser", &result);
+                if mode == "move" {
+                    new_losers.push(result.main_target);
+                } else {
+                    new_losers.push(loser);
+                }
+            }
+            Err(_) => {
+                failed = true;
+                new_losers.push(loser);
+            }
         }
     }
+    group.losers = new_losers;
     group.applied = true;
     if failed {
-        return Err("部分文件复制失败".to_string());
+        return Err("部分文件处理失败".to_string());
     }
     Ok(())
 }
@@ -1444,11 +1493,18 @@ fn apply_finished_groups(session: &mut SessionState) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_with_companions(
+#[derive(Debug)]
+struct TransferResult {
+    main_target: String,
+    companion_pairs: Vec<(String, String)>,
+}
+
+fn transfer_with_companions(
     src: &str,
     target_dir: &Path,
     companions: Option<&Vec<String>>,
-) -> Result<(), String> {
+    mode: &str,
+) -> Result<TransferResult, String> {
     let main_target = unique_target(
         target_dir,
         Path::new(src)
@@ -1456,12 +1512,13 @@ fn copy_with_companions(
             .and_then(|s| s.to_str())
             .unwrap_or("image"),
     );
-    fs::copy(src, &main_target).map_err(|e| e.to_string())?;
+    transfer_one(src, &main_target, mode)?;
     let stem = main_target
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("image")
         .to_string();
+    let mut companion_pairs = Vec::new();
     for comp in companions.into_iter().flatten() {
         let suffix = Path::new(comp)
             .extension()
@@ -1473,9 +1530,95 @@ fn copy_with_companions(
             format!("{stem}.{suffix}")
         };
         let target = unique_target(target_dir, &name);
-        let _ = fs::copy(comp, target);
+        if transfer_one(comp, &target, mode).is_ok() {
+            companion_pairs.push((comp.clone(), target.to_string_lossy().to_string()));
+        }
     }
-    Ok(())
+    Ok(TransferResult {
+        main_target: main_target.to_string_lossy().to_string(),
+        companion_pairs,
+    })
+}
+
+fn transfer_one(src: &str, target: &Path, mode: &str) -> Result<(), String> {
+    if mode == "move" {
+        fs::rename(src, target).map_err(|e| e.to_string())
+    } else {
+        fs::copy(src, target).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+fn record_transfer(group: &mut GroupState, src: &str, kind: &str, result: &TransferResult) {
+    group
+        .move_log
+        .push(json!({"src": src, "dst": result.main_target, "kind": kind}));
+    let companion_kind = format!("{kind}_companion");
+    for (comp_src, comp_dst) in &result.companion_pairs {
+        group
+            .move_log
+            .push(json!({"src": comp_src, "dst": comp_dst, "kind": companion_kind}));
+    }
+}
+
+fn revert_group_files(session: &mut SessionState, idx: usize) -> Vec<Value> {
+    if idx >= session.groups.len() || session.groups[idx].move_log.is_empty() {
+        return Vec::new();
+    }
+    let mode = session.mode.clone();
+    let root = PathBuf::from(&session.folder);
+    let mut failed = Vec::new();
+    for entry in session.groups[idx].move_log.clone() {
+        let src = entry.get("src").and_then(|v| v.as_str()).unwrap_or("");
+        let dst = entry.get("dst").and_then(|v| v.as_str()).unwrap_or("");
+        if dst.is_empty() {
+            continue;
+        }
+        let dst_path = PathBuf::from(dst);
+        if !dst_path.exists() {
+            failed.push(json!({"path": dst, "reason": "target missing"}));
+            continue;
+        }
+        if mode == "copy" {
+            if let Err(err) = fs::remove_file(&dst_path) {
+                failed.push(json!({"path": dst, "reason": err.to_string()}));
+            }
+            continue;
+        }
+        let mut restore_target = if src.is_empty() {
+            root.join(
+                dst_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image"),
+            )
+        } else {
+            PathBuf::from(src)
+        };
+        if restore_target.exists() {
+            let name = restore_target
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image")
+                .to_string();
+            restore_target = unique_target(restore_target.parent().unwrap_or(&root), &name);
+        }
+        if let Err(err) = fs::rename(&dst_path, &restore_target) {
+            failed.push(json!({"path": dst, "reason": err.to_string()}));
+        }
+    }
+    session.groups[idx].move_log.clear();
+    failed
+}
+
+fn reset_group_for_reopen(group: &mut GroupState) {
+    group.winner = None;
+    group.extra_winners.clear();
+    group.losers.clear();
+    group.applied = false;
+    group.finished = false;
+    group.left = group.images.first().cloned();
+    group.right = group.images.get(1).cloned();
+    group.pending = group.images.iter().skip(2).cloned().collect();
 }
 
 fn unique_target(folder: &Path, name: &str) -> PathBuf {
