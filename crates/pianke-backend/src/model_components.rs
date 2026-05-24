@@ -1,12 +1,14 @@
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
 const MANIFEST_FILENAME: &str = "component.json";
+const INSTALL_STATE_FILENAME: &str = "install_state.json";
 
 #[derive(Debug, Clone)]
 pub struct ModelManager {
@@ -55,7 +57,7 @@ impl ModelManager {
         engines
     }
 
-    pub fn install_unavailable(
+    pub async fn install(
         &self,
         req: ComponentInstallRequest,
     ) -> Result<(StatusCode, Value), (StatusCode, Value)> {
@@ -68,25 +70,34 @@ impl ModelManager {
                 }),
             ));
         };
-        let component = self.view_for(def);
-        Ok((
-            StatusCode::NOT_IMPLEMENTED,
-            json!({
-                "error": "Rust model component downloader is not implemented yet",
-                "unavailable": true,
-                "component": component,
-                "cache_dir": self.cache_dir.to_string_lossy()
-            }),
-        ))
+        match self.install_component(def, req).await {
+            Ok(component) => Ok((
+                StatusCode::OK,
+                json!({
+                    "ok": true,
+                    "component": component,
+                    "cache_dir": self.cache_dir.to_string_lossy()
+                }),
+            )),
+            Err(err) => Err(err),
+        }
     }
 
     fn view_for(&self, def: ComponentDef) -> ComponentView {
         let install_dir = self.cache_dir.join(def.id);
         let manifest_path = install_dir.join(MANIFEST_FILENAME);
         let manifest = read_manifest(&manifest_path);
+        let install_state = read_install_state(&install_dir.join(INSTALL_STATE_FILENAME));
         let status = match &manifest {
-            Some(manifest) if manifest.id == def.id && manifest.version == def.version => {
+            Some(manifest)
+                if manifest.id == def.id
+                    && manifest.version == def.version
+                    && manifest.checksum_status.as_deref() == Some("verified") =>
+            {
                 "installed"
+            }
+            Some(manifest) if manifest.id == def.id && manifest.version == def.version => {
+                "unverified"
             }
             Some(_) => "version_mismatch",
             None => "not_installed",
@@ -104,13 +115,145 @@ impl ModelManager {
             download_required: status != "installed",
             install_dir: install_dir.to_string_lossy().to_string(),
             manifest,
+            install_state,
         }
+    }
+
+    async fn install_component(
+        &self,
+        def: ComponentDef,
+        req: ComponentInstallRequest,
+    ) -> Result<ComponentView, (StatusCode, Value)> {
+        let source = match InstallSource::from_request(&req) {
+            Some(source) => source,
+            None => {
+                return Err((
+                    StatusCode::PRECONDITION_REQUIRED,
+                    json!({
+                        "error": "缺少 Expert 模型组件 manifest_url、manifest_path 或 source_dir。基础包不会内置大模型，需要先配置组件清单。",
+                        "component": self.view_for(def),
+                        "manual_supported": true,
+                        "cache_dir": self.cache_dir.to_string_lossy()
+                    }),
+                ));
+            }
+        };
+
+        let install_dir = self.cache_dir.join(def.id);
+        let temp_dir = self.cache_dir.join(format!("{}.installing", def.id));
+        let state_path = install_dir.join(INSTALL_STATE_FILENAME);
+        if let Err(err) = fs::create_dir_all(&install_dir) {
+            return Err(server_error(format!("create component dir failed: {err}")));
+        }
+        write_install_state(
+            &state_path,
+            &InstallState::running(def.id, "reading_manifest", 0, 1),
+        )
+        .map_err(server_error)?;
+
+        let loaded = load_manifest(source).await.map_err(server_error)?;
+        let mut manifest = loaded.manifest;
+        if manifest.id != def.id {
+            return Err(bad_request(format!(
+                "manifest id mismatch: expected {}, got {}",
+                def.id, manifest.id
+            )));
+        }
+        if manifest.runtime != def.runtime {
+            return Err(bad_request(format!(
+                "runtime mismatch: expected {}, got {}",
+                def.runtime, manifest.runtime
+            )));
+        }
+        if manifest.version != def.version {
+            return Err(bad_request(format!(
+                "version mismatch: expected {}, got {}",
+                def.version, manifest.version
+            )));
+        }
+
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir).map_err(|e| {
+                server_error(format!("remove stale temp component dir failed: {e}"))
+            })?;
+        }
+        fs::create_dir_all(&temp_dir)
+            .map_err(|e| server_error(format!("create temp component dir failed: {e}")))?;
+
+        let total = manifest.files.len().max(1);
+        for (idx, file) in manifest.files.iter().enumerate() {
+            let rel = safe_relative_path(&file.path)
+                .ok_or_else(|| bad_request(format!("unsafe model file path: {}", file.path)))?;
+            let target = temp_dir.join(&rel);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| server_error(format!("create model subdir failed: {e}")))?;
+            }
+            let label = rel.to_string_lossy().to_string();
+            write_install_state(
+                &state_path,
+                &InstallState::running(def.id, &label, idx, total),
+            )
+            .map_err(server_error)?;
+            let bytes = load_component_file(file, loaded.base_dir.as_deref())
+                .await
+                .map_err(server_error)?;
+            if let Some(expected_size) = file.size_bytes {
+                if expected_size != bytes.len() as u64 {
+                    return Err(bad_request(format!(
+                        "size mismatch for {}: expected {}, got {}",
+                        file.path,
+                        expected_size,
+                        bytes.len()
+                    )));
+                }
+            }
+            if let Some(expected_hash) = &file.sha256 {
+                let actual = sha256_hex(&bytes);
+                if !actual.eq_ignore_ascii_case(expected_hash) {
+                    return Err(bad_request(format!(
+                        "sha256 mismatch for {}: expected {}, got {}",
+                        file.path, expected_hash, actual
+                    )));
+                }
+            }
+            fs::write(&target, bytes)
+                .map_err(|e| server_error(format!("write model file failed: {e}")))?;
+        }
+
+        manifest.installed_at = Some(chrono_like_timestamp());
+        manifest.checksum_status = Some("verified".to_string());
+        fs::write(
+            temp_dir.join(MANIFEST_FILENAME),
+            serde_json::to_vec_pretty(&manifest)
+                .map_err(|e| server_error(format!("serialize manifest failed: {e}")))?,
+        )
+        .map_err(|e| server_error(format!("write manifest failed: {e}")))?;
+
+        if install_dir.exists() {
+            fs::remove_dir_all(&install_dir)
+                .map_err(|e| server_error(format!("remove old component failed: {e}")))?;
+        }
+        fs::rename(&temp_dir, &install_dir)
+            .map_err(|e| server_error(format!("activate component failed: {e}")))?;
+        write_install_state(
+            &install_dir.join(INSTALL_STATE_FILENAME),
+            &InstallState::done(def.id, total),
+        )
+        .map_err(server_error)?;
+        Ok(self.view_for(def))
     }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ComponentInstallRequest {
     pub id: String,
+    #[serde(default)]
+    pub manifest_url: Option<String>,
+    #[serde(default)]
+    pub manifest_path: Option<String>,
+    #[serde(default)]
+    pub source_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,9 +275,57 @@ pub struct ComponentManifest {
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
+    pub files: Vec<ComponentFile>,
+    #[serde(default)]
     pub installed_at: Option<String>,
     #[serde(default)]
     pub checksum_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentFile {
+    pub path: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallState {
+    pub id: String,
+    pub status: String,
+    pub done: usize,
+    pub total: usize,
+    pub current: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl InstallState {
+    fn running(id: &str, current: &str, done: usize, total: usize) -> Self {
+        Self {
+            id: id.to_string(),
+            status: "running".to_string(),
+            done,
+            total,
+            current: current.to_string(),
+            error: None,
+        }
+    }
+
+    fn done(id: &str, total: usize) -> Self {
+        Self {
+            id: id.to_string(),
+            status: "done".to_string(),
+            done: total,
+            total,
+            current: String::new(),
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +342,8 @@ pub struct ComponentView {
     pub install_dir: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<ComponentManifest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_state: Option<InstallState>,
 }
 
 fn component_catalog() -> Vec<ComponentDef> {
@@ -176,6 +369,202 @@ fn read_manifest(path: &Path) -> Option<ComponentManifest> {
     serde_json::from_str(&text).ok()
 }
 
+fn read_install_state(path: &Path) -> Option<InstallState> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_install_state(path: &Path, state: &InstallState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let data = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
+    fs::write(path, data).map_err(|e| e.to_string())
+}
+
+enum InstallSource {
+    SourceDir(PathBuf),
+    ManifestPath(PathBuf),
+    ManifestUrl(String),
+}
+
+impl InstallSource {
+    fn from_request(req: &ComponentInstallRequest) -> Option<Self> {
+        req.source_dir
+            .as_ref()
+            .map(|p| Self::SourceDir(PathBuf::from(p)))
+            .or_else(|| {
+                req.manifest_path
+                    .as_ref()
+                    .map(|p| Self::ManifestPath(PathBuf::from(p)))
+            })
+            .or_else(|| {
+                req.manifest_url
+                    .as_ref()
+                    .map(|u| Self::ManifestUrl(u.clone()))
+            })
+            .or_else(|| Self::from_environment(&req.id))
+    }
+
+    fn from_environment(id: &str) -> Option<Self> {
+        let prefix = id.to_ascii_uppercase().replace('-', "_");
+        env::var(format!("PIANKE_{prefix}_SOURCE_DIR"))
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|p| Self::SourceDir(PathBuf::from(p)))
+            .or_else(|| {
+                env::var(format!("PIANKE_{prefix}_MANIFEST_PATH"))
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|p| Self::ManifestPath(PathBuf::from(p)))
+            })
+            .or_else(|| {
+                env::var(format!("PIANKE_{prefix}_MANIFEST_URL"))
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(Self::ManifestUrl)
+            })
+    }
+}
+
+struct LoadedManifest {
+    manifest: ComponentManifest,
+    base_dir: Option<PathBuf>,
+}
+
+async fn load_manifest(source: InstallSource) -> Result<LoadedManifest, String> {
+    match source {
+        InstallSource::SourceDir(dir) => {
+            let manifest_path = dir.join(MANIFEST_FILENAME);
+            let manifest = read_manifest_required(&manifest_path)?;
+            Ok(LoadedManifest {
+                manifest,
+                base_dir: Some(dir),
+            })
+        }
+        InstallSource::ManifestPath(path) => {
+            let manifest = read_manifest_required(&path)?;
+            Ok(LoadedManifest {
+                manifest,
+                base_dir: path.parent().map(Path::to_path_buf),
+            })
+        }
+        InstallSource::ManifestUrl(url) if url.starts_with("file://") => {
+            let path = file_url_to_path(&url);
+            let manifest = read_manifest_required(&path)?;
+            Ok(LoadedManifest {
+                manifest,
+                base_dir: path.parent().map(Path::to_path_buf),
+            })
+        }
+        InstallSource::ManifestUrl(url) => {
+            let text = reqwest::get(&url)
+                .await
+                .map_err(|e| format!("download manifest failed: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("download manifest failed: {e}"))?
+                .text()
+                .await
+                .map_err(|e| format!("read manifest body failed: {e}"))?;
+            let manifest =
+                serde_json::from_str(&text).map_err(|e| format!("parse manifest failed: {e}"))?;
+            Ok(LoadedManifest {
+                manifest,
+                base_dir: None,
+            })
+        }
+    }
+}
+
+fn read_manifest_required(path: &Path) -> Result<ComponentManifest, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("read manifest failed: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse manifest failed: {e}"))
+}
+
+async fn load_component_file(
+    file: &ComponentFile,
+    base_dir: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    if let Some(url) = &file.url {
+        if url.starts_with("file://") {
+            let path = file_url_to_path(url);
+            return fs::read(path).map_err(|e| format!("read component file failed: {e}"));
+        }
+        return reqwest::get(url)
+            .await
+            .map_err(|e| format!("download component file failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("download component file failed: {e}"))?
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("read component file body failed: {e}"));
+    }
+    let Some(base_dir) = base_dir else {
+        return Err(format!("component file {} has no url", file.path));
+    };
+    let rel = safe_relative_path(&file.path)
+        .ok_or_else(|| format!("unsafe model file path: {}", file.path))?;
+    fs::read(base_dir.join(rel)).map_err(|e| format!("read component file failed: {e}"))
+}
+
+fn file_url_to_path(url: &str) -> PathBuf {
+    let mut path = url.trim_start_matches("file://").to_string();
+    if cfg!(windows)
+        && path.starts_with('/')
+        && path.len() > 3
+        && path.as_bytes().get(2) == Some(&b':')
+    {
+        path.remove(0);
+    }
+    PathBuf::from(path.replace("%20", " "))
+}
+
+fn safe_relative_path(path: &str) -> Option<PathBuf> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            _ => return None,
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn server_error(message: String) -> (StatusCode, Value) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({"error": message, "unavailable": false}),
+    )
+}
+
+fn bad_request(message: String) -> (StatusCode, Value) {
+    (
+        StatusCode::BAD_REQUEST,
+        json!({"error": message, "unavailable": false}),
+    )
+}
+
+fn chrono_like_timestamp() -> String {
+    // Keep the component module independent from chrono; seconds are enough for diagnostics.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    format!("unix:{now}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,7 +585,7 @@ mod tests {
         fs::create_dir_all(&install_dir).expect("install dir");
         fs::write(
             install_dir.join(MANIFEST_FILENAME),
-            r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small"]}"#,
+            r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small"],"checksum_status":"verified"}"#,
         )
         .expect("manifest");
 
@@ -208,5 +597,88 @@ mod tests {
             .expect("expert component");
         assert_eq!(expert.status, "installed");
         assert!(!expert.download_required);
+    }
+
+    #[tokio::test]
+    async fn installs_component_from_source_dir_and_verifies_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("models")).expect("source models dir");
+        let model_bytes = b"tiny fake onnx model";
+        fs::write(source.join("models").join("dinov2.onnx"), model_bytes).expect("model file");
+        fs::write(
+            source.join(MANIFEST_FILENAME),
+            format!(
+                r#"{{
+                    "id":"expert",
+                    "version":"onnx-v1",
+                    "runtime":"onnxruntime",
+                    "models":["dinov2-small"],
+                    "files":[{{"path":"models/dinov2.onnx","sha256":"{}","size_bytes":{}}}]
+                }}"#,
+                sha256_hex(model_bytes),
+                model_bytes.len()
+            ),
+        )
+        .expect("manifest");
+
+        let manager = ModelManager::new(temp.path().join("models"));
+        let (status, body) = manager
+            .install(ComponentInstallRequest {
+                id: "expert".to_string(),
+                source_dir: Some(source.to_string_lossy().to_string()),
+                manifest_path: None,
+                manifest_url: None,
+            })
+            .await
+            .expect("install component");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        let expert = manager
+            .list()
+            .into_iter()
+            .find(|c| c.id == "expert")
+            .expect("expert component");
+        assert_eq!(expert.status, "installed");
+        assert_eq!(
+            expert.manifest.as_ref().unwrap().checksum_status.as_deref(),
+            Some("verified")
+        );
+        assert!(Path::new(&expert.install_dir)
+            .join("models")
+            .join("dinov2.onnx")
+            .exists());
+        assert!(manager.available_engines().contains(&"expert".to_string()));
+    }
+
+    #[tokio::test]
+    async fn install_rejects_bad_checksum() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("models")).expect("source models dir");
+        fs::write(source.join("models").join("bad.onnx"), b"actual").expect("model file");
+        fs::write(
+            source.join(MANIFEST_FILENAME),
+            r#"{
+                "id":"expert",
+                "version":"onnx-v1",
+                "runtime":"onnxruntime",
+                "models":["dinov2-small"],
+                "files":[{"path":"models/bad.onnx","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]
+            }"#,
+        )
+        .expect("manifest");
+
+        let manager = ModelManager::new(temp.path().join("models"));
+        let err = manager
+            .install(ComponentInstallRequest {
+                id: "expert".to_string(),
+                source_dir: Some(source.to_string_lossy().to_string()),
+                manifest_path: None,
+                manifest_url: None,
+            })
+            .await
+            .expect_err("checksum mismatch");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 }

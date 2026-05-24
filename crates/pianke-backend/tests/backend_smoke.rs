@@ -198,9 +198,9 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         .json(&json!({"id": "expert"}))
         .send()
         .expect("install response");
-    assert_eq!(install_resp.status(), 501);
+    assert_eq!(install_resp.status(), 428);
     let install_json: Value = install_resp.json().expect("install json");
-    assert_eq!(install_json["unavailable"], true);
+    assert_eq!(install_json["manual_supported"], true);
     assert_eq!(install_json["component"]["id"], "expert");
 
     let unknown_install = client
@@ -390,6 +390,62 @@ fn installed_model_manifest_updates_capabilities() {
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
     assert_eq!(capabilities["engines"], json!(["expert", "fast", "tycoon"]));
+}
+
+#[test]
+fn model_component_install_from_source_dir_updates_capabilities() {
+    let token = "model-install-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let source = tempfile::tempdir().expect("source component dir");
+    fs::create_dir_all(source.path().join("models")).expect("models dir");
+    let model_path = source.path().join("models").join("dinov2.onnx");
+    fs::write(&model_path, b"fake onnx bytes").expect("model bytes");
+    fs::write(
+        source.path().join("component.json"),
+        r#"{
+            "id":"expert",
+            "version":"onnx-v1",
+            "runtime":"onnxruntime",
+            "models":["dinov2-small"],
+            "files":[{"path":"models/dinov2.onnx","size_bytes":15}]
+        }"#,
+    )
+    .expect("component manifest");
+
+    let client = Client::new();
+    let install: Value = client
+        .post(format!("{base}/api/model_components/install"))
+        .header("X-Token", token)
+        .json(&json!({
+            "id": "expert",
+            "source_dir": source.path()
+        }))
+        .send()
+        .expect("install response")
+        .json()
+        .expect("install json");
+    assert_eq!(install["ok"], true);
+    assert_eq!(install["component"]["status"], "installed");
+    assert_eq!(
+        install["component"]["manifest"]["checksum_status"],
+        "verified"
+    );
+    let install_dir = PathBuf::from(
+        install["component"]["install_dir"]
+            .as_str()
+            .expect("install dir"),
+    );
+    assert!(install_dir.join("models").join("dinov2.onnx").exists());
+
+    let capabilities: Value = client
+        .get(format!("{base}/api/capabilities"))
+        .header("X-Token", token)
+        .send()
+        .expect("capabilities response")
+        .json()
+        .expect("capabilities json");
+    assert_eq!(capabilities["expert_installed"], true);
+    assert_eq!(capabilities["model_components"]["expert"], "installed");
 }
 
 #[test]

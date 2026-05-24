@@ -394,6 +394,7 @@ fn build_router(ctx: AppCtx) -> Router {
         .route("/api/desktop/health", get(health))
         .route("/api/capabilities", get(capabilities))
         .route("/api/model_components", get(model_components))
+        .route("/api/model_components/status", get(model_components))
         .route(
             "/api/model_components/install",
             post(model_component_install),
@@ -543,7 +544,7 @@ async fn model_component_install(
     State(ctx): State<AppCtx>,
     Json(req): Json<ComponentInstallRequest>,
 ) -> impl IntoResponse {
-    match ctx.models.install_unavailable(req) {
+    match ctx.models.install(req).await {
         Ok((status, body)) | Err((status, body)) => (status, Json(body)),
     }
 }
