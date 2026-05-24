@@ -120,6 +120,38 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(capabilities["face_aware"], false);
     assert_eq!(capabilities["backend"], "rust-fast");
     assert_eq!(capabilities["engines"], json!(["fast"]));
+    assert_eq!(capabilities["watermark"], false);
+    assert_eq!(capabilities["expert_installed"], false);
+    assert_eq!(capabilities["tycoon_ready"], false);
+    assert_eq!(capabilities["python_required"], false);
+
+    let components: Value = client
+        .get(format!("{base}/api/model_components"))
+        .header("X-Token", token)
+        .send()
+        .expect("model components response")
+        .json()
+        .expect("model components json");
+    let components_list = components["components"]
+        .as_array()
+        .expect("components list");
+    assert_eq!(components_list.len(), 2);
+    assert!(components_list
+        .iter()
+        .any(|c| c["id"] == "expert" && c["status"] == "not_installed"));
+    assert!(components_list
+        .iter()
+        .any(|c| c["id"] == "tycoon" && c["status"] == "not_installed"));
+
+    let install_resp = client
+        .post(format!("{base}/api/model_components/install"))
+        .header("X-Token", token)
+        .json(&json!({"id": "expert"}))
+        .send()
+        .expect("install response");
+    assert_eq!(install_resp.status(), 501);
+    let install_json: Value = install_resp.json().expect("install json");
+    assert_eq!(install_json["unavailable"], true);
 
     let start_resp = client
         .post(format!("{base}/api/start"))

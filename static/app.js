@@ -301,8 +301,12 @@ document.querySelectorAll('input[name="engine"]').forEach(el => {
 // 整个 .engine-opt 块都可点击切换（不只点 radio）
 document.querySelectorAll(".engine-opt").forEach(el => {
   el.addEventListener("click", () => {
+    if (el.dataset.unavailable === "1") {
+      toast("该模式需要先安装 Rust 增强组件");
+      return;
+    }
     const radio = el.querySelector('input[type="radio"]');
-    if (radio && !radio.checked) {
+    if (radio && !radio.disabled && !radio.checked) {
       radio.checked = true;
       syncEngineSwitch();
     }
@@ -508,21 +512,63 @@ if (llmRefreshBtn) {
 
 syncEngineSwitch();
 
-// 后端没装 insightface → 把人脸感知开关锁死置灰
+let backendCapabilities = null;
+
+function applyBackendCapabilities(cap) {
+  backendCapabilities = cap || {};
+  const rustFast = !!(cap && (cap.rust_fast || cap.backend === "rust-fast"));
+  const engines = Array.isArray(cap?.engines) ? cap.engines : null;
+  if (rustFast && engines) {
+    document.querySelectorAll(".engine-opt").forEach((el) => {
+      const engine = el.dataset.engine;
+      const radio = el.querySelector('input[type="radio"]');
+      const available = engines.includes(engine);
+      el.classList.toggle("is-disabled", !available);
+      el.dataset.unavailable = available ? "" : "1";
+      if (radio) {
+        radio.disabled = !available;
+        if (!available && radio.checked) {
+          const fast = document.querySelector('input[name="engine"][value="fast"]');
+          if (fast) fast.checked = true;
+        }
+      }
+      const desc = el.querySelector(".engine-desc");
+      if (!available && desc) {
+        desc.dataset.originalText = desc.dataset.originalText || desc.textContent;
+        desc.textContent = "Rust版基础包暂未安装该增强组件，Fast模式可直接使用";
+      } else if (available && desc?.dataset.originalText) {
+        desc.textContent = desc.dataset.originalText;
+      }
+    });
+    syncEngineSwitch();
+  }
+
+  const faceOpt = $("opt-face-aware");
+  if (faceOpt && !cap?.face_aware) {
+    faceOpt.checked = false;
+    faceOpt.disabled = true;
+    faceOpt.dataset.unsupported = "1";
+    const label = faceOpt.parentElement?.querySelector("span");
+    if (label) {
+      label.textContent = rustFast
+        ? "人脸感知（需安装 Rust Expert 模型组件）"
+        : "人脸感知（未安装 insightface）";
+    }
+    faceOpt.parentElement?.classList.add("is-disabled");
+  }
+
+  const wmBtn = document.getElementById("btn-watermark");
+  if (wmBtn && rustFast && !cap?.watermark) {
+    wmBtn.disabled = true;
+    wmBtn.title = "Rust版水印模块迁移中";
+  }
+}
+
+// Backend capability probe: Rust base package exposes Fast now; AI engines are optional components.
 (async () => {
   try {
     const cap = await fetchJSON("/api/capabilities");
-    if (!cap.face_aware) {
-      const faceOpt = $("opt-face-aware");
-      if (faceOpt) {
-        faceOpt.checked = false;
-        faceOpt.disabled = true;
-        faceOpt.dataset.unsupported = "1";
-        const label = faceOpt.parentElement?.querySelector("span");
-        if (label) label.textContent = "人脸感知（未安装 insightface，请 pip install insightface onnxruntime）";
-        faceOpt.parentElement?.classList.add("is-disabled");
-      }
-    }
+    applyBackendCapabilities(cap);
   } catch {}
 })();
 
@@ -624,6 +670,12 @@ async function handleStart(e) {
   const wipe_cache = true;
   const mode = document.querySelector('input[name="mode"]:checked')?.value || "copy";
   const engine = currentEngine();
+  if (backendCapabilities?.backend === "rust-fast" && Array.isArray(backendCapabilities.engines)
+      && !backendCapabilities.engines.includes(engine)) {
+    $("start-error").textContent = "该模式需要先安装 Rust 增强组件";
+    setStatus("增强组件未安装", "error");
+    return;
+  }
   const prescreen_enabled = $("opt-prescreen").checked;
   const prescreen_strength = document.querySelector('input[name="prescreen-strength"]:checked')?.value || "standard";
   // 极速模式后端会强制忽略 face_aware，这里也明确传 false 避免歧义

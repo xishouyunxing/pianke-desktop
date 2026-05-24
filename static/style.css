@@ -3066,6 +3066,15 @@ body:has(#view-processing.active) .status-badge {
   box-shadow: var(--shadow-sm);
 }
 .engine-opt:hover { background: var(--bg-card-hover); }
+.engine-opt.is-disabled {
+  cursor: not-allowed;
+  opacity: .58;
+  background: rgba(255,255,255,.55);
+}
+.engine-opt.is-disabled:hover {
+  background: rgba(255,255,255,.55);
+  transform: none;
+}
 .engine-opt input[type="radio"] {
   position: absolute;
   opacity: 0; pointer-events: none;

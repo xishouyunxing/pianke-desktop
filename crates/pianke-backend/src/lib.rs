@@ -360,6 +360,11 @@ fn build_router(ctx: AppCtx) -> Router {
         .route("/static/*path", get(static_file))
         .route("/api/desktop/health", get(health))
         .route("/api/capabilities", get(capabilities))
+        .route("/api/model_components", get(model_components))
+        .route(
+            "/api/model_components/install",
+            post(model_component_install),
+        )
         .route("/api/start", post(start_job))
         .route("/api/reset_session", post(reset_session))
         .route("/api/cancel_job", post(cancel_job))
@@ -461,8 +466,56 @@ async fn capabilities() -> impl IntoResponse {
         "face_aware": false,
         "engines": ["fast"],
         "backend": "rust-fast",
-        "rust_fast": true
+        "rust_fast": true,
+        "watermark": false,
+        "expert_installed": false,
+        "tycoon_ready": false,
+        "model_components": {
+            "expert": "not_installed",
+            "tycoon": "not_installed"
+        },
+        "install_mode": "base",
+        "python_required": false
     }))
+}
+
+async fn model_components() -> impl IntoResponse {
+    Json(json!({
+        "components": [
+            {
+                "id": "expert",
+                "label": "Expert local models",
+                "status": "not_installed",
+                "estimated_size_mb": 850,
+                "engines": ["expert"],
+                "models": ["dinov2-small", "insightface-buffalo_l", "nima", "musiq", "clipiqa+"],
+                "runtime": "onnxruntime",
+                "download_required": true
+            },
+            {
+                "id": "tycoon",
+                "label": "Tycoon local grouping models",
+                "status": "not_installed",
+                "estimated_size_mb": 400,
+                "engines": ["tycoon"],
+                "models": ["dinov2-small", "insightface-buffalo_l"],
+                "runtime": "onnxruntime+reqwest",
+                "download_required": true
+            }
+        ],
+        "cache_dir": null,
+        "backend": "rust-fast"
+    }))
+}
+
+async fn model_component_install() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "Rust model component installer is not implemented yet",
+            "unavailable": true
+        })),
+    )
 }
 
 async fn unavailable() -> impl IntoResponse {
