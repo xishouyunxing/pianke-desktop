@@ -102,7 +102,7 @@ fn token_guard_rejects_wrong_token_and_allows_valid_token() {
 #[test]
 fn frontend_compat_endpoints_keep_expected_shape() {
     let token = "compat-token";
-    let (_backend, _handle, base) = start_test_backend(token);
+    let (backend, _handle, base) = start_test_backend(token);
     let photos = tempfile::tempdir().expect("photos dir");
     let a = photos.path().join("BURST_0001.jpg");
     let b = photos.path().join("BURST_0002.jpg");
@@ -119,7 +119,7 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         .expect("capabilities json");
     assert_eq!(capabilities["face_aware"], false);
     assert_eq!(capabilities["backend"], "rust-fast");
-    assert_eq!(capabilities["engines"], json!(["fast"]));
+    assert_eq!(capabilities["engines"], json!(["fast", "tycoon"]));
     assert_eq!(capabilities["watermark"], false);
     assert_eq!(capabilities["expert_installed"], false);
     assert_eq!(capabilities["tycoon_ready"], false);
@@ -135,13 +135,11 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     let components_list = components["components"]
         .as_array()
         .expect("components list");
-    assert_eq!(components_list.len(), 2);
+    assert_eq!(components_list.len(), 1);
     assert!(components_list
         .iter()
         .any(|c| c["id"] == "expert" && c["status"] == "not_installed"));
-    assert!(components_list
-        .iter()
-        .any(|c| c["id"] == "tycoon" && c["status"] == "not_installed"));
+    assert!(components_list.iter().all(|c| c["id"] != "tycoon"));
     assert!(components["cache_dir"]
         .as_str()
         .expect("cache dir")
@@ -228,15 +226,82 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         assert!(first.contains_key(key), "missing preview field {key}");
     }
 
-    let unavailable = client
+    let provider: Value = client
+        .get(format!("{base}/api/llm/provider"))
+        .header("X-Token", token)
+        .send()
+        .expect("provider response")
+        .json()
+        .expect("provider json");
+    assert_eq!(provider["configured"], false);
+    assert_eq!(provider["key_configured"], false);
+    assert!(provider["protocols"]
+        .as_array()
+        .expect("protocols")
+        .contains(&json!("openai_chat_completions")));
+
+    let models_without_provider = client
         .get(format!("{base}/api/llm_models"))
         .header("X-Token", token)
         .send()
-        .expect("unavailable response");
-    assert_eq!(unavailable.status(), 501);
-    let unavailable_json: Value = unavailable.json().expect("unavailable json");
-    assert_eq!(unavailable_json["unavailable"], true);
-    assert!(unavailable_json["error"].as_str().unwrap_or("").len() > 0);
+        .expect("models response");
+    assert_eq!(models_without_provider.status(), 428);
+    let models_json: Value = models_without_provider.json().expect("models json");
+    assert_eq!(models_json["manual_supported"], true);
+
+    let save_provider: Value = client
+        .post(format!("{base}/api/llm/provider"))
+        .header("X-Token", token)
+        .json(&json!({
+            "protocol": "openai_chat_completions",
+            "base_url": "https://api.example.com/v1",
+            "api_key": "secret-key",
+            "model": "vision-model",
+            "display_name": "Example AI"
+        }))
+        .send()
+        .expect("save provider response")
+        .json()
+        .expect("save provider json");
+    assert_eq!(save_provider["configured"], true);
+    assert_eq!(save_provider["config"]["api_key_ref"], "local_secret");
+    assert!(
+        !fs::read_to_string(backend.path().join("llm_provider").join("provider.json"))
+            .expect("provider config")
+            .contains("secret-key")
+    );
+
+    let ark_status: Value = client
+        .get(format!("{base}/api/ark_key"))
+        .header("X-Token", token)
+        .send()
+        .expect("ark alias response")
+        .json()
+        .expect("ark alias json");
+    assert_eq!(ark_status["deprecated"], true);
+    assert_eq!(ark_status["configured"], true);
+
+    let tycoon_capabilities: Value = client
+        .get(format!("{base}/api/capabilities"))
+        .header("X-Token", token)
+        .send()
+        .expect("tycoon capabilities response")
+        .json()
+        .expect("tycoon capabilities json");
+    assert_eq!(tycoon_capabilities["tycoon_ready"], true);
+
+    let tycoon_start = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "tycoon",
+            "llm_model": "vision-model"
+        }))
+        .send()
+        .expect("tycoon start response");
+    assert_eq!(tycoon_start.status(), 501);
 }
 
 #[test]
@@ -262,7 +327,7 @@ fn installed_model_manifest_updates_capabilities() {
     assert_eq!(capabilities["expert_installed"], true);
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
-    assert_eq!(capabilities["engines"], json!(["expert", "fast"]));
+    assert_eq!(capabilities["engines"], json!(["expert", "fast", "tycoon"]));
 }
 
 #[test]

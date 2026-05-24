@@ -47,7 +47,7 @@
           <label class="engine-opt engine-opt-tycoon" data-engine="tycoon">
             <input type="radio" name="engine" value="tycoon">
             <span class="engine-title">土豪模式 ¥</span>
-            <span class="engine-desc">火山引擎大模型直接判定 · 每张图 1-3 秒 + Token 费用</span>
+            <span class="engine-desc">兼容 OpenAI / Anthropic 的视觉大模型判定 · 使用你配置的 AI 服务商</span>
           </label>
         </div>
         <div id="tycoon-model-picker" class="tycoon-model-picker" hidden>
@@ -59,26 +59,33 @@
           <!-- 录入 Key 的展开区（默认折叠） -->
           <div class="tycoon-key-edit" id="tycoon-key-edit" hidden>
             <div class="tycoon-row">
-              <input type="password" id="tycoon-key-input" placeholder="粘贴火山引擎 API Key（仅本机存储）" autocomplete="off" spellcheck="false">
-              <button type="button" id="tycoon-key-save" class="btn btn-primary btn-small">验证并保存</button>
+              <select id="llm-protocol-select" name="llm_protocol">
+                <option value="openai_chat_completions">OpenAI Chat Compatible</option>
+                <option value="openai_responses">OpenAI Responses</option>
+                <option value="anthropic_messages">Anthropic Messages</option>
+              </select>
+              <input type="text" id="llm-base-url-input" placeholder="Base URL，例如 https://api.openai.com/v1" autocomplete="off" spellcheck="false">
+              <input type="text" id="llm-model-input" placeholder="Model ID，例如 gpt-4.1-mini" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="tycoon-row">
+              <input type="password" id="tycoon-key-input" placeholder="粘贴 AI 服务商 API Key（仅本机存储）" autocomplete="off" spellcheck="false">
+              <button type="button" id="tycoon-key-save" class="btn btn-primary btn-small">测试并保存</button>
               <button type="button" id="tycoon-key-cancel" class="btn-ghost btn-small">取消</button>
               <button type="button" id="tycoon-key-clear" class="btn-ghost btn-small btn-danger" hidden>清除</button>
             </div>
             <p class="tycoon-hint">
-              没有 Key？前往
-              <a href="https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey" target="_blank" rel="noopener">火山引擎 Ark 控制台</a>
-              申请，开通"豆包·视觉" Seed 系列模型权限后复制粘贴。Key 保存在本地 <code>~/.config/pic_selecter/ark_key</code>（权限 0600）。
+              支持 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages，以及实现这些协议的兼容服务。Key 只保存在本机。
             </p>
           </div>
           <!-- 模型选择 -->
-          <label class="field-label" for="llm-model-select">选择视觉模型</label>
+          <label class="field-label" for="llm-model-select">可选：拉取模型列表</label>
           <div class="tycoon-row">
             <select id="llm-model-select" name="llm_model">
-              <option value="">加载中...</option>
+              <option value="">也可以直接手填 Model ID</option>
             </select>
             <button type="button" id="llm-model-refresh" class="btn-ghost btn-small" title="重新拉取模型列表">↻</button>
           </div>
-          <p class="tycoon-hint" id="tycoon-hint">图片会上传至火山引擎服务器，按 token 计费。Key 保存在本地 <code>~/.config/pic_selecter/ark_key</code>（仅你可读）。</p>
+          <p class="tycoon-hint" id="tycoon-hint">图片会发送到你配置的 AI 服务商，费用、隐私与可用模型取决于该服务商。</p>
         </div>
         <label class="field-label" for="folder-input">照片文件夹</label>
         <div class="field-row" id="folder-drop">

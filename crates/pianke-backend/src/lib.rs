@@ -32,6 +32,9 @@ use uuid::Uuid;
 mod model_components;
 use model_components::{ComponentInstallRequest, ModelManager};
 
+mod llm_provider;
+use llm_provider::{LlmProviderManager, SaveProviderRequest};
+
 const STATE_FILENAME: &str = ".pic_selecter_state.json";
 const PIC_DIR: &str = "_pic_selecter";
 const THUMB_MAX: u32 = 1600;
@@ -82,6 +85,7 @@ struct AppCtx {
     token: Option<String>,
     backend_dir: PathBuf,
     models: ModelManager,
+    llm: LlmProviderManager,
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +297,8 @@ struct StartRequest {
     prescreen_enabled: bool,
     #[serde(default = "default_standard")]
     prescreen_strength: String,
+    #[serde(default)]
+    llm_model: Option<String>,
     #[serde(default = "default_threshold_near")]
     threshold_near: i32,
     #[serde(default = "default_threshold_far")]
@@ -335,6 +341,7 @@ pub fn start(options: ServerOptions) -> Result<ServerHandle, String> {
         inner: Arc::new(Mutex::new(AppState::default())),
         token: options.token,
         models: ModelManager::new(options.backend_dir.join("model_components")),
+        llm: LlmProviderManager::new(options.backend_dir.join("llm_provider")),
         backend_dir: options.backend_dir,
     };
     let app = build_router(ctx);
@@ -370,6 +377,14 @@ fn build_router(ctx: AppCtx) -> Router {
             "/api/model_components/install",
             post(model_component_install),
         )
+        .route(
+            "/api/llm/provider",
+            get(llm_provider_status)
+                .post(llm_provider_save)
+                .delete(llm_provider_clear),
+        )
+        .route("/api/llm/models", get(llm_models))
+        .route("/api/llm/test", post(llm_test))
         .route("/api/start", post(start_job))
         .route("/api/reset_session", post(reset_session))
         .route("/api/cancel_job", post(cancel_job))
@@ -396,11 +411,13 @@ fn build_router(ctx: AppCtx) -> Router {
         .route("/api/browse_folder", post(unavailable))
         .route(
             "/api/ark_key",
-            get(unavailable).post(unavailable).delete(unavailable),
+            get(ark_key_status)
+                .post(ark_key_save_compat)
+                .delete(ark_key_clear),
         )
-        .route("/api/llm_models", get(unavailable))
+        .route("/api/llm_models", get(llm_models))
         .route("/api/job_log", get(unavailable))
-        .route("/api/llm_concurrency", get(unavailable))
+        .route("/api/llm_concurrency", get(llm_concurrency))
         .route("/api/watermark/templates", get(unavailable))
         .route("/api/watermark/preview", post(unavailable))
         .route("/api/watermark/start", post(unavailable))
@@ -468,16 +485,26 @@ async fn health() -> impl IntoResponse {
 
 async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
     let expert_installed = ctx.models.is_installed("expert");
-    let tycoon_ready = ctx.models.is_installed("tycoon");
+    let llm_status = ctx.llm.provider_status();
+    let tycoon_ready = llm_status.configured;
+    let mut engines = ctx.models.available_engines();
+    engines.push("tycoon".to_string());
+    engines.sort();
+    engines.dedup();
     Json(json!({
         "face_aware": false,
-        "engines": ctx.models.available_engines(),
+        "engines": engines,
         "backend": "rust-fast",
         "rust_fast": true,
         "watermark": false,
         "expert_installed": expert_installed,
         "tycoon_ready": tycoon_ready,
         "model_components": ctx.models.status_map(),
+        "llm_provider": {
+            "configured": llm_status.configured,
+            "key_configured": llm_status.key_configured,
+            "protocols": llm_status.protocols
+        },
         "install_mode": "base",
         "python_required": false
     }))
@@ -500,6 +527,79 @@ async fn model_component_install(
     }
 }
 
+async fn llm_provider_status(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    Json(json!(ctx.llm.provider_status()))
+}
+
+async fn llm_provider_save(
+    State(ctx): State<AppCtx>,
+    Json(req): Json<SaveProviderRequest>,
+) -> impl IntoResponse {
+    match ctx.llm.save_provider(req) {
+        Ok(status) => (StatusCode::OK, Json(json!(status))),
+        Err(err) => err.into_json(),
+    }
+}
+
+async fn llm_provider_clear(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    match ctx.llm.clear_provider() {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+        Err(err) => err.into_json(),
+    }
+}
+
+async fn llm_models(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    match ctx.llm.list_models().await {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err(err) => err.into_json(),
+    }
+}
+
+async fn llm_test(
+    State(ctx): State<AppCtx>,
+    Json(req): Json<Option<SaveProviderRequest>>,
+) -> impl IntoResponse {
+    match ctx.llm.test_provider(req).await {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err(err) => err.into_json(),
+    }
+}
+
+async fn ark_key_status(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    let status = ctx.llm.provider_status();
+    Json(json!({
+        "configured": status.key_configured,
+        "source": if status.key_configured { json!("file") } else { Value::Null },
+        "masked": if status.key_configured { json!("***") } else { Value::Null },
+        "deprecated": true,
+        "provider": status
+    }))
+}
+
+async fn ark_key_save_compat() -> impl IntoResponse {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "Rust 版已改用通用 AI 服务商配置，请使用 /api/llm/provider",
+            "deprecated": true
+        })),
+    )
+}
+
+async fn ark_key_clear(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    llm_provider_clear(State(ctx)).await
+}
+
+async fn llm_concurrency(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    let status = ctx.llm.provider_status();
+    let limit = status
+        .config
+        .as_ref()
+        .map(|c| c.max_concurrency)
+        .unwrap_or(0);
+    Json(json!({"limit": limit}))
+}
+
 async fn unavailable() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -508,6 +608,17 @@ async fn unavailable() -> impl IntoResponse {
 }
 
 async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> Response {
+    if req.engine == "tycoon" {
+        match ctx.llm.require_tycoon_ready(req.llm_model.as_deref()) {
+            Ok(_) => {
+                return json_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "Rust Tycoon 已支持通用 AI 服务商配置，但远程判图任务流尚未接入",
+                );
+            }
+            Err(err) => return json_error(err.status, &err.message),
+        }
+    }
     if req.engine != "fast" {
         return json_error(
             StatusCode::BAD_REQUEST,

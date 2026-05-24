@@ -154,32 +154,21 @@ pub struct ComponentView {
 }
 
 fn component_catalog() -> Vec<ComponentDef> {
-    vec![
-        ComponentDef {
-            id: "expert",
-            label: "Expert local models",
-            version: "onnx-v1",
-            estimated_size_mb: 850,
-            engines: &["expert"],
-            models: &[
-                "dinov2-small",
-                "insightface-buffalo_l",
-                "nima",
-                "musiq",
-                "clipiqa+",
-            ],
-            runtime: "onnxruntime",
-        },
-        ComponentDef {
-            id: "tycoon",
-            label: "Tycoon local grouping models",
-            version: "onnx-v1",
-            estimated_size_mb: 400,
-            engines: &["tycoon"],
-            models: &["dinov2-small", "insightface-buffalo_l"],
-            runtime: "onnxruntime+reqwest",
-        },
-    ]
+    vec![ComponentDef {
+        id: "expert",
+        label: "Expert local models",
+        version: "onnx-v1",
+        estimated_size_mb: 850,
+        engines: &["expert"],
+        models: &[
+            "dinov2-small",
+            "insightface-buffalo_l",
+            "nima",
+            "musiq",
+            "clipiqa+",
+        ],
+        runtime: "onnxruntime",
+    }]
 }
 
 fn read_manifest(path: &Path) -> Option<ComponentManifest> {
@@ -196,7 +185,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let manager = ModelManager::new(temp.path().join("models"));
         let components = manager.list();
-        assert_eq!(components.len(), 2);
+        assert_eq!(components.len(), 1);
         assert!(components.iter().all(|c| c.status == "not_installed"));
     }
 

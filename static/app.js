@@ -313,42 +313,64 @@ document.querySelectorAll(".engine-opt").forEach(el => {
   });
 });
 
-// ---------- 土豪模式模型选择 + API Key 管理 ----------
+// ---------- 土豪模式：通用 AI Provider + 模型选择 ----------
 let llmModelsLoaded = false;
-let arkKeyConfigured = false;
+let llmProviderConfigured = false;
 
 function syncTycoonPicker(engine) {
   const picker = $("tycoon-model-picker");
   if (!picker) return;
   if (engine === "tycoon") {
     picker.hidden = false;
-    refreshArkKeyStatus();  // 每次切到土豪都查一遍 key 状态
+    refreshLlmProviderStatus();
   } else {
     picker.hidden = true;
   }
 }
 
-async function refreshArkKeyStatus() {
+function collectLlmProviderForm() {
+  return {
+    protocol: $("llm-protocol-select")?.value || "openai_chat_completions",
+    base_url: ($("llm-base-url-input")?.value || "").trim(),
+    api_key: ($("tycoon-key-input")?.value || "").trim(),
+    model: ($("llm-model-input")?.value || "").trim(),
+    display_name: "AI Provider",
+    max_concurrency: 4,
+    timeout_seconds: 45,
+  };
+}
+
+function fillLlmProviderForm(config) {
+  if (!config) return;
+  if ($("llm-protocol-select")) $("llm-protocol-select").value = config.protocol || "openai_chat_completions";
+  if ($("llm-base-url-input")) $("llm-base-url-input").value = config.base_url || "";
+  if ($("llm-model-input")) $("llm-model-input").value = config.model || "";
+  if (config.model) localStorage.setItem("pic_selecter.llm_model", config.model);
+}
+
+async function refreshLlmProviderStatus() {
   const badge = $("tycoon-key-badge");
   const btn = $("tycoon-key-btn");
   const select = $("llm-model-select");
   if (!badge) return;
   try {
-    const r = await fetch("/api/ark_key");
-    const data = await r.json();
-    arkKeyConfigured = !!data.configured;
+    const r = await fetchJSON("/api/llm/provider");
+    const data = r || {};
+    llmProviderConfigured = !!data.configured;
+    fillLlmProviderForm(data.config);
     if (data.configured) {
-      const src = data.source === "env" ? "环境变量" : "本地存储";
-      badge.innerHTML = `<span class="tycoon-key-ok">●</span> Key 已配置 <span class="tycoon-key-mask">${data.masked || ""}</span> <span class="tycoon-key-src">${src}</span>`;
-      btn.textContent = "修改";
-      // 自动加载模型
+      badge.innerHTML = `<span class="tycoon-key-ok">●</span> AI 服务商已配置 <span class="tycoon-key-mask">${data.config?.model || ""}</span>`;
+      btn.textContent = "修改配置";
       if (!llmModelsLoaded) loadLlmModels();
+    } else if (data.key_configured) {
+      badge.innerHTML = `<span class="tycoon-key-warn">●</span> Key 已保存，但协议/Base URL/模型未配置完整`;
+      btn.textContent = "继续配置";
     } else {
-      badge.innerHTML = `<span class="tycoon-key-warn">●</span> 未配置 API Key`;
-      btn.textContent = "设置 Key";
+      badge.innerHTML = `<span class="tycoon-key-warn">●</span> 未配置 AI 服务商`;
+      btn.textContent = "配置 AI 服务商";
       llmModelsLoaded = false;
       if (select) {
-        select.innerHTML = '<option value="">请先配置 API Key</option>';
+        select.innerHTML = '<option value="">也可以直接手填 Model ID</option>';
       }
     }
   } catch (e) {
@@ -356,45 +378,47 @@ async function refreshArkKeyStatus() {
   }
 }
 
-async function saveArkKey() {
+async function saveLlmProvider() {
   const input = $("tycoon-key-input");
   const saveBtn = $("tycoon-key-save");
-  const key = (input?.value || "").trim();
-  if (!key) {
+  const form = collectLlmProviderForm();
+  if (!form.base_url) { setStatus("请填写 AI 服务商 Base URL", "error"); return; }
+  if (!form.model) { setStatus("请填写模型 ID", "error"); return; }
+  if (!form.api_key && !llmProviderConfigured) {
     setStatus("请粘贴 API Key", "error");
     input?.focus();
     return;
   }
-  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = "验证中..."; }
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = "测试中..."; }
   try {
-    const r = await fetch("/api/ark_key", {
+    await fetchJSON("/api/llm/test", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key }),
+      body: JSON.stringify(form),
     });
-    const data = await r.json();
-    if (!r.ok || !data.ok) {
-      throw new Error(data.error || "验证失败");
-    }
-    // 成功：关闭录入面板、清空输入、刷新状态
+    const saved = await fetchJSON("/api/llm/provider", {
+      method: "POST",
+      body: JSON.stringify(form),
+    });
     if (input) input.value = "";
     $("tycoon-key-edit").hidden = true;
     llmModelsLoaded = false;
-    await refreshArkKeyStatus();
-    setStatus(`✓ Key 已保存（${data.model_count} 个模型可用）`, "idle");
+    llmProviderConfigured = !!saved.configured;
+    await refreshLlmProviderStatus();
+    setStatus("✓ AI 服务商已测试并保存", "idle");
   } catch (e) {
     setStatus(`× ${e.message}`, "error");
   } finally {
-    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = "验证并保存"; }
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = "测试并保存"; }
   }
 }
 
-async function clearArkKey() {
-  if (!confirm("清除 API Key？\n\n本地存储的 key 会被删掉，需要重新输入才能用土豪模式。")) return;
+async function clearLlmProvider() {
+  if (!confirm("清除 AI 服务商配置？\n\n本地保存的 Key 和 provider 配置都会被删除。")) return;
   try {
-    await fetch("/api/ark_key", { method: "DELETE" });
+    await fetchJSON("/api/llm/provider", { method: "DELETE" });
     llmModelsLoaded = false;
-    await refreshArkKeyStatus();
+    llmProviderConfigured = false;
+    await refreshLlmProviderStatus();
   } catch (e) {
     setStatus(`清除失败：${e.message}`, "error");
   }
@@ -409,13 +433,13 @@ if (keyBtn) {
       edit.hidden = !edit.hidden;
       // 已配置时显示"清除"按钮
       const clearBtn = $("tycoon-key-clear");
-      if (clearBtn) clearBtn.hidden = !arkKeyConfigured;
-      if (!edit.hidden) $("tycoon-key-input")?.focus();
+      if (clearBtn) clearBtn.hidden = !llmProviderConfigured;
+      if (!edit.hidden) $("llm-base-url-input")?.focus();
     }
   });
 }
 const keySaveBtn = document.getElementById("tycoon-key-save");
-if (keySaveBtn) keySaveBtn.addEventListener("click", saveArkKey);
+if (keySaveBtn) keySaveBtn.addEventListener("click", saveLlmProvider);
 const keyCancelBtn = document.getElementById("tycoon-key-cancel");
 if (keyCancelBtn) {
   keyCancelBtn.addEventListener("click", () => {
@@ -427,38 +451,37 @@ if (keyCancelBtn) {
 const keyClearBtn = document.getElementById("tycoon-key-clear");
 if (keyClearBtn) {
   keyClearBtn.addEventListener("click", async () => {
-    await clearArkKey();
+    await clearLlmProvider();
     $("tycoon-key-edit").hidden = true;
   });
 }
 const keyInput = document.getElementById("tycoon-key-input");
 if (keyInput) {
   keyInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); saveArkKey(); }
+    if (e.key === "Enter") { e.preventDefault(); saveLlmProvider(); }
   });
 }
+["llm-base-url-input", "llm-model-input"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); saveLlmProvider(); }
+  });
+});
 async function loadLlmModels() {
   const select = $("llm-model-select");
   const hint = $("tycoon-hint");
   if (!select) return;
   select.innerHTML = '<option value="">加载中...</option>';
   try {
-    const r = await fetch("/api/llm_models");
-    const data = await r.json();
-    if (!r.ok) {
-      select.innerHTML = '<option value="">不可用</option>';
-      hint.textContent = `× ${data.error || "拉取模型列表失败"}。请设置 ARK_API_KEY 后重启服务。`;
-      hint.classList.add("tycoon-hint-error");
-      return;
-    }
+    const data = await fetchJSON("/api/llm/models");
     const models = data.models || [];
     if (!models.length) {
-      select.innerHTML = '<option value="">无可用模型</option>';
-      hint.textContent = "× Ark 账号未返回 Seed 系列视觉模型，请到火山引擎控制台开通。";
-      hint.classList.add("tycoon-hint-error");
+      select.innerHTML = '<option value="">未拉到模型，可手填 Model ID</option>';
+      hint.textContent = data.error || "未自动拉到模型列表，请直接手填 Model ID。";
+      hint.classList.toggle("tycoon-hint-error", !!data.error);
       return;
     }
-    // 按 tier 分组：pro / lite / mini / other
+    // 按 tier 分组：pro / lite / mini / other；未知 provider 默认归 other
     const groups = { pro: [], lite: [], mini: [], other: [] };
     models.forEach(m => { (groups[m.tier] || groups.other).push(m); });
     const tierName = { pro: "Pro（高质量）", lite: "Lite（平衡）", mini: "Mini（轻量便宜）", other: "其他" };
@@ -476,30 +499,31 @@ async function loadLlmModels() {
       });
       select.appendChild(optgroup);
     }
-    // 默认选中：优先 localStorage；否则 doubao-seed-2-0-lite-260428；再降级 mini 最新
+    // 默认选中：优先本地保存；否则选择列表第一项
     const saved = localStorage.getItem("pic_selecter.llm_model");
-    const preferred = "doubao-seed-2-0-mini-260428";
     const allOptions = [...select.options];
     if (saved && allOptions.some(o => o.value === saved)) {
       select.value = saved;
-    } else if (allOptions.some(o => o.value === preferred)) {
-      select.value = preferred;
-    } else if (groups.mini.length) {
-      select.value = groups.mini[groups.mini.length - 1].id;
+    } else if (allOptions.length) {
+      select.value = allOptions[0].value;
     }
-    hint.textContent = "已就绪。图片会上传至火山引擎服务器，按 token 计费。";
+    if (select.value && $("llm-model-input")) $("llm-model-input").value = select.value;
+    hint.textContent = "已拉取模型列表。图片会发送到你配置的 AI 服务商。";
     hint.classList.remove("tycoon-hint-error");
     llmModelsLoaded = true;
   } catch (e) {
-    select.innerHTML = '<option value="">网络错误</option>';
-    hint.textContent = `× ${e.message || "拉取失败"}`;
+    select.innerHTML = '<option value="">拉取失败，可手填 Model ID</option>';
+    hint.textContent = `× ${e.message || "拉取失败"}；仍可直接手填 Model ID。`;
     hint.classList.add("tycoon-hint-error");
   }
 }
 const llmSelect = $("llm-model-select");
 if (llmSelect) {
   llmSelect.addEventListener("change", () => {
-    if (llmSelect.value) localStorage.setItem("pic_selecter.llm_model", llmSelect.value);
+    if (llmSelect.value) {
+      localStorage.setItem("pic_selecter.llm_model", llmSelect.value);
+      if ($("llm-model-input")) $("llm-model-input").value = llmSelect.value;
+    }
   });
 }
 const llmRefreshBtn = $("llm-model-refresh");
@@ -748,10 +772,10 @@ async function handleStart(e) {
   $("start-btn").disabled = true;
   try {
     const llm_model = engine === "tycoon"
-      ? ($("llm-model-select")?.value || "")
+      ? (($("llm-model-input")?.value || $("llm-model-select")?.value || "").trim())
       : "";
     if (engine === "tycoon" && !llm_model) {
-      setStatus("请先选择一个 LLM 模型再开始", "error");
+      setStatus("请先填写一个 AI 模型 ID 再开始", "error");
       $("start-btn").disabled = false;
       return;
     }
