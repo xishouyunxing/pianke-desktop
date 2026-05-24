@@ -47,6 +47,16 @@ impl ModelManager {
 
     pub fn expert_capabilities(&self) -> ExpertComponentCapabilities {
         let dir = self.cache_dir.join("expert");
+        let musiq = dir
+            .join("models")
+            .join("quality")
+            .join("musiq.onnx")
+            .exists();
+        let clipiqa = dir
+            .join("models")
+            .join("quality")
+            .join("clipiqa_plus.onnx")
+            .exists();
         ExpertComponentCapabilities {
             dinov2: dir.join("models").join("dinov2-small.onnx").exists(),
             insightface_detection: dir
@@ -64,6 +74,11 @@ impl ModelManager {
                 .join("insightface")
                 .join("1k3d68.onnx")
                 .exists(),
+            musiq,
+            clipiqa,
+            quality_models: musiq && clipiqa,
+            nima_legacy: false,
+            nima_legacy_unavailable: true,
         }
     }
 
@@ -387,6 +402,11 @@ pub struct ExpertComponentCapabilities {
     pub insightface_detection: bool,
     pub insightface_recognition: bool,
     pub insightface_landmark: bool,
+    pub musiq: bool,
+    pub clipiqa: bool,
+    pub quality_models: bool,
+    pub nima_legacy: bool,
+    pub nima_legacy_unavailable: bool,
 }
 
 fn component_catalog() -> Vec<ComponentDef> {
@@ -401,6 +421,8 @@ fn component_catalog() -> Vec<ComponentDef> {
             "insightface-det_10g",
             "insightface-w600k_r50",
             "insightface-1k3d68",
+            "quality-musiq-optional",
+            "quality-clipiqa-plus-optional",
         ],
         runtime: "onnxruntime",
     }]
@@ -654,6 +676,40 @@ mod tests {
             .expect("expert component");
         assert_eq!(expert.status, "installed");
         assert!(!expert.download_required);
+        let caps = manager.expert_capabilities();
+        assert!(caps.dinov2);
+        assert!(!caps.quality_models);
+        assert!(!caps.nima_legacy);
+        assert!(caps.nima_legacy_unavailable);
+    }
+
+    #[test]
+    fn optional_quality_models_update_expert_capabilities() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let install_dir = temp.path().join("models").join("expert");
+        fs::create_dir_all(install_dir.join("models").join("quality")).expect("quality dir");
+        fs::write(
+            install_dir
+                .join("models")
+                .join("quality")
+                .join("musiq.onnx"),
+            b"fake",
+        )
+        .expect("musiq");
+        fs::write(
+            install_dir
+                .join("models")
+                .join("quality")
+                .join("clipiqa_plus.onnx"),
+            b"fake",
+        )
+        .expect("clipiqa");
+
+        let manager = ModelManager::new(temp.path().join("models"));
+        let caps = manager.expert_capabilities();
+        assert!(caps.musiq);
+        assert!(caps.clipiqa);
+        assert!(caps.quality_models);
     }
 
     #[tokio::test]

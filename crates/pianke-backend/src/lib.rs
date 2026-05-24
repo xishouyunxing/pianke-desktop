@@ -513,6 +513,7 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         && expert_caps.insightface_detection
         && expert_caps.insightface_recognition
         && expert_caps.insightface_landmark;
+    let quality_models = expert_installed && expert_caps.quality_models;
     let llm_status = ctx.llm.provider_status();
     let tycoon_ready = llm_status.configured;
     let mut engines = ctx.models.available_engines();
@@ -527,6 +528,8 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "watermark": true,
         "expert_installed": expert_installed,
         "expert_capabilities": expert_caps,
+        "quality_models": quality_models,
+        "nima_legacy_unavailable": true,
         "tycoon_ready": tycoon_ready,
         "model_components": ctx.models.status_map(),
         "llm_provider": {
@@ -908,6 +911,27 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
     } else {
         None
     };
+    let mut quality_model = if req.engine == "expert" {
+        if let Some(dir) = &expert_dir {
+            if expert_vision::ExpertQualityModels::component_files_ready(dir) {
+                match expert_vision::ExpertQualityModels::from_component_dir(dir) {
+                    Ok(model) => Some(model),
+                    Err(err) => {
+                        let mut state = ctx.inner.lock().expect("backend state lock");
+                        state.job.label =
+                            format!("Expert 质量模型暂不可用，继续使用 DINOv2/人脸能力: {err}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let tycoon_config = if req.engine == "tycoon" {
         match ctx.llm.require_tycoon_ready(req.llm_model.as_deref()) {
             Ok(config) => Some(config),
@@ -999,6 +1023,33 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
                                 .extra
                                 .insert("face_unavailable".to_string(), json!(reason));
                             record.info.quality = Some(quality);
+                        }
+                    }
+                }
+                if req.engine == "expert" {
+                    apply_expert_quality_availability(&mut record, quality_model.is_some(), None);
+                    if let Some(model) = quality_model.as_mut() {
+                        let Some(analysis) = pair.analysis.as_ref() else {
+                            let mut quality = record.info.quality.clone().unwrap_or_default();
+                            quality.extra.insert(
+                                "quality_models_unavailable".to_string(),
+                                json!("Expert 质量模型需要可解码的 JPG/PNG/WebP/TIFF companion"),
+                            );
+                            record.info.quality = Some(quality);
+                            push_job_event(&ctx, &record, None);
+                            infos.push(record);
+                            continue;
+                        };
+                        match apply_expert_quality_models(
+                            model,
+                            analysis,
+                            &mut record,
+                            &req.prescreen_strength,
+                        ) {
+                            Ok(()) => {}
+                            Err(reason) => {
+                                apply_expert_quality_availability(&mut record, false, Some(reason));
+                            }
                         }
                     }
                 }
@@ -1310,6 +1361,92 @@ fn apply_llm_verdict(record: &mut InfoRecord, verdict: &JudgeVerdict) {
             .insert("llm_fixable".to_string(), json!(fixable));
     }
     record.info.quality = Some(quality);
+}
+
+fn apply_expert_quality_availability(
+    record: &mut InfoRecord,
+    available: bool,
+    reason: Option<String>,
+) {
+    let mut quality = record.info.quality.clone().unwrap_or_default();
+    quality
+        .extra
+        .insert("quality_models".to_string(), json!(available));
+    quality
+        .extra
+        .insert("nima_legacy_unavailable".to_string(), json!(true));
+    if let Some(reason) = reason {
+        quality
+            .extra
+            .insert("quality_models_unavailable".to_string(), json!(reason));
+    }
+    record.info.quality = Some(quality);
+}
+
+fn apply_expert_quality_models(
+    model: &mut expert_vision::ExpertQualityModels,
+    analysis: &Path,
+    record: &mut InfoRecord,
+    strength: &str,
+) -> Result<(), String> {
+    let img = image::open(analysis).map_err(|e| format!("加载 Expert 质量分析图片失败: {e}"))?;
+    let scores = model.analyze(&img)?;
+    apply_expert_quality_scores(record, scores, strength);
+    Ok(())
+}
+
+fn apply_expert_quality_scores(
+    record: &mut InfoRecord,
+    scores: expert_vision::ExpertQualityScores,
+    strength: &str,
+) {
+    let mut quality = record.info.quality.clone().unwrap_or_default();
+    quality
+        .extra
+        .insert("quality_models".to_string(), json!(true));
+    quality
+        .extra
+        .insert("nima_legacy_unavailable".to_string(), json!(true));
+    quality
+        .extra
+        .insert("aesthetic_score".to_string(), serde_json::Value::Null);
+    if let Some(v) = scores.musiq_score {
+        quality.extra.insert("musiq_score".to_string(), json!(v));
+    }
+    if let Some(v) = scores.clipiqa_score {
+        quality.extra.insert("clipiqa_score".to_string(), json!(v));
+    }
+    apply_expert_aesthetic_rule(&mut quality, strength);
+    record.info.quality = Some(quality);
+}
+
+fn apply_expert_aesthetic_rule(quality: &mut QualityInfo, strength: &str) {
+    let (musiq_low, clipiqa_low) = match strength {
+        "advanced" | "aggressive" => (68.0, 0.65),
+        _ => (55.0, 0.55),
+    };
+    let musiq_low_hit = quality
+        .extra
+        .get("musiq_score")
+        .and_then(|v| v.as_f64())
+        .is_some_and(|v| v < musiq_low);
+    let clipiqa_low_hit = quality
+        .extra
+        .get("clipiqa_score")
+        .and_then(|v| v.as_f64())
+        .is_some_and(|v| v < clipiqa_low);
+    if musiq_low_hit && clipiqa_low_hit && !quality.flags.iter().any(|f| f == "low_aesthetic") {
+        quality.flags.push("low_aesthetic".to_string());
+    }
+    if quality.flags.iter().any(|f| f == "low_aesthetic") {
+        quality.auto_reject = Some(true);
+        if quality.reject_reason.is_none() {
+            quality.reject_reason = Some("美学评分偏低".to_string());
+        }
+        if let Some(score) = quality.quality_score {
+            quality.quality_score = Some((score - 8.0).max(0.0));
+        }
+    }
 }
 
 fn apply_dinov2_embedding(record: &mut InfoRecord, dinov2: Vec<f32>) {
@@ -2938,9 +3075,21 @@ fn push_job_event(ctx: &AppCtx, record: &InfoRecord, reason: Option<String>) {
         } else {
             format!("{} faces", record.info.face_embeddings.len())
         };
+        let quality_value = q
+            .and_then(|q| q.extra.get("quality_models"))
+            .and_then(|v| v.as_bool())
+            .map(|available| {
+                if available {
+                    "MUSIQ + CLIP-IQA+"
+                } else {
+                    "not installed"
+                }
+            })
+            .unwrap_or("not installed");
         vec![
             json!({"kind": "dino", "label": "DINOv2", "value": dino_value}),
             json!({"kind": "face", "label": "Face", "value": face_value}),
+            json!({"kind": "quality", "label": "Quality", "value": quality_value}),
             json!({"kind": "llm", "label": "LLM", "value": llm_verdict.clone().unwrap_or_else(|| "none".to_string())}),
         ]
     } else {

@@ -171,10 +171,17 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(capabilities["expert_installed"], false);
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["python_required"], false);
+    assert_eq!(capabilities["quality_models"], false);
+    assert_eq!(capabilities["nima_legacy_unavailable"], true);
     assert_eq!(capabilities["expert_capabilities"]["dinov2"], false);
     assert_eq!(
         capabilities["expert_capabilities"]["insightface_detection"],
         false
+    );
+    assert_eq!(capabilities["expert_capabilities"]["quality_models"], false);
+    assert_eq!(
+        capabilities["expert_capabilities"]["nima_legacy_unavailable"],
+        true
     );
 
     let components: Value = client
@@ -402,11 +409,16 @@ fn installed_model_manifest_updates_capabilities() {
         .expect("capabilities json");
     assert_eq!(capabilities["expert_installed"], true);
     assert_eq!(capabilities["face_aware"], false);
+    assert_eq!(capabilities["quality_models"], false);
     assert_eq!(capabilities["expert_capabilities"]["dinov2"], true);
     assert_eq!(
         capabilities["expert_capabilities"]["insightface_detection"],
         false
     );
+    assert_eq!(capabilities["expert_capabilities"]["musiq"], false);
+    assert_eq!(capabilities["expert_capabilities"]["clipiqa"], false);
+    assert_eq!(capabilities["expert_capabilities"]["quality_models"], false);
+    assert_eq!(capabilities["expert_capabilities"]["nima_legacy"], false);
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
     assert_eq!(capabilities["engines"], json!(["expert", "fast", "tycoon"]));

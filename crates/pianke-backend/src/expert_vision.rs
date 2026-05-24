@@ -14,6 +14,9 @@ const PREPROCESSOR_PATH: &str = "preprocessor.json";
 const FACE_DET_MODEL_PATH: &str = "models/insightface/det_10g.onnx";
 const FACE_REC_MODEL_PATH: &str = "models/insightface/w600k_r50.onnx";
 const FACE_LANDMARK_MODEL_PATH: &str = "models/insightface/1k3d68.onnx";
+const MUSIQ_MODEL_PATH: &str = "models/quality/musiq.onnx";
+const CLIPIQA_MODEL_PATH: &str = "models/quality/clipiqa_plus.onnx";
+const QUALITY_PREPROCESSOR_PATH: &str = "quality_preprocessor.json";
 const DET_SIZE: u32 = 640;
 const DET_SCORE_THRESHOLD: f32 = 0.5;
 const DET_NMS_THRESHOLD: f32 = 0.4;
@@ -66,6 +69,65 @@ pub struct Dinov2Model {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpertQualityPreprocessor {
+    #[serde(default = "default_quality_max_side")]
+    pub max_side: u32,
+    #[serde(default)]
+    pub musiq_input_width: Option<u32>,
+    #[serde(default)]
+    pub musiq_input_height: Option<u32>,
+    #[serde(default = "default_quality_clip_input_size")]
+    pub clipiqa_input_width: u32,
+    #[serde(default = "default_quality_clip_input_size")]
+    pub clipiqa_input_height: u32,
+    #[serde(default)]
+    pub mean: Option<[f32; 3]>,
+    #[serde(default)]
+    pub std: Option<[f32; 3]>,
+    #[serde(default)]
+    pub scale_255: bool,
+    #[serde(default)]
+    pub musiq_input_name: Option<String>,
+    #[serde(default)]
+    pub musiq_output_name: Option<String>,
+    #[serde(default)]
+    pub clipiqa_input_name: Option<String>,
+    #[serde(default)]
+    pub clipiqa_output_name: Option<String>,
+}
+
+impl Default for ExpertQualityPreprocessor {
+    fn default() -> Self {
+        Self {
+            max_side: default_quality_max_side(),
+            musiq_input_width: None,
+            musiq_input_height: None,
+            clipiqa_input_width: default_quality_clip_input_size(),
+            clipiqa_input_height: default_quality_clip_input_size(),
+            mean: None,
+            std: None,
+            scale_255: false,
+            musiq_input_name: None,
+            musiq_output_name: None,
+            clipiqa_input_name: None,
+            clipiqa_output_name: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExpertQualityScores {
+    pub musiq_score: Option<f64>,
+    pub clipiqa_score: Option<f64>,
+}
+
+pub struct ExpertQualityModels {
+    musiq: Session,
+    clipiqa: Session,
+    preprocessor: ExpertQualityPreprocessor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FaceInfo {
     pub bbox: [f32; 4],
     pub det_score: f32,
@@ -100,6 +162,66 @@ pub struct InsightFaceModels {
     detector: Session,
     recognizer: Session,
     landmark: Session,
+}
+
+impl ExpertQualityModels {
+    pub fn component_files_ready(component_dir: &Path) -> bool {
+        component_dir.join(MUSIQ_MODEL_PATH).exists()
+            && component_dir.join(CLIPIQA_MODEL_PATH).exists()
+    }
+
+    pub fn from_component_dir(component_dir: &Path) -> Result<Self, String> {
+        let musiq_path = component_dir.join(MUSIQ_MODEL_PATH);
+        let clipiqa_path = component_dir.join(CLIPIQA_MODEL_PATH);
+        for path in [&musiq_path, &clipiqa_path] {
+            if !path.exists() {
+                return Err(format!(
+                    "Expert 组件缺少质量模型 ONNX 文件: {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(Self {
+            musiq: load_session(&musiq_path, "MUSIQ")?,
+            clipiqa: load_session(&clipiqa_path, "CLIP-IQA+")?,
+            preprocessor: load_quality_preprocessor(component_dir)?,
+        })
+    }
+
+    pub fn analyze(&mut self, img: &DynamicImage) -> Result<ExpertQualityScores, String> {
+        let musiq_input = preprocess_quality_nchw(
+            img,
+            self.preprocessor.musiq_input_width,
+            self.preprocessor.musiq_input_height,
+            self.preprocessor.max_side,
+            &self.preprocessor,
+        )?;
+        let clipiqa_input = preprocess_quality_nchw(
+            img,
+            Some(self.preprocessor.clipiqa_input_width),
+            Some(self.preprocessor.clipiqa_input_height),
+            self.preprocessor.max_side,
+            &self.preprocessor,
+        )?;
+        let musiq_score = run_scalar_model(
+            &mut self.musiq,
+            musiq_input,
+            self.preprocessor.musiq_input_name.as_deref(),
+            self.preprocessor.musiq_output_name.as_deref(),
+            "MUSIQ",
+        )?;
+        let clipiqa_score = run_scalar_model(
+            &mut self.clipiqa,
+            clipiqa_input,
+            self.preprocessor.clipiqa_input_name.as_deref(),
+            self.preprocessor.clipiqa_output_name.as_deref(),
+            "CLIP-IQA+",
+        )?;
+        Ok(ExpertQualityScores {
+            musiq_score: Some(musiq_score),
+            clipiqa_score: Some(clipiqa_score),
+        })
+    }
 }
 
 impl InsightFaceModels {
@@ -245,6 +367,19 @@ pub fn load_preprocessor(component_dir: &Path) -> Result<Dinov2Preprocessor, Str
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("读取 DINOv2 preprocessor.json 失败: {e}"))?;
     serde_json::from_str(&text).map_err(|e| format!("解析 DINOv2 preprocessor.json 失败: {e}"))
+}
+
+pub fn load_quality_preprocessor(
+    component_dir: &Path,
+) -> Result<ExpertQualityPreprocessor, String> {
+    let path = component_dir.join(QUALITY_PREPROCESSOR_PATH);
+    if !path.exists() {
+        return Ok(ExpertQualityPreprocessor::default());
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("读取 Expert quality_preprocessor.json 失败: {e}"))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("解析 Expert quality_preprocessor.json 失败: {e}"))
 }
 
 #[derive(Debug, Clone)]
@@ -475,6 +610,43 @@ fn run_embedding(session: &mut Session, input: Array4<f32>) -> Result<Vec<f32>, 
     Ok(embedding)
 }
 
+fn run_scalar_model(
+    session: &mut Session,
+    input: Array4<f32>,
+    input_name: Option<&str>,
+    output_name: Option<&str>,
+    label: &str,
+) -> Result<f64, String> {
+    let input_view = TensorRef::from_array_view(&input)
+        .map_err(|e| format!("create {label} input failed: {e}"))?;
+    let outputs = if let Some(name) = input_name {
+        session
+            .run(ort::inputs![name => input_view])
+            .map_err(|e| format!("run {label} failed: {e}"))?
+    } else {
+        session
+            .run(ort::inputs![input_view])
+            .map_err(|e| format!("run {label} failed: {e}"))?
+    };
+    if outputs.len() == 0 {
+        return Err(format!("{label} produced no outputs"));
+    }
+    let output = if let Some(name) = output_name {
+        outputs
+            .get(name)
+            .ok_or_else(|| format!("{label} output missing field: {name}"))?
+    } else {
+        &outputs[0]
+    };
+    let tensor = output
+        .try_extract_array::<f32>()
+        .map_err(|e| format!("read {label} output failed: {e}"))?;
+    let Some(score) = tensor.iter().next() else {
+        return Err(format!("{label} output is empty"));
+    };
+    Ok((*score as f64 * 10000.0).round() / 10000.0)
+}
+
 fn run_landmark(
     session: &mut Session,
     img: &DynamicImage,
@@ -518,6 +690,57 @@ pub fn preprocess_rgb_chw(
     }
     let resized = image::imageops::resize(&img.to_rgb8(), width, height, FilterType::Triangle);
     rgb_to_chw(&resized, mean, std)
+}
+
+fn preprocess_quality_nchw(
+    img: &DynamicImage,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+    max_side: u32,
+    cfg: &ExpertQualityPreprocessor,
+) -> Result<Array4<f32>, String> {
+    let mut rgb = img.to_rgb8();
+    let (mut width, mut height) = rgb.dimensions();
+    if width == 0 || height == 0 {
+        return Err("Expert quality input image is empty".to_string());
+    }
+    if let (Some(w), Some(h)) = (target_width, target_height) {
+        if w == 0 || h == 0 {
+            return Err("Expert quality fixed input size must not be zero".to_string());
+        }
+        rgb = image::imageops::resize(&rgb, w, h, FilterType::Triangle);
+        width = w;
+        height = h;
+    } else if max_side > 0 && width.max(height) > max_side {
+        let scale = max_side as f32 / width.max(height) as f32;
+        width = ((width as f32 * scale).round() as u32).max(1);
+        height = ((height as f32 * scale).round() as u32).max(1);
+        rgb = image::imageops::resize(&rgb, width, height, FilterType::Triangle);
+    }
+
+    let mean = cfg.mean.unwrap_or([0.0, 0.0, 0.0]);
+    let std = cfg.std.unwrap_or([1.0, 1.0, 1.0]);
+    if std.iter().any(|v| v.abs() < 1e-8) {
+        return Err("Expert quality preprocessor std must not contain zero".to_string());
+    }
+    let plane = (width * height) as usize;
+    let mut data = vec![0.0f32; plane * 3];
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = rgb.get_pixel(x, y).0;
+            let idx = (y * width + x) as usize;
+            for c in 0..3 {
+                let raw = if cfg.scale_255 {
+                    pixel[c] as f32
+                } else {
+                    pixel[c] as f32 / 255.0
+                };
+                data[c * plane + idx] = (raw - mean[c]) / std[c];
+            }
+        }
+    }
+    Array4::from_shape_vec((1, 3, height as usize, width as usize), data)
+        .map_err(|e| format!("create Expert quality NCHW input failed: {e}"))
 }
 
 fn rgb_to_chw(img: &RgbImage, mean: f32, std: f32) -> Result<Array4<f32>, String> {
@@ -848,6 +1071,14 @@ fn default_std() -> [f32; 3] {
     [0.229, 0.224, 0.225]
 }
 
+fn default_quality_max_side() -> u32 {
+    1024
+}
+
+fn default_quality_clip_input_size() -> u32 {
+    224
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,6 +1230,20 @@ mod tests {
     }
 
     #[test]
+    fn quality_preprocess_respects_fixed_clip_input_shape() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(32, 24, Rgb([128, 64, 32])));
+        let cfg = ExpertQualityPreprocessor {
+            clipiqa_input_width: 16,
+            clipiqa_input_height: 12,
+            ..ExpertQualityPreprocessor::default()
+        };
+        let arr = preprocess_quality_nchw(&img, Some(16), Some(12), cfg.max_side, &cfg)
+            .expect("quality preprocess");
+        assert_eq!(arr.shape(), &[1, 3, 12, 16]);
+        assert!(arr.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn dinov2_golden_fixture_matches_when_configured() {
         let Ok(component_dir) = std::env::var("PIANKE_EXPERT_COMPONENT_DIR") else {
             return;
@@ -1143,6 +1388,94 @@ mod tests {
             rust_infos.push(fixture_fast_info_with_actual_faces(item, item_idx, &actual));
         }
         assert_expert_grouping_matches_fixture(&value, &rust_infos);
+    }
+
+    #[test]
+    fn quality_golden_fixture_matches_when_configured() {
+        let Ok(component_dir) = std::env::var("PIANKE_EXPERT_COMPONENT_DIR") else {
+            return;
+        };
+        let component_dir = Path::new(&component_dir);
+        if !ExpertQualityModels::component_files_ready(component_dir) {
+            return;
+        }
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+        let fixture = workspace
+            .join("fixtures")
+            .join("expert_parity")
+            .join("quality.json");
+        if !fixture.exists() {
+            return;
+        }
+        let text = fs::read_to_string(&fixture).expect("read Expert quality golden fixture");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("parse Expert quality golden fixture");
+        let items = value["items"].as_array().expect("items");
+        if items
+            .iter()
+            .all(|item| item.get("quality_scores").is_none())
+        {
+            return;
+        }
+        let mut model =
+            ExpertQualityModels::from_component_dir(component_dir).expect("load quality models");
+        for item in items {
+            let Some(expected_scores) = item.get("quality_scores") else {
+                continue;
+            };
+            let path = fixture_image_path(workspace, item);
+            let img = image::open(&path).expect("load fixture image");
+            let actual = model.analyze(&img).expect("extract quality scores");
+            assert_optional_score_close(
+                actual.musiq_score,
+                expected_scores.get("musiq_score"),
+                0.1,
+                &path,
+                "musiq_score",
+            );
+            assert_optional_score_close(
+                actual.clipiqa_score,
+                expected_scores.get("clipiqa_score"),
+                0.01,
+                &path,
+                "clipiqa_score",
+            );
+
+            let mut record = crate::InfoRecord {
+                info: pianke_core::fast::FastImageInfo {
+                    quality: Some(pianke_core::fast::QualityInfo {
+                        quality_score: Some(80.0),
+                        ..pianke_core::fast::QualityInfo::default()
+                    }),
+                    ..pianke_core::fast::FastImageInfo::default()
+                },
+                companions: Vec::new(),
+            };
+            let strength = expected_scores
+                .get("strength")
+                .and_then(|v| v.as_str())
+                .unwrap_or("standard");
+            crate::apply_expert_quality_scores(&mut record, actual, strength);
+            let q = record.info.quality.expect("quality");
+            if let Some(expected_quality) = item.get("quality") {
+                assert_eq!(
+                    q.flags.iter().any(|f| f == "low_aesthetic"),
+                    expected_quality["flags"]
+                        .as_array()
+                        .map(|flags| flags.iter().any(|f| f.as_str() == Some("low_aesthetic")))
+                        .unwrap_or(false),
+                    "low_aesthetic flag mismatch for {}",
+                    path.display()
+                );
+                if q.flags.iter().any(|f| f == "low_aesthetic") {
+                    assert_eq!(q.auto_reject, Some(true));
+                    assert!(q.reject_reason.is_some());
+                }
+            }
+        }
     }
 
     fn fixture_image_path(workspace: &Path, item: &serde_json::Value) -> std::path::PathBuf {
@@ -1321,6 +1654,28 @@ mod tests {
     }
 
     fn assert_optional_f64_close(
+        actual: Option<f64>,
+        expected: Option<&serde_json::Value>,
+        tolerance: f64,
+        path: &Path,
+        label: &str,
+    ) {
+        let expected = expected.and_then(|v| v.as_f64());
+        match (actual, expected) {
+            (Some(a), Some(e)) => assert!(
+                (a - e).abs() <= tolerance,
+                "{label} mismatch for {}: actual={a}, expected={e}",
+                path.display()
+            ),
+            (None, None) => {}
+            other => panic!(
+                "{label} presence mismatch for {}: {other:?}",
+                path.display()
+            ),
+        }
+    }
+
+    fn assert_optional_score_close(
         actual: Option<f64>,
         expected: Option<&serde_json::Value>,
         tolerance: f64,

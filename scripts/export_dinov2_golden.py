@@ -119,6 +119,8 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--faces", action="store_true", help="also export InsightFace bbox/landmark/embedding data")
+    parser.add_argument("--quality", action="store_true", help="also export Python MUSIQ / CLIP-IQA+ scores and quality flags")
+    parser.add_argument("--strength", choices=["standard", "advanced", "aggressive"], default="standard")
     parser.add_argument("--path-root", type=Path, default=ROOT, help="root used to store image paths relatively")
     parser.add_argument("--no-synthetic", action="store_true", help="do not create deterministic synthetic images when folder is empty")
     args = parser.parse_args()
@@ -153,6 +155,28 @@ def main() -> None:
                     }
                     for face in faces
                 ]
+            if args.quality:
+                faces_for_quality = item.get("faces") if args.faces else None
+                musiq = vision.extract_musiq_score(rgb)
+                clipiqa = vision.extract_clipiqa_score(rgb)
+                quality_info = quality.analyze_image(
+                    rgb,
+                    path.stat().st_size,
+                    strength=args.strength,
+                    face_aware=args.faces,
+                    face_data=faces_for_quality,
+                    aesthetic_score=None,
+                    musiq_score=musiq,
+                    clipiqa_score=clipiqa,
+                )
+                item["quality_scores"] = {
+                    "aesthetic_score": None,
+                    "musiq_score": round(float(musiq), 4),
+                    "clipiqa_score": round(float(clipiqa), 6),
+                    "nima_legacy_unavailable": True,
+                    "strength": args.strength,
+                }
+                item["quality"] = jsonable(quality_info.__dict__)
         records.append(item)
 
     grouping = build_group_fixture(records)
@@ -164,6 +188,7 @@ def main() -> None:
                 "model": "facebook/dinov2-small",
                 "dinov2": "cls_l2_normalized",
                 "faces": "insightface_buffalo_l_optional",
+                "quality": "pyiqa_musiq_clipiqa_plus_optional",
                 "count": len(records),
                 "path_root": relative_path(args.path_root, ROOT),
                 "grouping": grouping,
