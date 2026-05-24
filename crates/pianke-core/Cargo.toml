@@ -1,0 +1,13 @@
+[package]
+name = "pianke-core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust core algorithms for Pianke"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+approx = "0.5"

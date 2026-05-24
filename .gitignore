@@ -54,6 +54,7 @@ job-*.log
 node_modules/
 dist/
 src-tauri/target/
+crates/*/target/
 src-tauri/gen/
 src-tauri/binaries/python/
 .desktop-python-cache/
