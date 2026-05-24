@@ -7,12 +7,13 @@ const TUTORIAL_KEY = "pic-arena.tutorial-seen";
 const CONFIRM_MOVE_KEY = "pic-arena.confirmed-move";
 const CONFIRM_REAL_KEY = "pic-arena.confirmed-real";
 const VERDICT_HOLD_MS = 380;
+const IS_DESKTOP_SHELL = new URLSearchParams(location.search).get("desktop") === "1";
 
 let busy = false;
 let pollHandle = null;
 let lastSession = null;
 let currentGroup = null;
-let currentMode = "move";
+let currentMode = IS_DESKTOP_SHELL ? "copy" : "move";
 let recentWinners = []; // 最近胜出路径，给 arena-stack 用
 let streamSeq = 0;       // streaming log 已渲染到的 event_seq
 
@@ -214,6 +215,15 @@ document.querySelectorAll(".btn-go-home").forEach(el => el.addEventListener("cli
 // =================================================================
 // 着陆页
 // =================================================================
+if (IS_DESKTOP_SHELL) {
+  const moveMode = document.querySelector('input[name="mode"][value="move"]');
+  const copyMode = document.querySelector('input[name="mode"][value="copy"]');
+  if (moveMode && copyMode) {
+    moveMode.checked = false;
+    copyMode.checked = true;
+  }
+}
+
 function loadRecent() {
   try { return JSON.parse(localStorage.getItem(RECENT_KEY) || "[]"); }
   catch { return []; }

@@ -41,6 +41,7 @@ const frameUrl = computed(() => {
   if (!status.value.url) return "";
   const url = new URL(status.value.url);
   if (status.value.token) url.searchParams.set("token", status.value.token);
+  url.searchParams.set("desktop", "1");
   return url.toString();
 });
 
