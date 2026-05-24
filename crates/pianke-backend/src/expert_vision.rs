@@ -1003,10 +1003,11 @@ mod tests {
         let Ok(component_dir) = std::env::var("PIANKE_EXPERT_COMPONENT_DIR") else {
             return;
         };
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
-            .expect("workspace root")
+            .expect("workspace root");
+        let fixture = workspace
             .join("fixtures")
             .join("expert_parity")
             .join("dinov2.json");
@@ -1018,27 +1019,39 @@ mod tests {
             serde_json::from_str(&text).expect("parse DINOv2 golden fixture");
         let mut model =
             Dinov2Model::from_component_dir(Path::new(&component_dir)).expect("load DINOv2 model");
-        for item in value["items"].as_array().expect("items") {
-            let path = Path::new(item["path"].as_str().expect("path"));
+        let items = value["items"].as_array().expect("items");
+        assert!(!items.is_empty(), "DINOv2 golden fixture has no items");
+        let mut rust_infos = Vec::new();
+        for (idx, item) in items.iter().enumerate() {
+            let path = fixture_image_path(workspace, item);
             let expected = item["embedding"]
                 .as_array()
                 .expect("embedding")
                 .iter()
                 .map(|v| v.as_f64().expect("embedding value") as f32)
                 .collect::<Vec<_>>();
-            let actual = model.extract_path(path).expect("extract DINOv2");
+            let actual = model.extract_path(&path).expect("extract DINOv2");
             assert_eq!(actual.len(), expected.len());
-            let cosine = actual
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| *a as f64 * *b as f64)
-                .sum::<f64>();
+            assert_eq!(actual.len(), 384, "DINOv2 embedding dimension changed");
+            assert!(
+                (l2_norm(&actual) - 1.0).abs() <= 1e-4,
+                "Rust DINOv2 embedding is not L2 normalized for {}",
+                path.display()
+            );
+            assert!(
+                (l2_norm(&expected) - 1.0).abs() <= 1e-4,
+                "Python DINOv2 embedding is not L2 normalized for {}",
+                path.display()
+            );
+            let cosine = cosine(&actual, &expected);
             assert!(
                 cosine >= 0.999,
                 "DINOv2 cosine below threshold for {}: {cosine}",
                 path.display()
             );
+            rust_infos.push(fixture_fast_info(item, idx));
         }
+        assert_expert_grouping_matches_fixture(&value, &rust_infos);
     }
 
     #[test]
@@ -1046,10 +1059,11 @@ mod tests {
         let Ok(component_dir) = std::env::var("PIANKE_EXPERT_COMPONENT_DIR") else {
             return;
         };
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
-            .expect("workspace root")
+            .expect("workspace root");
+        let fixture = workspace
             .join("fixtures")
             .join("expert_parity")
             .join("insightface.json");
@@ -1061,9 +1075,12 @@ mod tests {
             serde_json::from_str(&text).expect("parse InsightFace golden fixture");
         let mut model = InsightFaceModels::from_component_dir(Path::new(&component_dir))
             .expect("load InsightFace models");
-        for item in value["items"].as_array().expect("items") {
-            let path = Path::new(item["path"].as_str().expect("path"));
-            let img = image::open(path).expect("load fixture image");
+        let items = value["items"].as_array().expect("items");
+        assert!(!items.is_empty(), "InsightFace golden fixture has no items");
+        let mut rust_infos = Vec::new();
+        for (item_idx, item) in items.iter().enumerate() {
+            let path = fixture_image_path(workspace, item);
+            let img = image::open(&path).expect("load fixture image");
             let actual = model.extract_faces(&img).expect("extract faces");
             let expected = item["faces"].as_array().expect("faces");
             assert_eq!(
@@ -1102,8 +1119,106 @@ mod tests {
                     path.display(),
                     idx
                 );
+                if let Some(exp_kps) = optional_points(exp.get("kps")) {
+                    let act_kps = act.kps.as_ref().expect("actual 5-point landmarks");
+                    assert_points_close(act_kps, &exp_kps, 2.0, &path, idx, "5-point landmarks");
+                }
+                if let Some(exp_landmark) = optional_points(exp.get("landmark_2d_68")) {
+                    let act_landmark = act
+                        .landmark_2d_68
+                        .as_ref()
+                        .expect("actual 68-point landmarks");
+                    assert_points_close(
+                        act_landmark,
+                        &exp_landmark,
+                        3.0,
+                        &path,
+                        idx,
+                        "68-point landmarks",
+                    );
+                }
             }
+            let signals = face_signals_from_data(&actual, &img);
+            assert_face_signals_close(item.get("face_signals"), &signals, &path);
+            rust_infos.push(fixture_fast_info_with_actual_faces(item, item_idx, &actual));
         }
+        assert_expert_grouping_matches_fixture(&value, &rust_infos);
+    }
+
+    fn fixture_image_path(workspace: &Path, item: &serde_json::Value) -> std::path::PathBuf {
+        let raw = item["path"].as_str().expect("path");
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace.join(path)
+        }
+    }
+
+    fn fixture_fast_info(item: &serde_json::Value, idx: usize) -> pianke_core::fast::FastImageInfo {
+        let dinov2 = item["embedding"]
+            .as_array()
+            .expect("embedding")
+            .iter()
+            .map(|v| v.as_f64().expect("embedding value") as f32)
+            .collect::<Vec<_>>();
+        let face_embeddings = item["faces"]
+            .as_array()
+            .map(|faces| {
+                faces
+                    .iter()
+                    .map(|face| {
+                        face["embedding"]
+                            .as_array()
+                            .expect("face embedding")
+                            .iter()
+                            .map(|v| v.as_f64().expect("face embedding value") as f32)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        pianke_core::fast::FastImageInfo {
+            path: item["path"].as_str().expect("path").to_string(),
+            phash: Some("0".repeat(16)),
+            timestamp: Some(idx as f64 * 10.0),
+            mtime: Some(idx as f64 * 10.0),
+            dinov2: Some(dinov2),
+            face_embeddings,
+            ..pianke_core::fast::FastImageInfo::default()
+        }
+    }
+
+    fn fixture_fast_info_with_actual_faces(
+        item: &serde_json::Value,
+        idx: usize,
+        faces: &[FaceInfo],
+    ) -> pianke_core::fast::FastImageInfo {
+        let mut info = fixture_fast_info(item, idx);
+        info.face_embeddings = faces.iter().map(|face| face.embedding.clone()).collect();
+        info
+    }
+
+    fn assert_expert_grouping_matches_fixture(
+        value: &serde_json::Value,
+        infos: &[pianke_core::fast::FastImageInfo],
+    ) {
+        let Some(expected) = value["grouping"]["group_indices"].as_array() else {
+            return;
+        };
+        let expected = expected
+            .iter()
+            .map(|group| {
+                group
+                    .as_array()
+                    .expect("group array")
+                    .iter()
+                    .map(|v| v.as_u64().expect("group index") as usize)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let actual = crate::expert_cluster(infos);
+        assert_eq!(actual, expected, "Expert/Tycoon grouping parity mismatch");
     }
 
     fn bbox_max_abs_delta(actual: [f32; 4], expected: &[f32]) -> f32 {
@@ -1112,6 +1227,130 @@ mod tests {
             .zip(expected.iter())
             .map(|(a, b)| (*a - *b).abs())
             .fold(0.0, f32::max)
+    }
+
+    fn optional_points(value: Option<&serde_json::Value>) -> Option<Vec<[f32; 2]>> {
+        let value = value?;
+        if value.is_null() {
+            return None;
+        }
+        Some(
+            value
+                .as_array()
+                .expect("points array")
+                .iter()
+                .map(|point| {
+                    let arr = point.as_array().expect("point");
+                    [
+                        arr[0].as_f64().expect("x") as f32,
+                        arr[1].as_f64().expect("y") as f32,
+                    ]
+                })
+                .collect(),
+        )
+    }
+
+    fn assert_points_close(
+        actual: &[[f32; 2]],
+        expected: &[[f32; 2]],
+        tolerance_px: f32,
+        path: &Path,
+        face_idx: usize,
+        label: &str,
+    ) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{label} count mismatch for {} face {}",
+            path.display(),
+            face_idx
+        );
+        let max_delta = actual
+            .iter()
+            .zip(expected.iter())
+            .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()])
+            .fold(0.0, f32::max);
+        assert!(
+            max_delta <= tolerance_px,
+            "{label} mismatch for {} face {}: max_delta={max_delta}",
+            path.display(),
+            face_idx
+        );
+    }
+
+    fn assert_face_signals_close(
+        expected: Option<&serde_json::Value>,
+        actual: &FaceSignals,
+        path: &Path,
+    ) {
+        let Some(expected) = expected else {
+            return;
+        };
+        assert_eq!(
+            actual.face_count,
+            expected["face_count"].as_u64().unwrap_or(0) as usize,
+            "face_count signal mismatch for {}",
+            path.display()
+        );
+        assert_eq!(
+            actual.face_clipped,
+            expected["face_clipped"].as_bool().unwrap_or(false),
+            "face_clipped signal mismatch for {}",
+            path.display()
+        );
+        assert_optional_f64_close(
+            actual.face_sharpness,
+            expected.get("face_sharpness"),
+            5.0,
+            path,
+            "face_sharpness",
+        );
+        assert_optional_f64_close(
+            actual.eyes_open_score,
+            expected.get("eyes_open_score"),
+            0.03,
+            path,
+            "eyes_open_score",
+        );
+        assert_eq!(
+            actual.faces_detail.len(),
+            expected["faces_detail"].as_array().map_or(0, Vec::len),
+            "faces_detail count mismatch for {}",
+            path.display()
+        );
+    }
+
+    fn assert_optional_f64_close(
+        actual: Option<f64>,
+        expected: Option<&serde_json::Value>,
+        tolerance: f64,
+        path: &Path,
+        label: &str,
+    ) {
+        let expected = expected.and_then(|v| v.as_f64());
+        match (actual, expected) {
+            (Some(a), Some(e)) => assert!(
+                (a - e).abs() <= tolerance,
+                "{label} mismatch for {}: actual={a}, expected={e}",
+                path.display()
+            ),
+            (None, None) => {}
+            other => panic!(
+                "{label} presence mismatch for {}: {other:?}",
+                path.display()
+            ),
+        }
+    }
+
+    fn l2_norm(values: &[f32]) -> f64 {
+        values
+            .iter()
+            .map(|v| {
+                let v = *v as f64;
+                v * v
+            })
+            .sum::<f64>()
+            .sqrt()
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f64 {

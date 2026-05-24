@@ -70,5 +70,8 @@ src-tauri/binaries/python/
 *.log
 .tmp_*/
 
+# Local Expert parity outputs may reference private photos under .tmp_expert_parity.
+fixtures/expert_parity/*.json
+
 # 内部审计 / 设计文档，不入库
 docs/
