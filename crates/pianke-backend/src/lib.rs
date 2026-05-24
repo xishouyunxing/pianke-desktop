@@ -509,7 +509,8 @@ async fn health() -> impl IntoResponse {
 async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
     let expert_installed = ctx.models.is_installed("expert");
     let expert_caps = ctx.models.expert_capabilities();
-    let face_aware = expert_installed && expert_caps.insightface_detection
+    let face_aware = expert_installed
+        && expert_caps.insightface_detection
         && expert_caps.insightface_recognition
         && expert_caps.insightface_landmark;
     let llm_status = ctx.llm.provider_status();
@@ -848,8 +849,9 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
             Err(err) if req.engine == "tycoon" => {
                 let mut state = ctx.inner.lock().expect("backend state lock");
                 state.job.status = "error".to_string();
-                state.job.error =
-                    Some(format!("Tycoon 模式需要先安装 Expert DINOv2 + 人脸组件: {err}"));
+                state.job.error = Some(format!(
+                    "Tycoon 模式需要先安装 Expert DINOv2 + 人脸组件: {err}"
+                ));
                 state.job.finished_at = now_secs();
                 return;
             }
@@ -885,8 +887,9 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
                 Err(err) if req.engine == "tycoon" => {
                     let mut state = ctx.inner.lock().expect("backend state lock");
                     state.job.status = "error".to_string();
-                    state.job.error =
-                        Some(format!("Tycoon 模式需要可用的人脸组件，当前加载失败: {err}"));
+                    state.job.error = Some(format!(
+                        "Tycoon 模式需要可用的人脸组件，当前加载失败: {err}"
+                    ));
                     state.job.finished_at = now_secs();
                     return;
                 }
@@ -974,8 +977,10 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
                     let Some(analysis) = pair.analysis.as_ref() else {
                         let mut state = ctx.inner.lock().expect("backend state lock");
                         state.job.status = "error".to_string();
-                        state.job.error =
-                            Some("Expert/Tycoon 人脸模式需要可解码的 JPG/PNG/WebP/TIFF companion".to_string());
+                        state.job.error = Some(
+                            "Expert/Tycoon 人脸模式需要可解码的 JPG/PNG/WebP/TIFF companion"
+                                .to_string(),
+                        );
                         state.job.finished_at = now_secs();
                         return;
                     };
@@ -1330,7 +1335,11 @@ fn apply_face_analysis(
     Ok(())
 }
 
-fn apply_face_infos(record: &mut InfoRecord, img: &DynamicImage, faces: Vec<expert_vision::FaceInfo>) {
+fn apply_face_infos(
+    record: &mut InfoRecord,
+    img: &DynamicImage,
+    faces: Vec<expert_vision::FaceInfo>,
+) {
     let signals = expert_vision::face_signals_from_data(&faces, img);
     let mut quality = record.info.quality.clone().unwrap_or_default();
     quality
@@ -1343,10 +1352,14 @@ fn apply_face_infos(record: &mut InfoRecord, img: &DynamicImage, faces: Vec<expe
         .extra
         .insert("face_clipped".to_string(), json!(signals.face_clipped));
     if let Some(v) = signals.eyes_open_score {
-        quality.extra.insert("eyes_open_score".to_string(), json!(v));
+        quality
+            .extra
+            .insert("eyes_open_score".to_string(), json!(v));
     }
     if let Some(v) = signals.face_area_ratio {
-        quality.extra.insert("face_area_ratio".to_string(), json!(v));
+        quality
+            .extra
+            .insert("face_area_ratio".to_string(), json!(v));
     }
     if let Some(v) = signals.det_score {
         quality.extra.insert("det_score".to_string(), json!(v));
@@ -1365,10 +1378,7 @@ fn apply_face_quality_flags(quality: &mut QualityInfo) {
         .get("face_count")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let face_sharp = quality
-        .extra
-        .get("face_sharpness")
-        .and_then(|v| v.as_f64());
+    let face_sharp = quality.extra.get("face_sharpness").and_then(|v| v.as_f64());
     let eyes = quality
         .extra
         .get("eyes_open_score")
@@ -1736,7 +1746,10 @@ fn expert_gps_similarity(a: Option<&ExifSummary>, b: Option<&ExifSummary>) -> Op
 fn expert_filename_similarity(a: &str, b: &str) -> f64 {
     let name_a = file_name(a);
     let name_b = file_name(b);
-    let (Some(n1), Some(n2)) = (filename_number_from_name(&name_a), filename_number_from_name(&name_b)) else {
+    let (Some(n1), Some(n2)) = (
+        filename_number_from_name(&name_a),
+        filename_number_from_name(&name_b),
+    ) else {
         return 0.0;
     };
     if filename_prefix_from_name(&name_a) != filename_prefix_from_name(&name_b) {
@@ -1751,7 +1764,10 @@ fn expert_filename_similarity(a: &str, b: &str) -> f64 {
 }
 
 fn filename_number_from_name(name: &str) -> Option<u64> {
-    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
     let digits = stem
         .chars()
         .rev()
@@ -1765,8 +1781,12 @@ fn filename_number_from_name(name: &str) -> Option<u64> {
 }
 
 fn filename_prefix_from_name(name: &str) -> String {
-    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
-    stem.trim_end_matches(|ch: char| ch.is_ascii_digit()).to_string()
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    stem.trim_end_matches(|ch: char| ch.is_ascii_digit())
+        .to_string()
 }
 
 fn whash_image_scale(width: u32, height: u32) -> u32 {

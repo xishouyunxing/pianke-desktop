@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pic_selecter import vision  # noqa: E402
+from pic_selecter import quality  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
@@ -56,7 +57,9 @@ def main() -> None:
             }
             if args.faces:
                 faces = vision.extract_faces(rgb)
+                face_signals = quality._face_signals_from_data(faces, rgb)
                 item["face_count"] = len(faces)
+                item["face_signals"] = face_signals
                 item["faces"] = [
                     {
                         "bbox": [int(v) for v in face["bbox"]],

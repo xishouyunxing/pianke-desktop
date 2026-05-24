@@ -1,4 +1,6 @@
-use image::{imageops::FilterType, DynamicImage, GenericImageView, GrayImage};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, GrayImage, Rgb, RgbImage};
+use imageproc::geometric_transformations::{warp_into, Interpolation, Projection};
+use nalgebra::{DMatrix, DVector};
 use ndarray::Array4;
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
@@ -12,6 +14,16 @@ const PREPROCESSOR_PATH: &str = "preprocessor.json";
 const FACE_DET_MODEL_PATH: &str = "models/insightface/det_10g.onnx";
 const FACE_REC_MODEL_PATH: &str = "models/insightface/w600k_r50.onnx";
 const FACE_LANDMARK_MODEL_PATH: &str = "models/insightface/1k3d68.onnx";
+const DET_SIZE: u32 = 640;
+const DET_SCORE_THRESHOLD: f32 = 0.5;
+const DET_NMS_THRESHOLD: f32 = 0.4;
+const ARC_FACE_TEMPLATE: [[f32; 2]; 5] = [
+    [38.2946, 51.6963],
+    [73.5318, 51.5014],
+    [56.0252, 71.7366],
+    [41.5493, 92.3655],
+    [70.7299, 92.2041],
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dinov2Preprocessor {
@@ -103,7 +115,10 @@ impl InsightFaceModels {
         let landmark_path = component_dir.join(FACE_LANDMARK_MODEL_PATH);
         for path in [&det_path, &rec_path, &landmark_path] {
             if !path.exists() {
-                return Err(format!("Expert 组件缺少 InsightFace ONNX 文件: {}", path.display()));
+                return Err(format!(
+                    "Expert 组件缺少 InsightFace ONNX 文件: {}",
+                    path.display()
+                ));
             }
         }
         Ok(Self {
@@ -114,15 +129,24 @@ impl InsightFaceModels {
     }
 
     pub fn extract_faces(&mut self, img: &DynamicImage) -> Result<Vec<FaceInfo>, String> {
-        let rgb = resize_max_side(img, 1024).to_rgb8();
-        let _detector_preflight = preprocess_bgr_chw(&DynamicImage::ImageRgb8(rgb.clone()), 640, 640)?;
-        let faces = run_detector_placeholder(&mut self.detector)?;
+        let det_input = DetectorInput::from_image(img, DET_SIZE)?;
+        let faces = run_detector(&mut self.detector, &det_input)?;
         let mut out = Vec::new();
         for face in faces {
-            let rec = preprocess_face_crop(img, face.bbox, 112, 112)?;
+            let kps = face.kps.clone().ok_or_else(|| {
+                "InsightFace detector did not return 5-point landmarks".to_string()
+            })?;
+            let (aligned, _inverse) = align_face(img, &kps, 112)?;
+            let rec = preprocess_rgb_chw(
+                &DynamicImage::ImageRgb8(aligned.clone()),
+                112,
+                112,
+                127.5,
+                127.5,
+            )?;
             let mut embedding = run_embedding(&mut self.recognizer, rec)?;
             normalize_l2(&mut embedding)?;
-            let landmark = run_landmark_placeholder(&mut self.landmark)?;
+            let landmark = run_landmark(&mut self.landmark, img, face.bbox)?;
             out.push(FaceInfo {
                 bbox: face.bbox,
                 det_score: face.det_score,
@@ -230,101 +254,398 @@ struct DetectorFace {
     kps: Option<Vec<[f32; 2]>>,
 }
 
-fn run_detector_placeholder(session: &mut Session) -> Result<Vec<DetectorFace>, String> {
-    let input = Array4::<f32>::zeros((1, 3, 640, 640));
-    let input_view = TensorRef::from_array_view(&input)
-        .map_err(|e| format!("创建 InsightFace detector 输入失败: {e}"))?;
+struct DetectorInput {
+    tensor: Array4<f32>,
+    scale: f32,
+    pad_x: f32,
+    pad_y: f32,
+}
+
+impl DetectorInput {
+    fn from_image(img: &DynamicImage, det_size: u32) -> Result<Self, String> {
+        let (w, h) = img.dimensions();
+        if w == 0 || h == 0 || det_size == 0 {
+            return Err("InsightFace detector input size is invalid".to_string());
+        }
+        let scale = (det_size as f32 / w as f32).min(det_size as f32 / h as f32);
+        let resized_w = (w as f32 * scale).max(1.0) as u32;
+        let resized_h = (h as f32 * scale).max(1.0) as u32;
+        let resized =
+            image::imageops::resize(&img.to_rgb8(), resized_w, resized_h, FilterType::Triangle);
+        let mut canvas = RgbImage::from_pixel(det_size, det_size, Rgb([0, 0, 0]));
+        image::imageops::replace(&mut canvas, &resized, 0, 0);
+        let tensor = rgb_to_chw(&canvas, 127.5, 128.0)?;
+        Ok(Self {
+            tensor,
+            scale,
+            pad_x: 0.0,
+            pad_y: 0.0,
+        })
+    }
+}
+
+fn run_detector(session: &mut Session, input: &DetectorInput) -> Result<Vec<DetectorFace>, String> {
+    let input_view = TensorRef::from_array_view(&input.tensor)
+        .map_err(|e| format!("create InsightFace detector input failed: {e}"))?;
     let outputs = session
         .run(ort::inputs![input_view])
-        .map_err(|e| format!("运行 InsightFace detector 失败: {e}"))?;
-    if outputs.len() == 0 {
-        return Err("InsightFace detector 没有输出".to_string());
+        .map_err(|e| format!("run InsightFace detector failed: {e}"))?;
+    if outputs.len() < 6 {
+        return Err(format!(
+            "InsightFace detector output count is invalid: {}",
+            outputs.len()
+        ));
     }
-    Ok(Vec::new())
+    let strides = [8usize, 16, 32];
+    let fmc = 3usize;
+    let mut candidates = Vec::new();
+    for (level, stride) in strides.iter().enumerate() {
+        let score = output_vec(&outputs, level)?;
+        let bbox = output_vec(&outputs, level + fmc)?;
+        let kps = if outputs.len() >= 9 {
+            Some(output_vec(&outputs, level + fmc * 2)?)
+        } else {
+            None
+        };
+        decode_detector_level(
+            score,
+            bbox,
+            kps,
+            *stride,
+            DET_SIZE as usize,
+            input,
+            &mut candidates,
+        )?;
+    }
+    candidates.sort_by(|a, b| {
+        b.det_score
+            .partial_cmp(&a.det_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let keep = nms(&candidates, DET_NMS_THRESHOLD);
+    Ok(keep
+        .into_iter()
+        .map(|idx| candidates[idx].clone())
+        .collect())
+}
+
+fn output_vec(
+    outputs: &ort::session::SessionOutputs<'_>,
+    index: usize,
+) -> Result<Vec<f32>, String> {
+    outputs[index]
+        .try_extract_array::<f32>()
+        .map(|arr| arr.iter().copied().collect())
+        .map_err(|e| format!("read InsightFace detector output {index} failed: {e}"))
+}
+
+fn decode_detector_level(
+    scores: Vec<f32>,
+    boxes: Vec<f32>,
+    landmarks: Option<Vec<f32>>,
+    stride: usize,
+    det_size: usize,
+    input: &DetectorInput,
+    out: &mut Vec<DetectorFace>,
+) -> Result<(), String> {
+    let height = det_size / stride;
+    let width = det_size / stride;
+    let anchor_count = height * width * 2;
+    if scores.len() < anchor_count || boxes.len() < anchor_count * 4 {
+        return Err(format!(
+            "InsightFace detector output shape mismatch at stride {stride}: scores={}, boxes={}",
+            scores.len(),
+            boxes.len()
+        ));
+    }
+    if let Some(values) = &landmarks {
+        if values.len() < anchor_count * 10 {
+            return Err(format!(
+                "InsightFace detector landmark output shape mismatch at stride {stride}: {}",
+                values.len()
+            ));
+        }
+    }
+    for idx in 0..anchor_count {
+        let det_score = scores[idx];
+        if det_score < DET_SCORE_THRESHOLD {
+            continue;
+        }
+        let cell = idx / 2;
+        let y = cell / width;
+        let x = cell % width;
+        let anchor = [x as f32 * stride as f32, y as f32 * stride as f32];
+        let b = &boxes[idx * 4..idx * 4 + 4];
+        let mut decoded = distance2bbox(
+            anchor,
+            [
+                b[0] * stride as f32,
+                b[1] * stride as f32,
+                b[2] * stride as f32,
+                b[3] * stride as f32,
+            ],
+            det_size as f32,
+        );
+        decoded[0] = (decoded[0] - input.pad_x) / input.scale;
+        decoded[1] = (decoded[1] - input.pad_y) / input.scale;
+        decoded[2] = (decoded[2] - input.pad_x) / input.scale;
+        decoded[3] = (decoded[3] - input.pad_y) / input.scale;
+        let kps = landmarks.as_ref().map(|values| {
+            let mut points = Vec::with_capacity(5);
+            for p in 0..5 {
+                let dx = values[idx * 10 + p * 2];
+                let dy = values[idx * 10 + p * 2 + 1];
+                points.push([
+                    (anchor[0] + dx * stride as f32 - input.pad_x) / input.scale,
+                    (anchor[1] + dy * stride as f32 - input.pad_y) / input.scale,
+                ]);
+            }
+            points
+        });
+        out.push(DetectorFace {
+            bbox: decoded,
+            det_score,
+            kps,
+        });
+    }
+    Ok(())
+}
+
+fn distance2bbox(anchor: [f32; 2], distance: [f32; 4], max_shape: f32) -> [f32; 4] {
+    [
+        (anchor[0] - distance[0]).clamp(0.0, max_shape),
+        (anchor[1] - distance[1]).clamp(0.0, max_shape),
+        (anchor[0] + distance[2]).clamp(0.0, max_shape),
+        (anchor[1] + distance[3]).clamp(0.0, max_shape),
+    ]
+}
+
+fn nms(faces: &[DetectorFace], threshold: f32) -> Vec<usize> {
+    let mut order = (0..faces.len()).collect::<Vec<_>>();
+    order.sort_by(|a, b| {
+        faces[*b]
+            .det_score
+            .partial_cmp(&faces[*a].det_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut keep = Vec::new();
+    while let Some(current) = order.first().copied() {
+        keep.push(current);
+        order = order
+            .into_iter()
+            .skip(1)
+            .filter(|idx| bbox_iou(faces[current].bbox, faces[*idx].bbox) <= threshold)
+            .collect();
+    }
+    keep
+}
+
+fn bbox_iou(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let xx1 = a[0].max(b[0]);
+    let yy1 = a[1].max(b[1]);
+    let xx2 = a[2].min(b[2]);
+    let yy2 = a[3].min(b[3]);
+    let w = (xx2 - xx1 + 1.0).max(0.0);
+    let h = (yy2 - yy1 + 1.0).max(0.0);
+    let inter = w * h;
+    let area_a = ((a[2] - a[0] + 1.0).max(0.0)) * ((a[3] - a[1] + 1.0).max(0.0));
+    let area_b = ((b[2] - b[0] + 1.0).max(0.0)) * ((b[3] - b[1] + 1.0).max(0.0));
+    inter / (area_a + area_b - inter).max(1e-6)
 }
 
 fn run_embedding(session: &mut Session, input: Array4<f32>) -> Result<Vec<f32>, String> {
     let input_view = TensorRef::from_array_view(&input)
-        .map_err(|e| format!("创建 InsightFace recognizer 输入失败: {e}"))?;
+        .map_err(|e| format!("create InsightFace recognizer input failed: {e}"))?;
     let outputs = session
         .run(ort::inputs![input_view])
-        .map_err(|e| format!("运行 InsightFace recognizer 失败: {e}"))?;
+        .map_err(|e| format!("run InsightFace recognizer failed: {e}"))?;
     if outputs.len() == 0 {
-        return Err("InsightFace recognizer 没有输出".to_string());
+        return Err("InsightFace recognizer produced no outputs".to_string());
     }
     let tensor = outputs[0]
         .try_extract_array::<f32>()
-        .map_err(|e| format!("读取 InsightFace embedding 失败: {e}"))?;
+        .map_err(|e| format!("read InsightFace embedding failed: {e}"))?;
     let embedding = tensor.iter().copied().collect::<Vec<_>>();
     if embedding.len() < 128 {
-        return Err(format!("InsightFace embedding 维度异常: {}", embedding.len()));
+        return Err(format!(
+            "InsightFace embedding dimension is invalid: {}",
+            embedding.len()
+        ));
     }
     Ok(embedding)
 }
 
-fn run_landmark_placeholder(session: &mut Session) -> Result<Option<Vec<[f32; 2]>>, String> {
-    let input = Array4::<f32>::zeros((1, 3, 192, 192));
+fn run_landmark(
+    session: &mut Session,
+    img: &DynamicImage,
+    bbox: [f32; 4],
+) -> Result<Option<Vec<[f32; 2]>>, String> {
+    let (crop, inverse) = align_landmark_crop(img, bbox, 192)?;
+    let input = preprocess_rgb_chw(&DynamicImage::ImageRgb8(crop), 192, 192, 0.0, 1.0)?;
     let input_view = TensorRef::from_array_view(&input)
-        .map_err(|e| format!("创建 InsightFace landmark 输入失败: {e}"))?;
+        .map_err(|e| format!("create InsightFace landmark input failed: {e}"))?;
     let outputs = session
         .run(ort::inputs![input_view])
-        .map_err(|e| format!("运行 InsightFace landmark 失败: {e}"))?;
+        .map_err(|e| format!("run InsightFace landmark failed: {e}"))?;
     if outputs.len() == 0 {
-        return Err("InsightFace landmark 没有输出".to_string());
+        return Err("InsightFace landmark produced no outputs".to_string());
     }
-    Ok(None)
+    let tensor = outputs[0]
+        .try_extract_array::<f32>()
+        .map_err(|e| format!("read InsightFace landmark output failed: {e}"))?;
+    let values = tensor.iter().copied().collect::<Vec<_>>();
+    if values.len() < 136 {
+        return Ok(None);
+    }
+    let mut points = Vec::with_capacity(68);
+    for i in 0..68 {
+        let x = (values[i * 2] + 1.0) * 96.0;
+        let y = (values[i * 2 + 1] + 1.0) * 96.0;
+        points.push(apply_affine(inverse, [x, y]));
+    }
+    Ok(Some(points))
 }
 
-pub fn preprocess_bgr_chw(
+pub fn preprocess_rgb_chw(
     img: &DynamicImage,
     width: u32,
     height: u32,
+    mean: f32,
+    std: f32,
 ) -> Result<Array4<f32>, String> {
     if width == 0 || height == 0 {
-        return Err("InsightFace 输入尺寸不能为 0".to_string());
+        return Err("InsightFace input size must not be zero".to_string());
     }
     let resized = image::imageops::resize(&img.to_rgb8(), width, height, FilterType::Triangle);
+    rgb_to_chw(&resized, mean, std)
+}
+
+fn rgb_to_chw(img: &RgbImage, mean: f32, std: f32) -> Result<Array4<f32>, String> {
+    if std.abs() < 1e-8 {
+        return Err("InsightFace std must not be zero".to_string());
+    }
+    let (width, height) = img.dimensions();
     let plane = (width * height) as usize;
     let mut data = vec![0.0f32; plane * 3];
     for y in 0..height {
         for x in 0..width {
-            let p = resized.get_pixel(x, y).0;
+            let p = img.get_pixel(x, y).0;
             let idx = (y * width + x) as usize;
-            data[idx] = p[2] as f32;
-            data[plane + idx] = p[1] as f32;
-            data[plane * 2 + idx] = p[0] as f32;
+            data[idx] = (p[0] as f32 - mean) / std;
+            data[plane + idx] = (p[1] as f32 - mean) / std;
+            data[plane * 2 + idx] = (p[2] as f32 - mean) / std;
         }
     }
     Array4::from_shape_vec((1, 3, height as usize, width as usize), data)
-        .map_err(|e| format!("创建 InsightFace BGR NCHW 输入失败: {e}"))
+        .map_err(|e| format!("create InsightFace RGB NCHW input failed: {e}"))
 }
 
-fn preprocess_face_crop(
+fn align_face(
+    img: &DynamicImage,
+    kps: &[[f32; 2]],
+    image_size: u32,
+) -> Result<(RgbImage, [f32; 6]), String> {
+    if kps.len() < 5 {
+        return Err("InsightFace detector returned fewer than 5 landmarks".to_string());
+    }
+    let dst = ARC_FACE_TEMPLATE
+        .map(|[x, y]| [x * image_size as f32 / 112.0, y * image_size as f32 / 112.0]);
+    let src = [kps[0], kps[1], kps[2], kps[3], kps[4]];
+    let forward = estimate_similarity(&src, &dst)?;
+    let inverse = invert_affine(forward)?;
+    let projection = Projection::from_matrix([
+        forward[0], forward[1], forward[2], forward[3], forward[4], forward[5], 0.0, 0.0, 1.0,
+    ])
+    .ok_or_else(|| "create face alignment projection failed".to_string())?;
+    let rgb = img.to_rgb8();
+    let mut aligned = RgbImage::from_pixel(image_size, image_size, Rgb([0, 0, 0]));
+    warp_into(
+        &rgb,
+        &projection,
+        Interpolation::Bilinear,
+        Rgb([0, 0, 0]),
+        &mut aligned,
+    );
+    Ok((aligned, inverse))
+}
+
+fn align_landmark_crop(
     img: &DynamicImage,
     bbox: [f32; 4],
-    width: u32,
-    height: u32,
-) -> Result<Array4<f32>, String> {
-    let (full_w, full_h) = img.dimensions();
-    let x1 = bbox[0].floor().clamp(0.0, full_w.saturating_sub(1) as f32) as u32;
-    let y1 = bbox[1].floor().clamp(0.0, full_h.saturating_sub(1) as f32) as u32;
-    let x2 = bbox[2].ceil().clamp((x1 + 1) as f32, full_w as f32) as u32;
-    let y2 = bbox[3].ceil().clamp((y1 + 1) as f32, full_h as f32) as u32;
-    let crop = img.crop_imm(x1, y1, x2 - x1, y2 - y1);
-    preprocess_bgr_chw(&crop, width, height)
+    image_size: u32,
+) -> Result<(RgbImage, [f32; 6]), String> {
+    let w = (bbox[2] - bbox[0]).max(1.0);
+    let h = (bbox[3] - bbox[1]).max(1.0);
+    let center = [(bbox[2] + bbox[0]) * 0.5, (bbox[3] + bbox[1]) * 0.5];
+    let scale = image_size as f32 / (w.max(h) * 1.5);
+    let forward = [
+        scale,
+        0.0,
+        image_size as f32 * 0.5 - center[0] * scale,
+        0.0,
+        scale,
+        image_size as f32 * 0.5 - center[1] * scale,
+    ];
+    let inverse = invert_affine(forward)?;
+    let projection = Projection::from_matrix([
+        forward[0], forward[1], forward[2], forward[3], forward[4], forward[5], 0.0, 0.0, 1.0,
+    ])
+    .ok_or_else(|| "create landmark crop projection failed".to_string())?;
+    let rgb = img.to_rgb8();
+    let mut crop = RgbImage::from_pixel(image_size, image_size, Rgb([0, 0, 0]));
+    warp_into(
+        &rgb,
+        &projection,
+        Interpolation::Bilinear,
+        Rgb([0, 0, 0]),
+        &mut crop,
+    );
+    Ok((crop, inverse))
 }
 
-fn resize_max_side(img: &DynamicImage, max_side: u32) -> DynamicImage {
-    let (w, h) = img.dimensions();
-    if w.max(h) <= max_side {
-        return img.clone();
+fn estimate_similarity(src: &[[f32; 2]; 5], dst: &[[f32; 2]; 5]) -> Result<[f32; 6], String> {
+    let mut a = DMatrix::<f32>::zeros(10, 4);
+    let mut b = DVector::<f32>::zeros(10);
+    for i in 0..5 {
+        let x = src[i][0];
+        let y = src[i][1];
+        a[(i * 2, 0)] = x;
+        a[(i * 2, 1)] = -y;
+        a[(i * 2, 2)] = 1.0;
+        a[(i * 2, 3)] = 0.0;
+        b[i * 2] = dst[i][0];
+        a[(i * 2 + 1, 0)] = y;
+        a[(i * 2 + 1, 1)] = x;
+        a[(i * 2 + 1, 2)] = 0.0;
+        a[(i * 2 + 1, 3)] = 1.0;
+        b[i * 2 + 1] = dst[i][1];
     }
-    let scale = max_side as f32 / w.max(h) as f32;
-    img.resize(
-        (w as f32 * scale).round().max(1.0) as u32,
-        (h as f32 * scale).round().max(1.0) as u32,
-        FilterType::Lanczos3,
-    )
+    let svd = a.svd(true, true);
+    let x = svd
+        .solve(&b, 1e-6)
+        .map_err(|e| format!("solve face similarity transform failed: {e}"))?;
+    Ok([x[0], -x[1], x[2], x[1], x[0], x[3]])
+}
+
+fn invert_affine(m: [f32; 6]) -> Result<[f32; 6], String> {
+    let det = m[0] * m[4] - m[1] * m[3];
+    if det.abs() < 1e-8 {
+        return Err("face alignment transform is singular".to_string());
+    }
+    let inv00 = m[4] / det;
+    let inv01 = -m[1] / det;
+    let inv10 = -m[3] / det;
+    let inv11 = m[0] / det;
+    let inv02 = -(inv00 * m[2] + inv01 * m[5]);
+    let inv12 = -(inv10 * m[2] + inv11 * m[5]);
+    Ok([inv00, inv01, inv02, inv10, inv11, inv12])
+}
+
+fn apply_affine(m: [f32; 6], p: [f32; 2]) -> [f32; 2] {
+    [
+        m[0] * p[0] + m[1] * p[1] + m[2],
+        m[3] * p[0] + m[4] * p[1] + m[5],
+    ]
 }
 
 pub fn face_signals_from_data(faces: &[FaceInfo], img: &DynamicImage) -> FaceSignals {
@@ -568,6 +889,82 @@ mod tests {
     }
 
     #[test]
+    fn distance_bbox_and_nms_follow_scrfd_geometry() {
+        let bbox = distance2bbox([10.0, 20.0], [2.0, 3.0, 4.0, 5.0], 640.0);
+        assert_eq!(bbox, [8.0, 17.0, 14.0, 25.0]);
+        let faces = vec![
+            DetectorFace {
+                bbox: [0.0, 0.0, 20.0, 20.0],
+                det_score: 0.9,
+                kps: None,
+            },
+            DetectorFace {
+                bbox: [2.0, 2.0, 22.0, 22.0],
+                det_score: 0.8,
+                kps: None,
+            },
+            DetectorFace {
+                bbox: [80.0, 80.0, 100.0, 100.0],
+                det_score: 0.7,
+                kps: None,
+            },
+        ];
+        assert_eq!(nms(&faces, 0.4), vec![0, 2]);
+    }
+
+    #[test]
+    fn rgb_chw_preprocess_matches_swap_rb_effect() {
+        let img = RgbImage::from_pixel(1, 1, Rgb([10, 20, 30]));
+        let arr = rgb_to_chw(&img, 0.0, 1.0).expect("preprocess");
+        assert_eq!(arr.shape(), &[1, 3, 1, 1]);
+        assert_eq!(arr[[0, 0, 0, 0]], 10.0);
+        assert_eq!(arr[[0, 1, 0, 0]], 20.0);
+        assert_eq!(arr[[0, 2, 0, 0]], 30.0);
+    }
+
+    #[test]
+    fn arcface_alignment_transform_maps_landmarks_to_template() {
+        let src = ARC_FACE_TEMPLATE;
+        let dst = ARC_FACE_TEMPLATE;
+        let m = estimate_similarity(&src, &dst).expect("similarity");
+        for point in src {
+            let mapped = apply_affine(m, point);
+            assert!((mapped[0] - point[0]).abs() < 1e-3);
+            assert!((mapped[1] - point[1]).abs() < 1e-3);
+        }
+        let inv = invert_affine(m).expect("invert");
+        let p = apply_affine(inv, apply_affine(m, [12.0, 34.0]));
+        assert!((p[0] - 12.0).abs() < 1e-3);
+        assert!((p[1] - 34.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arcface_alignment_warps_source_landmarks_to_template() {
+        let src = ARC_FACE_TEMPLATE.map(|[x, y]| [x + 8.0, y + 5.0]);
+        let mut img = RgbImage::from_pixel(128, 128, Rgb([0, 0, 0]));
+        for [x, y] in src {
+            for yy in (y as i32 - 1)..=(y as i32 + 1) {
+                for xx in (x as i32 - 1)..=(x as i32 + 1) {
+                    if xx >= 0 && yy >= 0 {
+                        img.put_pixel(xx as u32, yy as u32, Rgb([255, 255, 255]));
+                    }
+                }
+            }
+        }
+        let (aligned, _) =
+            align_face(&DynamicImage::ImageRgb8(img), &src, 112).expect("align face");
+        for [x, y] in ARC_FACE_TEMPLATE {
+            let mut local_sum = 0u32;
+            for yy in (y as i32 - 1)..=(y as i32 + 1) {
+                for xx in (x as i32 - 1)..=(x as i32 + 1) {
+                    local_sum += aligned.get_pixel(xx as u32, yy as u32).0[0] as u32;
+                }
+            }
+            assert!(local_sum > 200, "landmark was not warped to template");
+        }
+    }
+
+    #[test]
     fn face_signals_compute_main_face_sharpness_and_eye_score() {
         let img = DynamicImage::ImageRgb8(RgbImage::from_fn(120, 120, |x, y| {
             let v = if (x + y) % 2 == 0 { 255 } else { 0 };
@@ -642,5 +1039,92 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn insightface_golden_fixture_matches_when_configured() {
+        let Ok(component_dir) = std::env::var("PIANKE_EXPERT_COMPONENT_DIR") else {
+            return;
+        };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .join("fixtures")
+            .join("expert_parity")
+            .join("insightface.json");
+        if !fixture.exists() {
+            return;
+        }
+        let text = fs::read_to_string(&fixture).expect("read InsightFace golden fixture");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("parse InsightFace golden fixture");
+        let mut model = InsightFaceModels::from_component_dir(Path::new(&component_dir))
+            .expect("load InsightFace models");
+        for item in value["items"].as_array().expect("items") {
+            let path = Path::new(item["path"].as_str().expect("path"));
+            let img = image::open(path).expect("load fixture image");
+            let actual = model.extract_faces(&img).expect("extract faces");
+            let expected = item["faces"].as_array().expect("faces");
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "face count mismatch for {}",
+                path.display()
+            );
+            for (idx, (act, exp)) in actual.iter().zip(expected.iter()).enumerate() {
+                let exp_bbox = exp["bbox"]
+                    .as_array()
+                    .expect("bbox")
+                    .iter()
+                    .map(|v| v.as_f64().expect("bbox value") as f32)
+                    .collect::<Vec<_>>();
+                let iou = bbox_iou(
+                    act.bbox,
+                    [exp_bbox[0], exp_bbox[1], exp_bbox[2], exp_bbox[3]],
+                );
+                assert!(
+                    iou >= 0.98 || bbox_max_abs_delta(act.bbox, &exp_bbox) <= 2.0,
+                    "bbox mismatch for {} face {}: iou={iou}",
+                    path.display(),
+                    idx
+                );
+                let expected_embedding = exp["embedding"]
+                    .as_array()
+                    .expect("embedding")
+                    .iter()
+                    .map(|v| v.as_f64().expect("embedding value") as f32)
+                    .collect::<Vec<_>>();
+                let cosine = cosine(&act.embedding, &expected_embedding);
+                assert!(
+                    cosine >= 0.999,
+                    "embedding cosine below threshold for {} face {}: {cosine}",
+                    path.display(),
+                    idx
+                );
+            }
+        }
+    }
+
+    fn bbox_max_abs_delta(actual: [f32; 4], expected: &[f32]) -> f32 {
+        actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (*a - *b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let x = *x as f64;
+            let y = *y as f64;
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        dot / (na.sqrt() * nb.sqrt()).max(1e-12)
     }
 }
