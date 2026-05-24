@@ -1,5 +1,6 @@
 use pianke_core::fast::{
     average_hash_from_luma, difference_hash_from_luma, perceptual_hash_from_luma,
+    wavelet_hash_from_luma,
 };
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
@@ -9,6 +10,7 @@ struct HashGolden {
     average_8x8: AverageGolden,
     difference_9x8: DifferenceGolden,
     perceptual_32x32: PerceptualGolden,
+    wavelet_32x32: Option<WaveletGolden>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +28,11 @@ struct DifferenceGolden {
 #[derive(Debug, Deserialize)]
 struct PerceptualGolden {
     phash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaveletGolden {
+    whash: String,
 }
 
 #[test]
@@ -58,4 +65,10 @@ fn synthetic_hashes_match_python_imagehash_golden() {
         perceptual_hash_from_luma(&phash_samples, 8).as_deref(),
         Some(golden.perceptual_32x32.phash.as_str())
     );
+    if let Some(wavelet) = golden.wavelet_32x32 {
+        assert_eq!(
+            wavelet_hash_from_luma(&phash_samples, 8, 32).as_deref(),
+            Some(wavelet.whash.as_str())
+        );
+    }
 }

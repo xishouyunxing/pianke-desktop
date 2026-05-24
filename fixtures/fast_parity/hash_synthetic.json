@@ -30,5 +30,9 @@
   "perceptual_32x32": {
     "formula": "(x * 7 + y * 11 + (x * y) % 17) % 256",
     "phash": "9748943f602d5ef8"
+  },
+  "wavelet_32x32": {
+    "formula": "(x * 7 + y * 11 + (x * y) % 17) % 256",
+    "whash": "0f3e78e0c1870f3e"
   }
 }

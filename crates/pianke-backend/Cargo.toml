@@ -6,13 +6,18 @@ description = "Local Rust Fast backend for Pianke"
 
 [dependencies]
 axum = "0.7"
+ab_glyph = "0.2"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "tiff", "webp"] }
+imageproc = "0.25"
+exif = { package = "kamadak-exif", version = "0.6" }
 pianke-core = { path = "../pianke-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+once_cell = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

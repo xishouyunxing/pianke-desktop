@@ -4,6 +4,7 @@ use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use std::{
     fs,
+    io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     thread,
@@ -24,6 +25,28 @@ fn backend_dir() -> tempfile::TempDir {
     )
     .expect("write index");
     dir
+}
+
+fn start_mock_llm_server(response_body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock llm bind");
+    let port = listener.local_addr().expect("mock llm addr").port();
+    let body = response_body.to_string();
+    thread::spawn(move || {
+        for _ in 0..8 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    format!("http://127.0.0.1:{port}/v1")
 }
 
 fn write_jpg(path: &Path, seed: u8) {
@@ -61,6 +84,27 @@ fn wait_for_done(client: &Client, base: &str, token: &str) -> Value {
             panic!("job failed: {job}");
         }
         assert!(Instant::now() < deadline, "job timeout: {job}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_watermark_done(client: &Client, base: &str, token: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status: Value = client
+            .get(format!("{base}/api/watermark/status"))
+            .header("X-Token", token)
+            .send()
+            .expect("watermark status response")
+            .json()
+            .expect("watermark status json");
+        if status["status"] == "done" {
+            return status;
+        }
+        if status["status"] == "error" {
+            panic!("watermark failed: {status}");
+        }
+        assert!(Instant::now() < deadline, "watermark timeout: {status}");
         thread::sleep(Duration::from_millis(100));
     }
 }
@@ -103,6 +147,9 @@ fn token_guard_rejects_wrong_token_and_allows_valid_token() {
 fn frontend_compat_endpoints_keep_expected_shape() {
     let token = "compat-token";
     let (backend, _handle, base) = start_test_backend(token);
+    let llm_base = start_mock_llm_server(
+        r#"{"choices":[{"message":{"content":"{\"verdict\":\"reject\",\"reason\":\"too dark\",\"flaws\":\"low light\",\"fixable\":\"exposure\"}"}}]}"#,
+    );
     let photos = tempfile::tempdir().expect("photos dir");
     let a = photos.path().join("BURST_0001.jpg");
     let b = photos.path().join("BURST_0002.jpg");
@@ -120,7 +167,7 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(capabilities["face_aware"], false);
     assert_eq!(capabilities["backend"], "rust-fast");
     assert_eq!(capabilities["engines"], json!(["fast", "tycoon"]));
-    assert_eq!(capabilities["watermark"], false);
+    assert_eq!(capabilities["watermark"], true);
     assert_eq!(capabilities["expert_installed"], false);
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["python_required"], false);
@@ -254,7 +301,7 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         .header("X-Token", token)
         .json(&json!({
             "protocol": "openai_chat_completions",
-            "base_url": "https://api.example.com/v1",
+            "base_url": llm_base,
             "api_key": "secret-key",
             "model": "vision-model",
             "display_name": "Example AI"
@@ -301,7 +348,22 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         }))
         .send()
         .expect("tycoon start response");
-    assert_eq!(tycoon_start.status(), 501);
+    assert!(tycoon_start.status().is_success());
+
+    wait_for_done(&client, &base, token);
+    let job: Value = client
+        .get(format!("{base}/api/job"))
+        .header("X-Token", token)
+        .send()
+        .expect("tycoon job response")
+        .json()
+        .expect("tycoon job json");
+    assert_eq!(job["status"], "done");
+    let events = job["events"].as_array().expect("recent events");
+    assert!(!events.is_empty());
+    assert_eq!(events[0]["engine"], "tycoon");
+    assert_eq!(events[0]["verdict"], "reject");
+    assert_eq!(events[0]["reason"], "too dark");
 }
 
 #[test]
@@ -404,6 +466,95 @@ fn fast_main_flow_copies_winner_and_loser_without_moving_sources() {
             .join(file_name(&right))
             .exists(),
         "loser copy exists"
+    );
+}
+
+#[test]
+fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
+    let token = "watermark-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let a = photos.path().join("WM_0001.jpg");
+    let b = photos.path().join("WM_0002.jpg");
+    write_jpg(&a, 75);
+    fs::copy(&a, &b).expect("copy identical jpg");
+
+    let client = Client::new();
+    let templates: Value = client
+        .get(format!("{base}/api/watermark/templates"))
+        .header("X-Token", token)
+        .send()
+        .expect("templates response")
+        .json()
+        .expect("templates json");
+    assert!(templates["templates"].as_array().expect("templates").len() >= 1);
+    assert!(templates["logos"].as_array().expect("logos").is_empty());
+
+    let start_resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start response");
+    assert!(start_resp.status().is_success());
+    wait_for_done(&client, &base, token);
+
+    let group_resp: Value = client
+        .get(format!("{base}/api/group"))
+        .header("X-Token", token)
+        .send()
+        .expect("group response")
+        .json()
+        .expect("group json");
+    assert_eq!(group_resp["done"], false, "expected comparable group");
+
+    let choose_resp = client
+        .post(format!("{base}/api/choose"))
+        .header("X-Token", token)
+        .json(&json!({"loser": "right"}))
+        .send()
+        .expect("choose response");
+    assert!(choose_resp.status().is_success());
+
+    let preview: Value = client
+        .post(format!("{base}/api/watermark/preview"))
+        .header("X-Token", token)
+        .json(&json!({"template": "A", "preview_index": 0}))
+        .send()
+        .expect("preview response")
+        .json()
+        .expect("preview json");
+    assert!(preview["image_b64"].as_str().expect("preview b64").len() > 100);
+    assert_eq!(preview["total_winners"], 1);
+    assert!(preview["exif"].is_object());
+
+    let export: Value = client
+        .post(format!("{base}/api/watermark/start"))
+        .header("X-Token", token)
+        .json(&json!({"template": "A"}))
+        .send()
+        .expect("watermark start response")
+        .json()
+        .expect("watermark start json");
+    assert_eq!(export["ok"], true);
+    assert_eq!(export["total"], 1);
+
+    let status = wait_for_watermark_done(&client, &base, token);
+    assert_eq!(status["ok"], 1);
+    assert_eq!(status["failed_count"], 0);
+    let out_dir = PathBuf::from(status["out_dir"].as_str().expect("out dir"));
+    assert!(out_dir.exists(), "watermark output dir exists");
+    assert!(
+        fs::read_dir(&out_dir)
+            .expect("read output dir")
+            .flatten()
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jpg")),
+        "watermark output jpg exists"
     );
 }
 

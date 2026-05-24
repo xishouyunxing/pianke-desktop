@@ -103,6 +103,64 @@ pub fn perceptual_hash_from_luma(samples: &[u8], hash_size: usize) -> Option<Str
     Some(bits_to_imagehash_hex(&bits))
 }
 
+/// Haar wavelet hash for already resized grayscale samples.
+///
+/// This mirrors Python imagehash.whash defaults for mode="haar" and
+/// remove_max_haar_ll=true. The caller must resize to image_scale x image_scale,
+/// where image_scale is a power of two and at least hash_size.
+pub fn wavelet_hash_from_luma(
+    samples: &[u8],
+    hash_size: usize,
+    image_scale: usize,
+) -> Option<String> {
+    if hash_size < 2
+        || !hash_size.is_power_of_two()
+        || !image_scale.is_power_of_two()
+        || image_scale < hash_size
+        || samples.len() != image_scale * image_scale
+    {
+        return None;
+    }
+
+    let mut current = samples
+        .iter()
+        .map(|value| f64::from(*value) / 255.0)
+        .collect::<Vec<_>>();
+
+    // imagehash.whash removes the single lowest-frequency LL coefficient. For
+    // Haar at full depth this is equivalent to subtracting the global mean.
+    let mean = current.iter().sum::<f64>() / current.len() as f64;
+    for value in &mut current {
+        *value -= mean;
+    }
+
+    let mut current_size = image_scale;
+    while current_size > hash_size {
+        let next_size = current_size / 2;
+        let mut next = vec![0.0; next_size * next_size];
+        for y in 0..next_size {
+            for x in 0..next_size {
+                let y0 = y * 2;
+                let x0 = x * 2;
+                let a = current[y0 * current_size + x0];
+                let b = current[y0 * current_size + x0 + 1];
+                let c = current[(y0 + 1) * current_size + x0];
+                let d = current[(y0 + 1) * current_size + x0 + 1];
+                next[y * next_size + x] = (a + b + c + d) / 4.0;
+            }
+        }
+        current = next;
+        current_size = next_size;
+    }
+
+    let median = median_like_numpy(current.clone());
+    let bits = current
+        .iter()
+        .map(|value| *value > median)
+        .collect::<Vec<_>>();
+    Some(bits_to_imagehash_hex(&bits))
+}
+
 fn dct_type_ii(input: &[f64]) -> Vec<f64> {
     let n = input.len() as f64;
     (0..input.len())
@@ -180,6 +238,20 @@ mod tests {
         assert_eq!(
             perceptual_hash_from_luma(&samples, 8).as_deref(),
             Some("9748943f602d5ef8")
+        );
+    }
+
+    #[test]
+    fn wavelet_hash_matches_python_imagehash_fixture() {
+        let mut samples = Vec::with_capacity(32 * 32);
+        for y in 0..32 {
+            for x in 0..32 {
+                samples.push(((x * 7 + y * 11 + (x * y) % 17) % 256) as u8);
+            }
+        }
+        assert_eq!(
+            wavelet_hash_from_luma(&samples, 8, 32).as_deref(),
+            Some("0f3e78e0c1870f3e")
         );
     }
 }

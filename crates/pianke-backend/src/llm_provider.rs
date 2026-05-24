@@ -171,6 +171,79 @@ impl LlmProviderManager {
         }))
     }
 
+    pub async fn judge_image(
+        &self,
+        config: &ProviderConfig,
+        image_data_url: &str,
+        prompt: &str,
+    ) -> Result<JudgeVerdict, ApiError> {
+        let api_key = self
+            .load_api_key()
+            .ok_or_else(|| ApiError::precondition("AI provider API key missing"))?;
+        let payload = build_judge_payload(config, image_data_url, prompt);
+        let url = config.completion_endpoint()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_seconds))
+            .build()
+            .map_err(|e| ApiError::internal(format!("create http client failed: {e}")))?;
+
+        let attempts = 4u32;
+        let mut last_error: Option<String> = None;
+        for attempt in 1..=attempts {
+            let resp = client
+                .post(&url)
+                .headers(config.headers(&api_key)?)
+                .json(&payload)
+                .send()
+                .await;
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    if attempt < attempts {
+                        tokio::time::sleep(Duration::from_millis(300 * u64::from(attempt))).await;
+                        continue;
+                    }
+                    return Err(ApiError::bad_gateway(format!(
+                        "AI provider request failed: {e}"
+                    )));
+                }
+            };
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| ApiError::bad_gateway(format!("read AI response failed: {e}")))?;
+            if status.as_u16() == 429 || status.is_server_error() {
+                last_error = Some(format!("HTTP {status}: {}", truncate(&body, 180)));
+                if attempt < attempts {
+                    tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+                    continue;
+                }
+            }
+            if !status.is_success() {
+                return Err(ApiError::bad_gateway(format!(
+                    "AI provider returned HTTP {status}: {}",
+                    truncate(&body, 180)
+                )));
+            }
+            let value: Value = serde_json::from_str(&body)
+                .map_err(|e| ApiError::bad_gateway(format!("parse AI response failed: {e}")))?;
+            let parsed =
+                parse_judge_response(&config.protocol, &value).map_err(ApiError::bad_gateway)?;
+            return Ok(JudgeVerdict {
+                verdict: parsed["verdict"].as_str().unwrap_or("reject").to_string(),
+                reason: parsed["reason"].as_str().unwrap_or("").to_string(),
+                flaws: parsed["flaws"].as_str().map(str::to_string),
+                fixable: parsed["fixable"].as_str().map(str::to_string),
+            });
+        }
+        Err(ApiError::bad_gateway(format!(
+            "AI provider request failed after retries: {}",
+            last_error.unwrap_or_else(|| "unknown error".to_string())
+        )))
+    }
+
     pub fn require_tycoon_ready(
         &self,
         model_override: Option<&str>,
@@ -322,6 +395,16 @@ pub struct ProviderStatus {
     pub key_configured: bool,
     pub config: Option<ProviderConfig>,
     pub protocols: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeVerdict {
+    pub verdict: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flaws: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixable: Option<String>,
 }
 
 #[derive(Debug)]

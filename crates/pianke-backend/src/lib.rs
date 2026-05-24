@@ -7,12 +7,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Local};
 use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat};
 use pianke_core::fast::{
     analyze_from_signals, average_hash_from_luma, cluster, difference_hash_from_luma,
-    perceptual_hash_from_luma, ExifSummary, FastImageInfo, FastQualityProfile, FastQualitySignals,
-    QualityInfo,
+    perceptual_hash_from_luma, wavelet_hash_from_luma, ExifSummary, FastImageInfo,
+    FastQualityProfile, FastQualitySignals, QualityInfo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +23,7 @@ use std::{
     io::Cursor,
     net::{SocketAddr, TcpListener},
     path::{Component, Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -33,7 +35,10 @@ mod model_components;
 use model_components::{ComponentInstallRequest, ModelManager};
 
 mod llm_provider;
+use llm_provider::JudgeVerdict;
 use llm_provider::{LlmProviderManager, SaveProviderRequest};
+mod watermark;
+use watermark::WatermarkConfig;
 
 const STATE_FILENAME: &str = ".pic_selecter_state.json";
 const PIC_DIR: &str = "_pic_selecter";
@@ -94,6 +99,7 @@ struct AppState {
     job: JobState,
     last_infos: Vec<InfoRecord>,
     grouping: GroupingState,
+    watermark: WatermarkState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +290,21 @@ struct GroupingState {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct WatermarkState {
+    status: String,
+    done: usize,
+    total: usize,
+    current: String,
+    out_dir: Option<String>,
+    ok: usize,
+    failed: Vec<(String, String)>,
+    error: Option<String>,
+    started_at: f64,
+    finished_at: f64,
+    cancel_requested: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct StartRequest {
     folder: String,
@@ -418,12 +439,12 @@ fn build_router(ctx: AppCtx) -> Router {
         .route("/api/llm_models", get(llm_models))
         .route("/api/job_log", get(unavailable))
         .route("/api/llm_concurrency", get(llm_concurrency))
-        .route("/api/watermark/templates", get(unavailable))
-        .route("/api/watermark/preview", post(unavailable))
-        .route("/api/watermark/start", post(unavailable))
-        .route("/api/watermark/status", get(unavailable))
-        .route("/api/watermark/cancel", post(unavailable))
-        .route("/api/watermark/open_out_dir", post(unavailable))
+        .route("/api/watermark/templates", get(watermark_templates))
+        .route("/api/watermark/preview", post(watermark_preview))
+        .route("/api/watermark/start", post(watermark_start))
+        .route("/api/watermark/status", get(watermark_status))
+        .route("/api/watermark/cancel", post(watermark_cancel))
+        .route("/api/watermark/open_out_dir", post(watermark_open_out_dir))
         .layer(middleware::from_fn_with_state(ctx.clone(), token_guard))
         .with_state(ctx)
 }
@@ -496,7 +517,7 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "engines": engines,
         "backend": "rust-fast",
         "rust_fast": true,
-        "watermark": false,
+        "watermark": true,
         "expert_installed": expert_installed,
         "tycoon_ready": tycoon_ready,
         "model_components": ctx.models.status_map(),
@@ -600,6 +621,158 @@ async fn llm_concurrency(State(ctx): State<AppCtx>) -> impl IntoResponse {
     Json(json!({"limit": limit}))
 }
 
+async fn watermark_templates(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    Json(json!({
+        "templates": watermark::list_templates(),
+        "logos": watermark::available_logos(&ctx.backend_dir),
+    }))
+}
+
+async fn watermark_preview(State(ctx): State<AppCtx>, Json(req): Json<Value>) -> Response {
+    let cfg = serde_json::from_value::<WatermarkConfig>(req.clone()).unwrap_or_default();
+    let winners = {
+        let state = ctx.inner.lock().expect("backend state lock");
+        watermark_winner_paths(state.session.as_ref())
+    };
+    if winners.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "没有 winner 照片可预览");
+    }
+    let idx = cfg.preview_index.min(winners.len().saturating_sub(1));
+    let src = PathBuf::from(&winners[idx]);
+    match watermark::render(&ctx.backend_dir, &src, &cfg, Some(1400)) {
+        Ok(data) => {
+            let exif = watermark::parse_exif(&src);
+            Json(json!({
+                "image_b64": BASE64_STANDARD.encode(&data),
+                "size_kb": (data.len() as f64 / 1024.0 * 10.0).round() / 10.0,
+                "source_name": src.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                "total_winners": winners.len(),
+                "preview_index": idx,
+                "exif": exif,
+            }))
+            .into_response()
+        }
+        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err),
+    }
+}
+
+async fn watermark_start(State(ctx): State<AppCtx>, Json(req): Json<Value>) -> Response {
+    let cfg = serde_json::from_value::<WatermarkConfig>(req).unwrap_or_default();
+    let winners = {
+        let state = ctx.inner.lock().expect("backend state lock");
+        if state.watermark.status == "running" {
+            return json_error(StatusCode::CONFLICT, "已有水印任务正在运行");
+        }
+        watermark_winner_paths(state.session.as_ref())
+    };
+    if winners.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "没有 winner 照片可导出");
+    }
+
+    let folder = {
+        let state = ctx.inner.lock().expect("backend state lock");
+        state.session.as_ref().map(|s| s.folder.clone())
+    };
+    let Some(folder) = folder else {
+        return json_error(StatusCode::BAD_REQUEST, "当前没有可用会话");
+    };
+
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let out_dir = Path::new(&folder)
+        .join("winners")
+        .join(format!("watermarked_{stamp}"));
+    if let Err(err) = fs::create_dir_all(&out_dir) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("创建输出目录失败: {err}"),
+        );
+    }
+
+    {
+        let mut state = ctx.inner.lock().expect("backend state lock");
+        state.watermark = WatermarkState {
+            status: "running".to_string(),
+            total: winners.len(),
+            out_dir: Some(out_dir.to_string_lossy().to_string()),
+            started_at: now_secs(),
+            ..WatermarkState::default()
+        };
+    }
+
+    let total = winners.len();
+    let out_dir_text = out_dir.to_string_lossy().to_string();
+    let worker_ctx = ctx.clone();
+    thread::spawn(move || run_watermark_job(worker_ctx, winners, out_dir, cfg));
+    Json(json!({"ok": true, "total": total, "out_dir": out_dir_text})).into_response()
+}
+
+async fn watermark_status(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    let state = ctx.inner.lock().expect("backend state lock");
+    let wm = state.watermark.clone();
+    let end = if wm.finished_at > 0.0 {
+        wm.finished_at
+    } else {
+        now_secs()
+    };
+    let elapsed = if wm.started_at > 0.0 {
+        (end - wm.started_at).max(0.0)
+    } else {
+        0.0
+    };
+    let failed_count = wm.failed.len();
+    let failed_sample = wm.failed.iter().take(5).cloned().collect::<Vec<_>>();
+    Json(json!({
+        "status": wm.status,
+        "done": wm.done,
+        "total": wm.total,
+        "current": wm.current,
+        "out_dir": wm.out_dir,
+        "ok": wm.ok,
+        "failed": wm.failed,
+        "failed_count": failed_count,
+        "failed_sample": failed_sample,
+        "error": wm.error,
+        "elapsed": elapsed,
+    }))
+}
+
+async fn watermark_cancel(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    let mut state = ctx.inner.lock().expect("backend state lock");
+    if state.watermark.status != "running" {
+        return json_error(StatusCode::BAD_REQUEST, "没有运行中的水印任务");
+    }
+    state.watermark.cancel_requested = true;
+    Json(json!({"ok": true})).into_response()
+}
+
+async fn watermark_open_out_dir(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    let out_dir = {
+        let state = ctx.inner.lock().expect("backend state lock");
+        state.watermark.out_dir.clone()
+    };
+    let Some(out_dir) = out_dir else {
+        return json_error(StatusCode::BAD_REQUEST, "没有可打开的输出目录");
+    };
+    let path = PathBuf::from(out_dir);
+    if !path.exists() {
+        return json_error(StatusCode::BAD_REQUEST, "输出目录不存在");
+    }
+    let result = if cfg!(windows) {
+        Command::new("explorer").arg(&path).spawn()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open").arg(&path).spawn()
+    } else {
+        Command::new("xdg-open").arg(&path).spawn()
+    };
+    match result {
+        Ok(_) => Json(json!({"ok": true})).into_response(),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("打开失败: {err}"),
+        ),
+    }
+}
+
 async fn unavailable() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -608,21 +781,10 @@ async fn unavailable() -> impl IntoResponse {
 }
 
 async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> Response {
-    if req.engine == "tycoon" {
-        match ctx.llm.require_tycoon_ready(req.llm_model.as_deref()) {
-            Ok(_) => {
-                return json_error(
-                    StatusCode::NOT_IMPLEMENTED,
-                    "Rust Tycoon 已支持通用 AI 服务商配置，但远程判图任务流尚未接入",
-                );
-            }
-            Err(err) => return json_error(err.status, &err.message),
-        }
-    }
-    if req.engine != "fast" {
+    if req.engine != "fast" && req.engine != "tycoon" {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "Rust Fast 后端第一轮仅支持 fast 模式",
+            "Rust backend only supports fast or tycoon for now",
         );
     }
     if req.mode != "copy" && req.mode != "move" {
@@ -662,11 +824,29 @@ async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> 
     }
 
     let worker_ctx = ctx.clone();
-    thread::spawn(move || run_fast_job(worker_ctx, req));
+    thread::spawn(move || run_job(worker_ctx, req));
     Json(json!({"started": true, "backend": "rust-fast"})).into_response()
 }
 
-fn run_fast_job(ctx: AppCtx, req: StartRequest) {
+fn run_job(ctx: AppCtx, req: StartRequest) {
+    let tycoon_config = if req.engine == "tycoon" {
+        match ctx.llm.require_tycoon_ready(req.llm_model.as_deref()) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                let mut state = ctx.inner.lock().expect("backend state lock");
+                state.job.status = "error".to_string();
+                state.job.error = Some(err.message);
+                state.job.finished_at = now_secs();
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let tycoon_runtime = tycoon_config
+        .as_ref()
+        .map(|_| tokio::runtime::Runtime::new().expect("create tycoon runtime"));
+
     let folder = PathBuf::from(&req.folder);
     let pairs = scan_folder(&folder);
     {
@@ -693,7 +873,25 @@ fn run_fast_job(ctx: AppCtx, req: StartRequest) {
         }
 
         match process_one(&pair, &req.prescreen_strength) {
-            Ok(record) => {
+            Ok(mut record) => {
+                if let Some(config) = &tycoon_config {
+                    match run_tycoon_judge(
+                        &ctx,
+                        config,
+                        tycoon_runtime.as_ref().expect("tycoon runtime"),
+                        &pair,
+                        &req.prescreen_strength,
+                    ) {
+                        Ok(verdict) => apply_llm_verdict(&mut record, &verdict),
+                        Err(reason) => {
+                            let mut state = ctx.inner.lock().expect("backend state lock");
+                            state.job.status = "error".to_string();
+                            state.job.error = Some(reason);
+                            state.job.finished_at = now_secs();
+                            return;
+                        }
+                    }
+                }
                 push_job_event(&ctx, &record, None);
                 infos.push(record);
             }
@@ -932,6 +1130,56 @@ fn scan_dir(root: &Path, dir: &Path, groups: &mut HashMap<(PathBuf, String), Vec
     }
 }
 
+fn run_tycoon_judge(
+    ctx: &AppCtx,
+    config: &llm_provider::ProviderConfig,
+    runtime: &tokio::runtime::Runtime,
+    pair: &ScanPair,
+    strength: &str,
+) -> Result<JudgeVerdict, String> {
+    let analysis = pair
+        .analysis
+        .as_ref()
+        .ok_or_else(|| "tycoon requires a decodable companion image".to_string())?;
+    let (data_url, _bytes, _size) = image_to_data_url(analysis)?;
+    let prompt = tycoon_prompt(strength);
+    runtime
+        .block_on(ctx.llm.judge_image(config, &data_url, &prompt))
+        .map_err(|e| e.message)
+}
+
+fn apply_llm_verdict(record: &mut InfoRecord, verdict: &JudgeVerdict) {
+    let is_reject = verdict.verdict.eq_ignore_ascii_case("reject");
+    let mut quality = record.info.quality.clone().unwrap_or_default();
+    if is_reject {
+        quality.auto_reject = Some(true);
+        quality.reject_reason = Some(verdict.reason.clone());
+        if !quality.flags.iter().any(|f| f == "llm_reject") {
+            quality.flags.push("llm_reject".to_string());
+        }
+    } else {
+        quality.auto_reject = Some(false);
+        if !quality.flags.iter().any(|f| f == "llm_pass") {
+            quality.flags.push("llm_pass".to_string());
+        }
+    }
+    quality
+        .extra
+        .insert("llm_verdict".to_string(), json!(verdict.verdict));
+    quality
+        .extra
+        .insert("llm_reason".to_string(), json!(verdict.reason));
+    if let Some(flaws) = &verdict.flaws {
+        quality.extra.insert("llm_flaws".to_string(), json!(flaws));
+    }
+    if let Some(fixable) = &verdict.fixable {
+        quality
+            .extra
+            .insert("llm_fixable".to_string(), json!(fixable));
+    }
+    record.info.quality = Some(quality);
+}
+
 fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     let analysis = pair.analysis.as_ref().ok_or_else(|| {
         if RAW_EXTS.contains(&ext_lower(&pair.primary).as_str()) {
@@ -970,10 +1218,15 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     let small_p = DynamicImage::ImageLuma8(gray8.clone())
         .resize_exact(32, 32, FilterType::Lanczos3)
         .to_luma8();
+    let whash_scale = whash_image_scale(width, height);
+    let small_w = DynamicImage::ImageLuma8(gray8.clone())
+        .resize_exact(whash_scale, whash_scale, FilterType::Lanczos3)
+        .to_luma8();
     let ahash = average_hash_from_luma(small_a.as_raw(), 8).unwrap_or_default();
     let dhash = difference_hash_from_luma(small_d.as_raw(), 8).unwrap_or_default();
     let phash = perceptual_hash_from_luma(small_p.as_raw(), 8).unwrap_or_default();
-    let whash = ahash.clone();
+    let whash =
+        wavelet_hash_from_luma(small_w.as_raw(), 8, whash_scale as usize).unwrap_or_default();
 
     let signals = quality_signals(&img, file_size);
     let quality_result = analyze_from_signals(&signals, FastQualityProfile::from_name(strength));
@@ -1025,6 +1278,49 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
     })
+}
+
+fn image_to_data_url(path: &Path) -> Result<(String, usize, (u32, u32)), String> {
+    let img = image::open(path).map_err(|e| format!("load image failed: {e}"))?;
+    let (w, h) = img.dimensions();
+    let max_side = 896u32;
+    let resized = if w.max(h) > max_side {
+        let scale = max_side as f32 / w.max(h) as f32;
+        img.resize(
+            (w as f32 * scale).round().max(1.0) as u32,
+            (h as f32 * scale).round().max(1.0) as u32,
+            FilterType::Lanczos3,
+        )
+    } else {
+        img
+    };
+    let mut buf = Cursor::new(Vec::new());
+    resized
+        .write_to(&mut buf, ImageFormat::Jpeg)
+        .map_err(|e| format!("encode jpeg failed: {e}"))?;
+    let bytes = buf.into_inner();
+    Ok((
+        format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(&bytes)),
+        bytes.len(),
+        resized.dimensions(),
+    ))
+}
+
+fn tycoon_prompt(strength: &str) -> String {
+    let _ = strength;
+    "You are a photo quality judge. Return exactly one JSON object with keys verdict, reason, flaws, fixable. verdict must be pass or reject. reason must be short and concrete. flaws lists all defects. fixable is only meaningful when verdict is pass.".to_string()
+}
+
+fn whash_image_scale(width: u32, height: u32) -> u32 {
+    let natural = previous_power_of_two(width.min(height));
+    natural.max(8)
+}
+
+fn previous_power_of_two(value: u32) -> u32 {
+    if value <= 1 {
+        return 1;
+    }
+    1 << (31 - value.leading_zeros())
 }
 
 fn quality_signals(img: &DynamicImage, file_size: u64) -> FastQualitySignals {
@@ -1991,6 +2287,75 @@ async fn winners(State(ctx): State<AppCtx>) -> impl IntoResponse {
     Json(json!({"entries": entries, "winners": entries}))
 }
 
+fn watermark_winner_paths(session: Option<&SessionState>) -> Vec<String> {
+    session
+        .map(|s| {
+            s.groups
+                .iter()
+                .flat_map(|g| {
+                    let mut out = Vec::new();
+                    if let Some(w) = &g.winner {
+                        out.push(w.clone());
+                    }
+                    out.extend(g.extra_winners.iter().cloned());
+                    out
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn run_watermark_job(ctx: AppCtx, winners: Vec<String>, out_dir: PathBuf, cfg: WatermarkConfig) {
+    let mut progress = |done: usize, total: usize, name: String| {
+        let mut state = ctx.inner.lock().expect("backend state lock");
+        state.watermark.done = done;
+        state.watermark.total = total;
+        state.watermark.current = name;
+    };
+    let mut cancel = || {
+        let state = ctx.inner.lock().expect("backend state lock");
+        state.watermark.cancel_requested
+    };
+    let result = watermark::batch_export(
+        &ctx.backend_dir,
+        &winners,
+        &out_dir,
+        &cfg,
+        Some(&mut progress),
+        Some(&mut cancel),
+    );
+    let mut state = ctx.inner.lock().expect("backend state lock");
+    state.watermark.finished_at = now_secs();
+    match result {
+        Ok(report) => {
+            state.watermark.ok = report["ok"].as_u64().unwrap_or(0) as usize;
+            state.watermark.failed = report["failed"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            Some((
+                                item.get(0)?.as_str()?.to_string(),
+                                item.get(1)?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            state.watermark.status = if state.watermark.cancel_requested {
+                "cancelled".to_string()
+            } else {
+                "done".to_string()
+            };
+        }
+        Err(err) => {
+            state.watermark.status = "error".to_string();
+            state.watermark.error = Some(err);
+        }
+    }
+}
+
 async fn peek_folder(Json(req): Json<Value>) -> Response {
     let Some(folder) = req.get("folder").and_then(|v| v.as_str()) else {
         return json_error(StatusCode::BAD_REQUEST, "缺少 folder");
@@ -2071,6 +2436,15 @@ fn push_job_event(ctx: &AppCtx, record: &InfoRecord, reason: Option<String>) {
     let mut state = ctx.inner.lock().expect("backend state lock");
     let q = record.info.quality.as_ref();
     let reject = q.and_then(|q| q.auto_reject).unwrap_or(false);
+    let engine = state.job.engine.clone();
+    let llm_verdict = q
+        .and_then(|q| q.extra.get("llm_verdict"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let llm_reason = q
+        .and_then(|q| q.extra.get("llm_reason"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     state.job.event_seq += 1;
     let event = JobEvent {
         seq: state.job.event_seq,
@@ -2078,9 +2452,11 @@ fn push_job_event(ctx: &AppCtx, record: &InfoRecord, reason: Option<String>) {
         path: record.info.path.clone(),
         ok: true,
         reject,
-        reason: reason.or_else(|| q.and_then(|q| q.reject_reason.clone())),
+        reason: reason
+            .or_else(|| llm_reason.clone())
+            .or_else(|| q.and_then(|q| q.reject_reason.clone())),
         verdict: if reject { "reject" } else { "pass" }.to_string(),
-        engine: "fast".to_string(),
+        engine,
         shutter: record
             .info
             .exif_summary
@@ -2099,7 +2475,8 @@ fn push_job_event(ctx: &AppCtx, record: &InfoRecord, reason: Option<String>) {
         signals: vec![
             json!({"kind": "hash", "label": "hash", "value": record.info.ahash.clone().unwrap_or_default()}),
             json!({"kind": "color", "label": "HSV", "value": if record.info.color_hist.is_some() { "已建" } else { "数据不足" }}),
-            json!({"kind": "orb", "label": "ORB", "value": "待接入"}),
+            json!({"kind": "orb", "label": "ORB", "value": "pending"}),
+            json!({"kind": "llm", "label": "LLM", "value": llm_verdict.unwrap_or_else(|| "none".to_string())}),
         ],
     };
     state.job.recent_events.push(event);

@@ -46,7 +46,7 @@ impl Default for BackendRuntime {
                 token: None,
                 port: None,
                 python: None,
-                backend_kind: "python".to_string(),
+                backend_kind: "rust-fast".to_string(),
                 backend_dir: None,
                 message: "片刻引擎尚未启动".to_string(),
             },
@@ -114,7 +114,7 @@ fn main() {
                         token: None,
                         port: None,
                         python: None,
-                        backend_kind: "python".to_string(),
+                        backend_kind: "rust-fast".to_string(),
                         backend_dir: None,
                         message: err,
                     };
@@ -155,10 +155,9 @@ fn start_or_restart_backend(
     let token = Uuid::new_v4().to_string();
     let url = format!("http://127.0.0.1:{port}");
 
-    if env::var("PIANKE_BACKEND")
-        .map(|v| v == "rust-fast")
-        .unwrap_or(false)
-    {
+    let use_python = matches!(env::var("PIANKE_BACKEND").ok().as_deref(), Some("python"));
+
+    if !use_python {
         let handle = pianke_backend::start(pianke_backend::ServerOptions {
             port,
             token: Some(token.clone()),
@@ -246,7 +245,7 @@ fn stop_child(child: &mut Option<Child>) {
 fn resolve_backend_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     if let Ok(dir) = env::var("PIANKE_BACKEND_DIR") {
         let p = PathBuf::from(dir);
-        if p.join("app.py").exists() {
+        if p.join("static").exists() {
             return Ok(p);
         }
     }
@@ -255,21 +254,24 @@ fn resolve_backend_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .parent()
         .ok_or("无法解析开发目录")?
         .to_path_buf();
-    if dev_dir.join("app.py").exists() {
+    if dev_dir.join("static").exists() {
         return Ok(dev_dir);
     }
 
     if let Ok(resource_dir) = app.path().resource_dir() {
-        if resource_dir.join("app.py").exists() {
+        if resource_dir.join("static").exists() {
             return Ok(resource_dir);
         }
         let nested = resource_dir.join("backend");
-        if nested.join("app.py").exists() {
+        if nested.join("static").exists() {
             return Ok(nested);
         }
     }
 
-    Err("未找到 app.py。开发时请在项目根目录运行；打包时请确认 backend 资源已随包分发。".to_string())
+    Err(
+        "未找到 static 资源目录。开发时请在项目根目录运行；打包时请确认 static 资源已随包分发。"
+            .to_string(),
+    )
 }
 
 fn resolve_python(app: &tauri::AppHandle) -> PythonCommand {
