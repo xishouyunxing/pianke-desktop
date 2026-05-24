@@ -55,6 +55,81 @@ pub fn difference_hash_from_luma(samples: &[u8], hash_size: usize) -> Option<Str
     Some(bits_to_imagehash_hex(&bits))
 }
 
+/// Perceptual hash for already resized grayscale samples.
+///
+/// Python reference:
+/// image.convert("L").resize((hash_size * highfreq_factor, ...), LANCZOS),
+/// scipy.fftpack.dct(scipy.fftpack.dct(pixels, axis=0), axis=1), then
+/// low-frequency hash_size x hash_size block > numpy.median(block).
+pub fn perceptual_hash_from_luma(samples: &[u8], hash_size: usize) -> Option<String> {
+    if hash_size < 2 {
+        return None;
+    }
+    let size = hash_size * 4;
+    if samples.len() != size * size {
+        return None;
+    }
+
+    let mut stage = vec![0.0; size * size];
+    for col in 0..size {
+        let input = (0..size)
+            .map(|row| f64::from(samples[row * size + col]))
+            .collect::<Vec<_>>();
+        let output = dct_type_ii(&input);
+        for row in 0..size {
+            stage[row * size + col] = output[row];
+        }
+    }
+
+    let mut dct = vec![0.0; size * size];
+    for row in 0..size {
+        let input = (0..size)
+            .map(|col| stage[row * size + col])
+            .collect::<Vec<_>>();
+        let output = dct_type_ii(&input);
+        for col in 0..size {
+            dct[row * size + col] = output[col];
+        }
+    }
+
+    let mut low = Vec::with_capacity(hash_size * hash_size);
+    for row in 0..hash_size {
+        for col in 0..hash_size {
+            low.push(dct[row * size + col]);
+        }
+    }
+    let median = median_like_numpy(low.clone());
+    let bits = low.iter().map(|value| *value > median).collect::<Vec<_>>();
+    Some(bits_to_imagehash_hex(&bits))
+}
+
+fn dct_type_ii(input: &[f64]) -> Vec<f64> {
+    let n = input.len() as f64;
+    (0..input.len())
+        .map(|k| {
+            let k = k as f64;
+            2.0 * input
+                .iter()
+                .enumerate()
+                .map(|(n_idx, value)| {
+                    let angle = std::f64::consts::PI * (n_idx as f64 + 0.5) * k / n;
+                    *value * angle.cos()
+                })
+                .sum::<f64>()
+        })
+        .collect()
+}
+
+fn median_like_numpy(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len();
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +166,20 @@ mod tests {
         assert_eq!(
             difference_hash_from_luma(&decreasing, 8).as_deref(),
             Some("0000000000000000")
+        );
+    }
+
+    #[test]
+    fn perceptual_hash_matches_python_reference_fixture() {
+        let mut samples = Vec::with_capacity(32 * 32);
+        for y in 0..32 {
+            for x in 0..32 {
+                samples.push(((x * 7 + y * 11 + (x * y) % 17) % 256) as u8);
+            }
+        }
+        assert_eq!(
+            perceptual_hash_from_luma(&samples, 8).as_deref(),
+            Some("9748943f602d5ef8")
         );
     }
 }

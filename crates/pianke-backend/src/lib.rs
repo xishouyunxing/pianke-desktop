@@ -10,8 +10,9 @@ use axum::{
 use chrono::{DateTime, Local};
 use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat};
 use pianke_core::fast::{
-    analyze_from_signals, average_hash_from_luma, cluster, difference_hash_from_luma, ExifSummary,
-    FastImageInfo, FastQualityProfile, FastQualitySignals, QualityInfo,
+    analyze_from_signals, average_hash_from_luma, cluster, difference_hash_from_luma,
+    perceptual_hash_from_luma, ExifSummary, FastImageInfo, FastQualityProfile, FastQualitySignals,
+    QualityInfo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -325,9 +326,6 @@ pub fn start(options: ServerOptions) -> Result<ServerHandle, String> {
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("configure backend listener failed: {e}"))?;
-    let listener = tokio::net::TcpListener::from_std(listener)
-        .map_err(|e| format!("create tokio listener failed: {e}"))?;
-
     let ctx = AppCtx {
         inner: Arc::new(Mutex::new(AppState::default())),
         token: options.token,
@@ -338,6 +336,8 @@ pub fn start(options: ServerOptions) -> Result<ServerHandle, String> {
     let thread = thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("create backend runtime");
         runtime.block_on(async move {
+            let listener =
+                tokio::net::TcpListener::from_std(listener).expect("create tokio listener");
             let server = axum::serve(listener, app).with_graceful_shutdown(async {
                 let _ = rx.await;
             });
@@ -808,9 +808,12 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     let small_d = DynamicImage::ImageLuma8(gray8.clone())
         .resize_exact(9, 8, FilterType::Lanczos3)
         .to_luma8();
+    let small_p = DynamicImage::ImageLuma8(gray8.clone())
+        .resize_exact(32, 32, FilterType::Lanczos3)
+        .to_luma8();
     let ahash = average_hash_from_luma(small_a.as_raw(), 8).unwrap_or_default();
     let dhash = difference_hash_from_luma(small_d.as_raw(), 8).unwrap_or_default();
-    let phash = ahash.clone();
+    let phash = perceptual_hash_from_luma(small_p.as_raw(), 8).unwrap_or_default();
     let whash = ahash.clone();
 
     let signals = quality_signals(&img, file_size);
