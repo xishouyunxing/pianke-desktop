@@ -64,4 +64,6 @@ pub struct FastImageInfo {
     pub color_hist: Option<Vec<f32>>,
     pub orb_descs_len: Option<usize>,
     pub orb_kps_len: Option<usize>,
+    #[serde(default)]
+    pub dinov2: Option<Vec<f32>>,
 }

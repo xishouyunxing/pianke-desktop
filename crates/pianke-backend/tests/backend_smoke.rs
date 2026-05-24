@@ -371,7 +371,9 @@ fn installed_model_manifest_updates_capabilities() {
     let token = "models-token";
     let (backend, _handle, base) = start_test_backend(token);
     let expert_dir = backend.path().join("model_components").join("expert");
-    fs::create_dir_all(&expert_dir).expect("expert component dir");
+    fs::create_dir_all(expert_dir.join("models")).expect("expert component dir");
+    fs::write(expert_dir.join("models").join("dinov2-small.onnx"), b"fake")
+        .expect("expert model marker");
     fs::write(
         expert_dir.join("component.json"),
         r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small"],"checksum_status":"verified"}"#,
@@ -393,12 +395,72 @@ fn installed_model_manifest_updates_capabilities() {
 }
 
 #[test]
+fn expert_start_requires_installed_component() {
+    let token = "expert-missing-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    write_jpg(&photos.path().join("EXPERT_0001.jpg"), 90);
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "expert"
+        }))
+        .send()
+        .expect("expert start response");
+    assert_eq!(resp.status(), 428);
+    let body: Value = resp.json().expect("expert error json");
+    assert!(body["error"]
+        .as_str()
+        .expect("error message")
+        .contains("Expert"));
+}
+
+#[test]
+fn expert_start_with_incomplete_component_requires_reinstall() {
+    let token = "expert-incomplete-token";
+    let (backend, _handle, base) = start_test_backend(token);
+    let expert_dir = backend.path().join("model_components").join("expert");
+    fs::create_dir_all(&expert_dir).expect("expert component dir");
+    fs::write(
+        expert_dir.join("component.json"),
+        r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small"],"checksum_status":"verified"}"#,
+    )
+    .expect("expert manifest");
+    let photos = tempfile::tempdir().expect("photos dir");
+    write_jpg(&photos.path().join("EXPERT_0001.jpg"), 90);
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "expert",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("expert start response");
+    assert_eq!(resp.status(), 428);
+    let body: Value = resp.json().expect("expert start json");
+    assert!(body["error"]
+        .as_str()
+        .expect("error message")
+        .contains("Expert"));
+}
+
+#[test]
 fn model_component_install_from_source_dir_updates_capabilities() {
     let token = "model-install-token";
     let (_backend, _handle, base) = start_test_backend(token);
     let source = tempfile::tempdir().expect("source component dir");
     fs::create_dir_all(source.path().join("models")).expect("models dir");
-    let model_path = source.path().join("models").join("dinov2.onnx");
+    let model_path = source.path().join("models").join("dinov2-small.onnx");
     fs::write(&model_path, b"fake onnx bytes").expect("model bytes");
     fs::write(
         source.path().join("component.json"),
@@ -407,7 +469,7 @@ fn model_component_install_from_source_dir_updates_capabilities() {
             "version":"onnx-v1",
             "runtime":"onnxruntime",
             "models":["dinov2-small"],
-            "files":[{"path":"models/dinov2.onnx","size_bytes":15}]
+            "files":[{"path":"models/dinov2-small.onnx","size_bytes":15}]
         }"#,
     )
     .expect("component manifest");
@@ -435,7 +497,10 @@ fn model_component_install_from_source_dir_updates_capabilities() {
             .as_str()
             .expect("install dir"),
     );
-    assert!(install_dir.join("models").join("dinov2.onnx").exists());
+    assert!(install_dir
+        .join("models")
+        .join("dinov2-small.onnx")
+        .exists());
 
     let capabilities: Value = client
         .get(format!("{base}/api/capabilities"))

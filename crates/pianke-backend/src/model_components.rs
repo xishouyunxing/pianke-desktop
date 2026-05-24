@@ -45,6 +45,18 @@ impl ModelManager {
             .any(|component| component.id == id && component.status == "installed")
     }
 
+    pub fn installed_dir(&self, id: &str) -> Result<PathBuf, String> {
+        let component = self
+            .list()
+            .into_iter()
+            .find(|component| component.id == id)
+            .ok_or_else(|| format!("unknown model component: {id}"))?;
+        if component.status != "installed" {
+            return Err(format!("模型组件 {id} 尚未安装"));
+        }
+        Ok(PathBuf::from(component.install_dir))
+    }
+
     pub fn available_engines(&self) -> Vec<String> {
         let mut engines = vec!["fast".to_string()];
         for component in self.list() {
@@ -92,7 +104,8 @@ impl ModelManager {
             Some(manifest)
                 if manifest.id == def.id
                     && manifest.version == def.version
-                    && manifest.checksum_status.as_deref() == Some("verified") =>
+                    && manifest.checksum_status.as_deref() == Some("verified")
+                    && component_files_ready(def.id, &install_dir) =>
             {
                 "installed"
             }
@@ -364,6 +377,16 @@ fn component_catalog() -> Vec<ComponentDef> {
     }]
 }
 
+fn component_files_ready(id: &str, install_dir: &Path) -> bool {
+    match id {
+        "expert" => install_dir
+            .join("models")
+            .join("dinov2-small.onnx")
+            .exists(),
+        _ => true,
+    }
+}
+
 fn read_manifest(path: &Path) -> Option<ComponentManifest> {
     let text = fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
@@ -582,7 +605,12 @@ mod tests {
     fn installed_manifest_marks_component_installed() {
         let temp = tempfile::tempdir().expect("temp dir");
         let install_dir = temp.path().join("models").join("expert");
-        fs::create_dir_all(&install_dir).expect("install dir");
+        fs::create_dir_all(install_dir.join("models")).expect("install dir");
+        fs::write(
+            install_dir.join("models").join("dinov2-small.onnx"),
+            b"fake",
+        )
+        .expect("model");
         fs::write(
             install_dir.join(MANIFEST_FILENAME),
             r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small"],"checksum_status":"verified"}"#,
@@ -605,7 +633,8 @@ mod tests {
         let source = temp.path().join("source");
         fs::create_dir_all(source.join("models")).expect("source models dir");
         let model_bytes = b"tiny fake onnx model";
-        fs::write(source.join("models").join("dinov2.onnx"), model_bytes).expect("model file");
+        fs::write(source.join("models").join("dinov2-small.onnx"), model_bytes)
+            .expect("model file");
         fs::write(
             source.join(MANIFEST_FILENAME),
             format!(
@@ -614,7 +643,7 @@ mod tests {
                     "version":"onnx-v1",
                     "runtime":"onnxruntime",
                     "models":["dinov2-small"],
-                    "files":[{{"path":"models/dinov2.onnx","sha256":"{}","size_bytes":{}}}]
+                    "files":[{{"path":"models/dinov2-small.onnx","sha256":"{}","size_bytes":{}}}]
                 }}"#,
                 sha256_hex(model_bytes),
                 model_bytes.len()
@@ -646,7 +675,7 @@ mod tests {
         );
         assert!(Path::new(&expert.install_dir)
             .join("models")
-            .join("dinov2.onnx")
+            .join("dinov2-small.onnx")
             .exists());
         assert!(manager.available_engines().contains(&"expert".to_string()));
     }

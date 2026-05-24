@@ -34,6 +34,7 @@ use uuid::Uuid;
 mod model_components;
 use model_components::{ComponentInstallRequest, ModelManager};
 
+mod expert_vision;
 mod llm_provider;
 use llm_provider::JudgeVerdict;
 use llm_provider::{LlmProviderManager, SaveProviderRequest};
@@ -782,10 +783,16 @@ async fn unavailable() -> impl IntoResponse {
 }
 
 async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> Response {
-    if req.engine != "fast" && req.engine != "tycoon" {
+    if req.engine != "fast" && req.engine != "tycoon" && req.engine != "expert" {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "Rust backend only supports fast or tycoon for now",
+            "Rust backend only supports fast, expert, or tycoon for now",
+        );
+    }
+    if req.engine == "expert" && !ctx.models.is_installed("expert") {
+        return json_error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "Expert 模型组件尚未安装，请先安装增强组件",
         );
     }
     if req.mode != "copy" && req.mode != "move" {
@@ -830,6 +837,24 @@ async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> 
 }
 
 fn run_job(ctx: AppCtx, req: StartRequest) {
+    let mut expert_model = if req.engine == "expert" {
+        match ctx
+            .models
+            .installed_dir("expert")
+            .and_then(|dir| expert_vision::Dinov2Model::from_component_dir(&dir))
+        {
+            Ok(model) => Some(model),
+            Err(err) => {
+                let mut state = ctx.inner.lock().expect("backend state lock");
+                state.job.status = "error".to_string();
+                state.job.error = Some(err);
+                state.job.finished_at = now_secs();
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let tycoon_config = if req.engine == "tycoon" {
         match ctx.llm.require_tycoon_ready(req.llm_model.as_deref()) {
             Ok(config) => Some(config),
@@ -875,6 +900,26 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
 
         match process_one(&pair, &req.prescreen_strength) {
             Ok(mut record) => {
+                if let Some(model) = expert_model.as_mut() {
+                    let Some(analysis) = pair.analysis.as_ref() else {
+                        let mut state = ctx.inner.lock().expect("backend state lock");
+                        state.job.status = "error".to_string();
+                        state.job.error =
+                            Some("Expert 模式需要可解码的 JPG/PNG/WebP/TIFF companion".to_string());
+                        state.job.finished_at = now_secs();
+                        return;
+                    };
+                    match model.extract_path(analysis) {
+                        Ok(dinov2) => apply_dinov2_embedding(&mut record, dinov2),
+                        Err(reason) => {
+                            let mut state = ctx.inner.lock().expect("backend state lock");
+                            state.job.status = "error".to_string();
+                            state.job.error = Some(reason);
+                            state.job.finished_at = now_secs();
+                            return;
+                        }
+                    }
+                }
                 if let Some(config) = &tycoon_config {
                     match run_tycoon_judge(
                         &ctx,
@@ -917,7 +962,11 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
     }
 
     let fast_infos = infos.iter().map(|r| r.info.clone()).collect::<Vec<_>>();
-    let idx_groups = cluster(&fast_infos);
+    let idx_groups = if req.engine == "expert" {
+        expert_cluster(&fast_infos)
+    } else {
+        cluster(&fast_infos)
+    };
     let mut groups = Vec::new();
     for group in idx_groups {
         let paths = group
@@ -1181,6 +1230,18 @@ fn apply_llm_verdict(record: &mut InfoRecord, verdict: &JudgeVerdict) {
     record.info.quality = Some(quality);
 }
 
+fn apply_dinov2_embedding(record: &mut InfoRecord, dinov2: Vec<f32>) {
+    let mut quality = record.info.quality.clone().unwrap_or_default();
+    quality
+        .extra
+        .insert("dinov2_dim".to_string(), json!(dinov2.len()));
+    quality
+        .extra
+        .insert("expert_stage".to_string(), json!("dinov2"));
+    record.info.quality = Some(quality);
+    record.info.dinov2 = Some(dinov2);
+}
+
 fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     let analysis = pair.analysis.as_ref().ok_or_else(|| {
         if RAW_EXTS.contains(&ext_lower(&pair.primary).as_str()) {
@@ -1270,6 +1331,7 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
         color_hist: compute_color_hist(&img),
         orb_descs_len: None,
         orb_kps_len: None,
+        dinov2: None,
     };
     Ok(InfoRecord {
         info,
@@ -1310,6 +1372,94 @@ fn image_to_data_url(path: &Path) -> Result<(String, usize, (u32, u32)), String>
 fn tycoon_prompt(strength: &str) -> String {
     let _ = strength;
     "You are a photo quality judge. Return exactly one JSON object with keys verdict, reason, flaws, fixable. verdict must be pass or reject. reason must be short and concrete. flaws lists all defects. fixable is only meaningful when verdict is pass.".to_string()
+}
+
+fn expert_cluster(infos: &[FastImageInfo]) -> Vec<Vec<usize>> {
+    const THRESHOLD: f64 = 0.68;
+    const HARD_BREAK_SECONDS: f64 = 30.0 * 60.0;
+    let n = infos.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    'outer: for i in 0..n {
+        for group in &mut groups {
+            if group.iter().all(|j| {
+                let sim = expert_pair_similarity(&infos[i], &infos[*j]);
+                let time_gap = match (infos[i].mtime, infos[*j].mtime) {
+                    (Some(a), Some(b)) => (a - b).abs(),
+                    _ => 0.0,
+                };
+                sim >= THRESHOLD && time_gap <= HARD_BREAK_SECONDS
+            }) {
+                group.push(i);
+                continue 'outer;
+            }
+        }
+        groups.push(vec![i]);
+    }
+    for group in &mut groups {
+        group.sort_by(|a, b| {
+            infos[*a]
+                .mtime
+                .partial_cmp(&infos[*b].mtime)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    groups
+}
+
+fn expert_pair_similarity(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
+    let dino = cosine_similarity(a.dinov2.as_deref(), b.dinov2.as_deref()).unwrap_or(0.0);
+    let time = match (a.mtime, b.mtime) {
+        (Some(x), Some(y)) => (-(x - y).abs() / 60.0).exp(),
+        _ => 0.0,
+    };
+    let exif = match (&a.exif_summary, &b.exif_summary) {
+        (Some(x), Some(y)) if x.camera.is_some() && x.camera == y.camera => 1.0,
+        _ => 0.0,
+    };
+    let name = filename_prefix_similarity(&a.path, &b.path);
+    0.64 * dino + 0.18 * time + 0.12 * exif + 0.06 * name
+}
+
+fn cosine_similarity(a: Option<&[f32]>, b: Option<&[f32]>) -> Option<f64> {
+    let (Some(a), Some(b)) = (a, b) else {
+        return None;
+    };
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let x = *x as f64;
+        let y = *y as f64;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na < 1e-12 || nb < 1e-12 {
+        return None;
+    }
+    Some((dot / (na.sqrt() * nb.sqrt())).clamp(0.0, 1.0))
+}
+
+fn filename_prefix_similarity(a: &str, b: &str) -> f64 {
+    let a = file_name(a);
+    let b = file_name(b);
+    let pa = a
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .trim_end_matches(['_', '-']);
+    let pb = b
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .trim_end_matches(['_', '-']);
+    if !pa.is_empty() && pa == pb {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 fn whash_image_scale(width: u32, height: u32) -> u32 {
@@ -2446,6 +2596,26 @@ fn push_job_event(ctx: &AppCtx, record: &InfoRecord, reason: Option<String>) {
         .and_then(|q| q.extra.get("llm_reason"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let _signals = if engine == "expert" {
+        let dino_value = record
+            .info
+            .dinov2
+            .as_ref()
+            .map(|v| format!("{}维", v.len()))
+            .unwrap_or_else(|| "missing".to_string());
+        vec![
+            json!({"kind": "dino", "label": "DINOv2", "value": dino_value}),
+            json!({"kind": "nima", "label": "美学", "value": "未接入"}),
+            json!({"kind": "face", "label": "脸", "value": "未接入"}),
+        ]
+    } else {
+        vec![
+            json!({"kind": if engine == "expert" { "dino" } else { "hash" }, "label": if engine == "expert" { "DINOv2" } else { "hash" }, "value": if engine == "expert" { record.info.dinov2.as_ref().map(|v| format!("{}维", v.len())).unwrap_or_else(|| "missing".to_string()) } else { record.info.ahash.clone().unwrap_or_default() }}),
+            json!({"kind": "color", "label": "HSV", "value": if record.info.color_hist.is_some() { "已建" } else { "数据不足" }}),
+            json!({"kind": "orb", "label": "ORB", "value": "pending"}),
+            json!({"kind": "llm", "label": "LLM", "value": llm_verdict.clone().unwrap_or_else(|| "none".to_string())}),
+        ]
+    };
     state.job.event_seq += 1;
     let event = JobEvent {
         seq: state.job.event_seq,
@@ -2524,6 +2694,9 @@ fn meta_entry(record: &InfoRecord) -> Value {
     }
     if let Some(mtime) = record.info.mtime {
         map.insert("mtime".to_string(), json!(mtime));
+    }
+    if let Some(dinov2) = &record.info.dinov2 {
+        map.insert("dinov2_dim".to_string(), json!(dinov2.len()));
     }
     Value::Object(map)
 }

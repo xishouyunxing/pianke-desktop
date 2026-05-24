@@ -12,6 +12,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "tiff", "webp"] }
 imageproc = "0.25"
 exif = { package = "kamadak-exif", version = "0.6" }
+ndarray = "0.17"
+ort = "2.0.0-rc.12"
 pianke-core = { path = "../pianke-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
