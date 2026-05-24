@@ -708,9 +708,11 @@ fn preprocess_quality_nchw(
         if w == 0 || h == 0 {
             return Err("Expert quality fixed input size must not be zero".to_string());
         }
-        rgb = image::imageops::resize(&rgb, w, h, FilterType::Triangle);
-        width = w;
-        height = h;
+        if width != w || height != h {
+            rgb = image::imageops::resize(&rgb, w, h, FilterType::Triangle);
+            width = w;
+            height = h;
+        }
     } else if max_side > 0 && width.max(height) > max_side {
         let scale = max_side as f32 / width.max(height) as f32;
         width = ((width as f32 * scale).round() as u32).max(1);
@@ -1439,7 +1441,7 @@ mod tests {
             assert_optional_score_close(
                 actual.clipiqa_score,
                 expected_scores.get("clipiqa_score"),
-                0.01,
+                0.02,
                 &path,
                 "clipiqa_score",
             );

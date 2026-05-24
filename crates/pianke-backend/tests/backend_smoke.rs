@@ -386,6 +386,77 @@ fn frontend_compat_endpoints_keep_expected_shape() {
 }
 
 #[test]
+fn unsupported_raw_and_heic_are_reported_as_skipped() {
+    let token = "unsupported-formats-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    fs::write(photos.path().join("ONLY_RAW.CR2"), b"raw without jpg").expect("raw file");
+    fs::write(photos.path().join("ONLY_HEIC.HEIC"), b"not decoded").expect("heic file");
+
+    let client = Client::new();
+    let start = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start unsupported response");
+    assert!(start.status().is_success());
+    let job = wait_for_done(&client, &base, token);
+    assert_eq!(job["skipped_count"], 2);
+
+    let skipped: Value = client
+        .get(format!("{base}/api/skipped"))
+        .header("X-Token", token)
+        .send()
+        .expect("skipped response")
+        .json()
+        .expect("skipped json");
+    let reasons = skipped["skipped"]
+        .as_array()
+        .expect("skipped list")
+        .iter()
+        .filter_map(|item| item["reason"].as_str())
+        .collect::<Vec<_>>();
+    assert!(reasons.iter().any(|reason| reason.contains("纯 RAW")));
+    assert!(reasons.iter().any(|reason| reason.contains("HEIC/HEIF")));
+}
+
+#[test]
+fn llm_test_accepts_all_supported_protocols_with_mock_provider() {
+    let token = "llm-test-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let llm_base = start_mock_llm_server(r#"{"ok":true,"output_text":"pong"}"#);
+    let client = Client::new();
+
+    for protocol in [
+        "openai_chat_completions",
+        "openai_responses",
+        "anthropic_messages",
+    ] {
+        let resp: Value = client
+            .post(format!("{base}/api/llm/test"))
+            .header("X-Token", token)
+            .json(&json!({
+                "protocol": protocol,
+                "base_url": llm_base,
+                "api_key": "secret-key",
+                "model": "vision-model"
+            }))
+            .send()
+            .expect("llm test response")
+            .json()
+            .expect("llm test json");
+        assert_eq!(resp["ok"], true, "protocol {protocol} should pass mock test");
+        assert_eq!(resp["protocol"], protocol);
+    }
+}
+
+#[test]
 fn installed_model_manifest_updates_capabilities() {
     let token = "models-token";
     let (backend, _handle, base) = start_test_backend(token);
