@@ -7,7 +7,9 @@ const TUTORIAL_KEY = "pic-arena.tutorial-seen";
 const CONFIRM_MOVE_KEY = "pic-arena.confirmed-move";
 const CONFIRM_REAL_KEY = "pic-arena.confirmed-real";
 const VERDICT_HOLD_MS = 380;
-const IS_DESKTOP_SHELL = new URLSearchParams(location.search).get("desktop") === "1";
+const URL_PARAMS = new URLSearchParams(location.search);
+const IS_DESKTOP_SHELL = URL_PARAMS.get("desktop") === "1";
+const DESKTOP_TOKEN = URL_PARAMS.get("token") || "";
 
 let busy = false;
 let pollHandle = null;
@@ -91,14 +93,18 @@ function shortenHome(p) {
 function imgUrl(path, width) {
   let u = `/api/image?path=${encodeURIComponent(path)}`;
   if (width) u += `&w=${width}`;
+  if (DESKTOP_TOKEN) u += `&token=${encodeURIComponent(DESKTOP_TOKEN)}`;
   return u;
 }
 function originalUrl(path) {
-  return `/api/image_original?path=${encodeURIComponent(path)}`;
+  let u = `/api/image_original?path=${encodeURIComponent(path)}`;
+  if (DESKTOP_TOKEN) u += `&token=${encodeURIComponent(DESKTOP_TOKEN)}`;
+  return u;
 }
 
 async function fetchJSON(url, opts = {}) {
   opts.headers = { ...(opts.headers || {}) };
+  if (DESKTOP_TOKEN) opts.headers["X-Token"] = DESKTOP_TOKEN;
   if (opts.body && !opts.headers["Content-Type"]) {
     opts.headers["Content-Type"] = "application/json";
   }

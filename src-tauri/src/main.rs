@@ -22,6 +22,7 @@ struct BackendPayload {
     token: Option<String>,
     port: Option<u16>,
     python: Option<String>,
+    backend_kind: String,
     backend_dir: Option<String>,
     message: String,
 }
@@ -29,6 +30,7 @@ struct BackendPayload {
 #[derive(Debug)]
 struct BackendRuntime {
     child: Option<Child>,
+    rust_backend: Option<pianke_backend::ServerHandle>,
     payload: BackendPayload,
 }
 
@@ -36,6 +38,7 @@ impl Default for BackendRuntime {
     fn default() -> Self {
         Self {
             child: None,
+            rust_backend: None,
             payload: BackendPayload {
                 running: false,
                 healthy: false,
@@ -43,6 +46,7 @@ impl Default for BackendRuntime {
                 token: None,
                 port: None,
                 python: None,
+                backend_kind: "python".to_string(),
                 backend_dir: None,
                 message: "片刻引擎尚未启动".to_string(),
             },
@@ -110,6 +114,7 @@ fn main() {
                         token: None,
                         port: None,
                         python: None,
+                        backend_kind: "python".to_string(),
                         backend_dir: None,
                         message: err,
                     };
@@ -128,6 +133,7 @@ fn main() {
                 {
                     if let Ok(mut runtime) = state.0.lock() {
                         stop_child(&mut runtime.child);
+                        stop_rust_backend(&mut runtime.rust_backend);
                     };
                 }
             }
@@ -142,12 +148,43 @@ fn start_or_restart_backend(
 ) -> Result<BackendPayload, String> {
     let mut runtime = state.0.lock().map_err(|e| e.to_string())?;
     stop_child(&mut runtime.child);
+    stop_rust_backend(&mut runtime.rust_backend);
 
     let backend_dir = resolve_backend_dir(app)?;
-    let python = resolve_python(app);
     let port = reserve_port()?;
     let token = Uuid::new_v4().to_string();
     let url = format!("http://127.0.0.1:{port}");
+
+    if env::var("PIANKE_BACKEND")
+        .map(|v| v == "rust-fast")
+        .unwrap_or(false)
+    {
+        let handle = pianke_backend::start(pianke_backend::ServerOptions {
+            port,
+            token: Some(token.clone()),
+            backend_dir: backend_dir.clone(),
+        })?;
+        let healthy = wait_for_port(port, Duration::from_secs(10));
+        runtime.payload = BackendPayload {
+            running: true,
+            healthy,
+            url: Some(url),
+            token: Some(token),
+            port: Some(port),
+            python: None,
+            backend_kind: "rust-fast".to_string(),
+            backend_dir: Some(backend_dir.to_string_lossy().to_string()),
+            message: if healthy {
+                "Rust Fast 引擎已就绪".to_string()
+            } else {
+                "Rust Fast 引擎已启动，但健康检查暂未通过".to_string()
+            },
+        };
+        runtime.rust_backend = Some(handle);
+        return Ok(runtime.payload.clone());
+    }
+
+    let python = resolve_python(app);
 
     let mut command = Command::new(&python.program);
     command
@@ -185,11 +222,18 @@ fn start_or_restart_backend(
         token: Some(token),
         port: Some(port),
         python: Some(python.label),
+        backend_kind: "python".to_string(),
         backend_dir: Some(backend_dir.to_string_lossy().to_string()),
         message,
     };
     runtime.child = Some(child);
     Ok(runtime.payload.clone())
+}
+
+fn stop_rust_backend(handle: &mut Option<pianke_backend::ServerHandle>) {
+    if let Some(handle) = handle.take() {
+        handle.stop();
+    }
 }
 
 fn stop_child(child: &mut Option<Child>) {

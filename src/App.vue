@@ -9,6 +9,7 @@ type BackendStatus = {
   token: string | null;
   port: number | null;
   python: string | null;
+  backend_kind: string;
   backend_dir: string | null;
   message: string;
 };
@@ -20,6 +21,7 @@ const status = ref<BackendStatus>({
   token: null,
   port: null,
   python: null,
+  backend_kind: "python",
   backend_dir: null,
   message: "正在启动片刻引擎...",
 });
@@ -109,8 +111,8 @@ onUnmounted(() => {
             <dd>{{ status.port ?? "待分配" }}</dd>
           </div>
           <div>
-            <dt>Python</dt>
-            <dd>{{ status.python ?? "未找到" }}</dd>
+            <dt>引擎</dt>
+            <dd>{{ status.backend_kind === "rust-fast" ? "Rust Fast" : (status.python ?? "Python") }}</dd>
           </div>
         </dl>
       </section>

@@ -9,6 +9,7 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+pianke-backend = { path = "../crates/pianke-backend" }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
