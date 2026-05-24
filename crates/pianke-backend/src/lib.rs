@@ -11,9 +11,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Local};
 use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat};
 use pianke_core::fast::{
-    analyze_from_signals, average_hash_from_luma, cluster, difference_hash_from_luma,
-    perceptual_hash_from_luma, wavelet_hash_from_luma, ExifSummary, FastImageInfo,
-    FastQualityProfile, FastQualitySignals, QualityInfo,
+    analyze_from_signals, average_hash_from_luma, cluster, cluster_with_options,
+    difference_hash_from_luma, perceptual_hash_from_luma, wavelet_hash_from_luma, ExifSummary,
+    FastClusterOptions, FastImageInfo, FastQualityProfile, FastQualitySignals, QualityInfo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1098,7 +1098,14 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
     let idx_groups = if req.engine == "expert" || req.engine == "tycoon" {
         expert_cluster(&fast_infos)
     } else {
-        cluster(&fast_infos)
+        let orb_inliers = compute_orb_inliers_for_records(&infos);
+        if orb_inliers.is_empty() {
+            cluster(&fast_infos)
+        } else {
+            let mut options = FastClusterOptions::default();
+            options.orb_inliers = orb_inliers;
+            cluster_with_options(&fast_infos, &options)
+        }
     };
     let mut groups = Vec::new();
     for group in idx_groups {
@@ -1657,6 +1664,146 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     })
 }
 
+#[cfg(feature = "opencv-orb")]
+fn compute_orb_inliers_for_records(records: &[InfoRecord]) -> HashMap<(usize, usize), usize> {
+    use opencv::{
+        calib3d,
+        core::{self, Mat, Point2f, Vector, NORM_HAMMING},
+        features2d, imgproc,
+        prelude::*,
+    };
+
+    struct OrbFeatures {
+        descriptors: Mat,
+        keypoints: Vec<Point2f>,
+    }
+
+    fn features(path: &str) -> Result<Option<OrbFeatures>, String> {
+        let img = image::open(path).map_err(|e| format!("load ORB image failed: {e}"))?;
+        let gray = img.to_luma8();
+        let (w, h) = gray.dimensions();
+        if w < 32 || h < 32 {
+            return Ok(None);
+        }
+        let src = Mat::from_slice(gray.as_raw())
+            .map_err(|e| format!("create ORB Mat failed: {e}"))?
+            .reshape(1, h as i32)
+            .map_err(|e| format!("reshape ORB Mat failed: {e}"))?
+            .try_clone()
+            .map_err(|e| format!("clone ORB Mat failed: {e}"))?;
+        let mut work = src;
+        if w.max(h) > 800 {
+            let scale = 800.0f64 / w.max(h) as f64;
+            let size = core::Size::new(
+                ((w as f64 * scale) as i32).max(1),
+                ((h as f64 * scale) as i32).max(1),
+            );
+            let mut resized = Mat::default();
+            imgproc::resize(&work, &mut resized, size, 0.0, 0.0, imgproc::INTER_AREA)
+                .map_err(|e| format!("resize ORB image failed: {e}"))?;
+            work = resized;
+        }
+        let mut orb = features2d::ORB::create(
+            500,
+            1.2,
+            8,
+            31,
+            0,
+            2,
+            features2d::ORB_ScoreType::HARRIS_SCORE,
+            31,
+            20,
+        )
+        .map_err(|e| format!("create ORB failed: {e}"))?;
+        let mut keypoints = Vector::<core::KeyPoint>::new();
+        let mut descriptors = Mat::default();
+        orb.detect_and_compute(
+            &work,
+            &Mat::default(),
+            &mut keypoints,
+            &mut descriptors,
+            false,
+        )
+        .map_err(|e| format!("compute ORB failed: {e}"))?;
+        if descriptors.empty() || descriptors.rows() < 8 {
+            return Ok(None);
+        }
+        let points = keypoints.iter().map(|kp| kp.pt()).collect::<Vec<Point2f>>();
+        if points.len() < 8 {
+            return Ok(None);
+        }
+        Ok(Some(OrbFeatures {
+            descriptors,
+            keypoints: points,
+        }))
+    }
+
+    fn inliers(a: &OrbFeatures, b: &OrbFeatures) -> Result<usize, String> {
+        let matcher = features2d::BFMatcher::create(NORM_HAMMING, true)
+            .map_err(|e| format!("create BFMatcher failed: {e}"))?;
+        let mut matches = Vector::<core::DMatch>::new();
+        matcher
+            .train_match_def(&a.descriptors, &b.descriptors, &mut matches)
+            .map_err(|e| format!("match ORB descriptors failed: {e}"))?;
+        let good = matches
+            .iter()
+            .filter(|m| m.distance < 60.0)
+            .collect::<Vec<_>>();
+        if good.len() < 8 {
+            return Ok(0);
+        }
+        let mut pts_a = Vector::<Point2f>::new();
+        let mut pts_b = Vector::<Point2f>::new();
+        for m in good {
+            let qa = m.query_idx as usize;
+            let tb = m.train_idx as usize;
+            if let (Some(pa), Some(pb)) = (a.keypoints.get(qa), b.keypoints.get(tb)) {
+                pts_a.push(*pa);
+                pts_b.push(*pb);
+            }
+        }
+        if pts_a.len() < 8 {
+            return Ok(0);
+        }
+        let mut mask = Mat::default();
+        let _ = calib3d::find_homography(&pts_a, &pts_b, &mut mask, calib3d::RANSAC, 4.0)
+            .map_err(|e| format!("find ORB homography failed: {e}"))?;
+        if mask.empty() {
+            return Ok(0);
+        }
+        let count =
+            core::count_non_zero(&mask).map_err(|e| format!("read ORB mask failed: {e}"))?;
+        Ok(count.max(0) as usize)
+    }
+
+    let features = records
+        .iter()
+        .map(|record| features(&record.info.path).ok().flatten())
+        .collect::<Vec<_>>();
+    let mut out = HashMap::new();
+    for i in 0..features.len() {
+        for j in (i + 1)..features.len() {
+            let Some(a) = features[i].as_ref() else {
+                continue;
+            };
+            let Some(b) = features[j].as_ref() else {
+                continue;
+            };
+            if let Ok(value) = inliers(a, b) {
+                if value > 0 {
+                    out.insert((i, j), value);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(feature = "opencv-orb"))]
+fn compute_orb_inliers_for_records(_records: &[InfoRecord]) -> HashMap<(usize, usize), usize> {
+    HashMap::new()
+}
+
 fn image_to_data_url(path: &Path) -> Result<(String, usize, (u32, u32)), String> {
     let img = image::open(path).map_err(|e| format!("load image failed: {e}"))?;
     let (w, h) = img.dimensions();
@@ -1689,53 +1836,200 @@ fn tycoon_prompt(strength: &str) -> String {
 }
 
 fn expert_cluster(infos: &[FastImageInfo]) -> Vec<Vec<usize>> {
-    const THRESHOLD: f64 = 0.68;
-    const HARD_BREAK_SECONDS: f64 = 30.0 * 60.0;
+    const DISTANCE_THRESHOLD: f64 = 0.46;
+    const HARD_BREAK_SECONDS: f64 = 45.0 * 60.0;
     let n = infos.len();
     if n == 0 {
         return Vec::new();
     }
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    'outer: for i in 0..n {
-        for group in &mut groups {
-            if group.iter().all(|j| {
-                let sim = expert_pair_similarity(&infos[i], &infos[*j]);
-                let time_gap = match (infos[i].mtime, infos[*j].mtime) {
-                    (Some(a), Some(b)) => (a - b).abs(),
-                    _ => 0.0,
-                };
-                sim >= THRESHOLD && time_gap <= HARD_BREAK_SECONDS
-            }) {
-                group.push(i);
-                continue 'outer;
-            }
+
+    let mut sorted_idx = (0..n).collect::<Vec<_>>();
+    sorted_idx.sort_by(|a, b| {
+        expert_time_for_info(&infos[*a])
+            .unwrap_or(0.0)
+            .partial_cmp(&expert_time_for_info(&infos[*b]).unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut segments: Vec<Vec<usize>> = Vec::new();
+    for idx in sorted_idx {
+        let split = segments
+            .last()
+            .and_then(|seg| seg.last().copied())
+            .is_some_and(|prev| {
+                match (
+                    expert_time_for_info(&infos[idx]),
+                    expert_time_for_info(&infos[prev]),
+                ) {
+                    (Some(cur), Some(prev)) => cur - prev > HARD_BREAK_SECONDS,
+                    _ => false,
+                }
+            });
+        if split || segments.is_empty() {
+            segments.push(vec![idx]);
+        } else if let Some(seg) = segments.last_mut() {
+            seg.push(idx);
         }
-        groups.push(vec![i]);
     }
+
+    let mut groups = Vec::new();
+    for segment in segments {
+        groups.extend(expert_complete_linkage_segment(
+            infos,
+            segment,
+            DISTANCE_THRESHOLD,
+        ));
+    }
+    groups = expert_split_oversized(groups, infos, 25);
     for group in &mut groups {
         group.sort_by(|a, b| {
-            infos[*a]
-                .mtime
-                .partial_cmp(&infos[*b].mtime)
+            expert_time_for_info(&infos[*a])
+                .unwrap_or(0.0)
+                .partial_cmp(&expert_time_for_info(&infos[*b]).unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
+    groups.sort_by(|a, b| {
+        let ta = a
+            .first()
+            .and_then(|idx| expert_time_for_info(&infos[*idx]))
+            .unwrap_or(0.0);
+        let tb = b
+            .first()
+            .and_then(|idx| expert_time_for_info(&infos[*idx]))
+            .unwrap_or(0.0);
+        ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+    });
     groups
 }
 
+fn expert_complete_linkage_segment(
+    infos: &[FastImageInfo],
+    members: Vec<usize>,
+    threshold: f64,
+) -> Vec<Vec<usize>> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let mut clusters = members
+        .into_iter()
+        .map(|idx| (idx, vec![idx]))
+        .collect::<HashMap<usize, Vec<usize>>>();
+    let mut cache: HashMap<(usize, usize), f64> = HashMap::new();
+    loop {
+        let ids = clusters.keys().copied().collect::<Vec<_>>();
+        if ids.len() < 2 {
+            break;
+        }
+        let mut best_pair = None;
+        let mut best_d = f64::INFINITY;
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let d = expert_cluster_distance(
+                    ids[i], ids[j], &clusters, infos, &mut cache, threshold,
+                );
+                if d < best_d {
+                    best_d = d;
+                    best_pair = Some((ids[i], ids[j]));
+                }
+            }
+        }
+        let Some((a, b)) = best_pair else {
+            break;
+        };
+        if best_d > threshold {
+            break;
+        }
+        let moved = clusters.remove(&b).unwrap_or_default();
+        clusters.entry(a).or_default().extend(moved);
+        cache.retain(|(x, y), _| *x != a && *y != a && *x != b && *y != b);
+    }
+    clusters.into_values().collect()
+}
+
+fn expert_cluster_distance(
+    ca: usize,
+    cb: usize,
+    clusters: &HashMap<usize, Vec<usize>>,
+    infos: &[FastImageInfo],
+    cache: &mut HashMap<(usize, usize), f64>,
+    threshold: f64,
+) -> f64 {
+    let key = (ca.min(cb), ca.max(cb));
+    if let Some(value) = cache.get(&key) {
+        return *value;
+    }
+    let mut max_d = 0.0;
+    let Some(a_members) = clusters.get(&ca) else {
+        return 1.0;
+    };
+    let Some(b_members) = clusters.get(&cb) else {
+        return 1.0;
+    };
+    for i in a_members {
+        for j in b_members {
+            let d = 1.0 - expert_pair_similarity(&infos[*i], &infos[*j]);
+            if d > max_d {
+                max_d = d;
+                if max_d > threshold {
+                    cache.insert(key, max_d);
+                    return max_d;
+                }
+            }
+        }
+    }
+    cache.insert(key, max_d);
+    max_d
+}
+
+fn expert_split_oversized(
+    groups: Vec<Vec<usize>>,
+    infos: &[FastImageInfo],
+    max_size: usize,
+) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    let mut stack = groups;
+    while let Some(group) = stack.pop() {
+        if group.len() <= max_size {
+            out.push(group);
+            continue;
+        }
+        let mut timed = group
+            .into_iter()
+            .map(|idx| (expert_time_for_info(&infos[idx]).unwrap_or(0.0), idx))
+            .collect::<Vec<_>>();
+        timed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut best_gap = -1.0;
+        let mut best_k = timed.len() / 2;
+        for k in 1..timed.len() {
+            let gap = timed[k].0 - timed[k - 1].0;
+            if gap > best_gap {
+                best_gap = gap;
+                best_k = k;
+            }
+        }
+        stack.push(timed[..best_k].iter().map(|(_, idx)| *idx).collect());
+        stack.push(timed[best_k..].iter().map(|(_, idx)| *idx).collect());
+    }
+    out
+}
+
+fn expert_time_for_info(info: &FastImageInfo) -> Option<f64> {
+    info.timestamp.or(info.mtime)
+}
+
 fn expert_pair_similarity(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
-    const W_DINOV2: f64 = 0.58;
-    const W_TIME: f64 = 0.16;
+    const W_DINOV2: f64 = 0.35;
+    const W_TIME: f64 = 0.20;
     const W_EXIF: f64 = 0.10;
-    const W_FACE: f64 = 0.10;
-    const W_GPS: f64 = 0.03;
-    const W_FILENAME: f64 = 0.03;
-    const PORTRAIT_W_DINOV2: f64 = 0.34;
-    const PORTRAIT_W_TIME: f64 = 0.12;
-    const PORTRAIT_W_EXIF: f64 = 0.08;
-    const PORTRAIT_W_FACE: f64 = 0.40;
-    const PORTRAIT_W_GPS: f64 = 0.03;
-    const PORTRAIT_W_FILENAME: f64 = 0.03;
+    const W_FACE: f64 = 0.15;
+    const W_GPS: f64 = 0.10;
+    const W_FILENAME: f64 = 0.10;
+    const PORTRAIT_W_DINOV2: f64 = 0.20;
+    const PORTRAIT_W_TIME: f64 = 0.15;
+    const PORTRAIT_W_EXIF: f64 = 0.05;
+    const PORTRAIT_W_FACE: f64 = 0.50;
+    const PORTRAIT_W_GPS: f64 = 0.05;
+    const PORTRAIT_W_FILENAME: f64 = 0.05;
 
     let dino = cosine_similarity(a.dinov2.as_deref(), b.dinov2.as_deref())
         .expect("Expert/Tycoon clustering requires DINOv2 embeddings");
