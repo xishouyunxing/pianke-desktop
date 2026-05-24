@@ -142,6 +142,10 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert!(components_list
         .iter()
         .any(|c| c["id"] == "tycoon" && c["status"] == "not_installed"));
+    assert!(components["cache_dir"]
+        .as_str()
+        .expect("cache dir")
+        .contains("model_components"));
 
     let install_resp = client
         .post(format!("{base}/api/model_components/install"))
@@ -152,6 +156,15 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(install_resp.status(), 501);
     let install_json: Value = install_resp.json().expect("install json");
     assert_eq!(install_json["unavailable"], true);
+    assert_eq!(install_json["component"]["id"], "expert");
+
+    let unknown_install = client
+        .post(format!("{base}/api/model_components/install"))
+        .header("X-Token", token)
+        .json(&json!({"id": "unknown"}))
+        .send()
+        .expect("unknown install response");
+    assert_eq!(unknown_install.status(), 404);
 
     let start_resp = client
         .post(format!("{base}/api/start"))
@@ -224,6 +237,32 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     let unavailable_json: Value = unavailable.json().expect("unavailable json");
     assert_eq!(unavailable_json["unavailable"], true);
     assert!(unavailable_json["error"].as_str().unwrap_or("").len() > 0);
+}
+
+#[test]
+fn installed_model_manifest_updates_capabilities() {
+    let token = "models-token";
+    let (backend, _handle, base) = start_test_backend(token);
+    let expert_dir = backend.path().join("model_components").join("expert");
+    fs::create_dir_all(&expert_dir).expect("expert component dir");
+    fs::write(
+        expert_dir.join("component.json"),
+        r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small"],"checksum_status":"verified"}"#,
+    )
+    .expect("expert manifest");
+
+    let client = Client::new();
+    let capabilities: Value = client
+        .get(format!("{base}/api/capabilities"))
+        .header("X-Token", token)
+        .send()
+        .expect("capabilities response")
+        .json()
+        .expect("capabilities json");
+    assert_eq!(capabilities["expert_installed"], true);
+    assert_eq!(capabilities["tycoon_ready"], false);
+    assert_eq!(capabilities["model_components"]["expert"], "installed");
+    assert_eq!(capabilities["engines"], json!(["expert", "fast"]));
 }
 
 #[test]

@@ -29,6 +29,9 @@ use std::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+mod model_components;
+use model_components::{ComponentInstallRequest, ModelManager};
+
 const STATE_FILENAME: &str = ".pic_selecter_state.json";
 const PIC_DIR: &str = "_pic_selecter";
 const THUMB_MAX: u32 = 1600;
@@ -78,6 +81,7 @@ struct AppCtx {
     inner: Arc<Mutex<AppState>>,
     token: Option<String>,
     backend_dir: PathBuf,
+    models: ModelManager,
 }
 
 #[derive(Debug, Default)]
@@ -330,6 +334,7 @@ pub fn start(options: ServerOptions) -> Result<ServerHandle, String> {
     let ctx = AppCtx {
         inner: Arc::new(Mutex::new(AppState::default())),
         token: options.token,
+        models: ModelManager::new(options.backend_dir.join("model_components")),
         backend_dir: options.backend_dir,
     };
     let app = build_router(ctx);
@@ -461,61 +466,38 @@ async fn health() -> impl IntoResponse {
     Json(json!({"ok": true, "backend": "rust-fast"}))
 }
 
-async fn capabilities() -> impl IntoResponse {
+async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    let expert_installed = ctx.models.is_installed("expert");
+    let tycoon_ready = ctx.models.is_installed("tycoon");
     Json(json!({
         "face_aware": false,
-        "engines": ["fast"],
+        "engines": ctx.models.available_engines(),
         "backend": "rust-fast",
         "rust_fast": true,
         "watermark": false,
-        "expert_installed": false,
-        "tycoon_ready": false,
-        "model_components": {
-            "expert": "not_installed",
-            "tycoon": "not_installed"
-        },
+        "expert_installed": expert_installed,
+        "tycoon_ready": tycoon_ready,
+        "model_components": ctx.models.status_map(),
         "install_mode": "base",
         "python_required": false
     }))
 }
 
-async fn model_components() -> impl IntoResponse {
+async fn model_components(State(ctx): State<AppCtx>) -> impl IntoResponse {
     Json(json!({
-        "components": [
-            {
-                "id": "expert",
-                "label": "Expert local models",
-                "status": "not_installed",
-                "estimated_size_mb": 850,
-                "engines": ["expert"],
-                "models": ["dinov2-small", "insightface-buffalo_l", "nima", "musiq", "clipiqa+"],
-                "runtime": "onnxruntime",
-                "download_required": true
-            },
-            {
-                "id": "tycoon",
-                "label": "Tycoon local grouping models",
-                "status": "not_installed",
-                "estimated_size_mb": 400,
-                "engines": ["tycoon"],
-                "models": ["dinov2-small", "insightface-buffalo_l"],
-                "runtime": "onnxruntime+reqwest",
-                "download_required": true
-            }
-        ],
-        "cache_dir": null,
+        "components": ctx.models.list(),
+        "cache_dir": ctx.models.cache_dir().to_string_lossy(),
         "backend": "rust-fast"
     }))
 }
 
-async fn model_component_install() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "Rust model component installer is not implemented yet",
-            "unavailable": true
-        })),
-    )
+async fn model_component_install(
+    State(ctx): State<AppCtx>,
+    Json(req): Json<ComponentInstallRequest>,
+) -> impl IntoResponse {
+    match ctx.models.install_unavailable(req) {
+        Ok((status, body)) | Err((status, body)) => (status, Json(body)),
+    }
 }
 
 async fn unavailable() -> impl IntoResponse {
