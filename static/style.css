@@ -3075,6 +3075,24 @@ body:has(#view-processing.active) .status-badge {
   background: rgba(255,255,255,.55);
   transform: none;
 }
+.model-install-chip {
+  align-self: flex-start;
+  margin-top: 4px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(142, 94, 70, .28);
+  background: rgba(255,255,255,.72);
+  color: var(--accent-deep);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.model-install-chip:hover,
+.model-install-chip:focus-visible {
+  background: #fff;
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(204,120,92,.18);
+}
 .engine-opt input[type="radio"] {
   position: absolute;
   opacity: 0; pointer-events: none;

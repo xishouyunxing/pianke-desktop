@@ -514,6 +514,24 @@ syncEngineSwitch();
 
 let backendCapabilities = null;
 
+async function requestModelComponentInstall(componentId) {
+  if (!componentId) return;
+  setStatus("正在检查增强组件", "busy");
+  try {
+    await fetchJSON("/api/model_components/install", {
+      method: "POST",
+      body: JSON.stringify({ id: componentId }),
+    });
+    const cap = await fetchJSON("/api/capabilities");
+    applyBackendCapabilities(cap);
+    toast("增强组件已安装");
+    setStatus("增强组件已安装", "done");
+  } catch (err) {
+    toast(err.message || "增强组件安装器尚未完成");
+    setStatus("增强组件暂不可安装", "error");
+  }
+}
+
 function applyBackendCapabilities(cap) {
   backendCapabilities = cap || {};
   const rustFast = !!(cap && (cap.rust_fast || cap.backend === "rust-fast"));
@@ -538,6 +556,31 @@ function applyBackendCapabilities(cap) {
         desc.textContent = "Rust版基础包暂未安装该增强组件，Fast模式可直接使用";
       } else if (available && desc?.dataset.originalText) {
         desc.textContent = desc.dataset.originalText;
+      }
+      let action = el.querySelector(".model-install-chip");
+      if (!available && engine !== "fast") {
+        if (!action) {
+          action = document.createElement("span");
+          action.className = "model-install-chip";
+          action.role = "button";
+          action.tabIndex = 0;
+          action.textContent = "安装增强组件";
+          action.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            requestModelComponentInstall(engine);
+          });
+          action.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            event.stopPropagation();
+            requestModelComponentInstall(engine);
+          });
+          el.appendChild(action);
+        }
+        action.dataset.component = engine;
+      } else if (action) {
+        action.remove();
       }
     });
     syncEngineSwitch();
