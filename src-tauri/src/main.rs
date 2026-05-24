@@ -249,6 +249,19 @@ fn resolve_python(app: &tauri::AppHandle) -> PythonCommand {
         }
     }
 
+    let dev_bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("binaries")
+        .join("python")
+        .join("python.exe");
+    if dev_bundled.exists() {
+        let py = dev_bundled.to_string_lossy().to_string();
+        return PythonCommand {
+            label: py.clone(),
+            program: py,
+            prefix_args: vec![],
+        };
+    }
+
     if cfg!(windows) {
         PythonCommand {
             program: "py".to_string(),

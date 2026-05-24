@@ -27,13 +27,14 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
-    "resources": [
-      "../app.py",
-      "../pic_selecter",
-      "../static",
-      "../assets",
-      "../requirements-fast.txt"
-    ],
+    "resources": {
+      "../app.py": "app.py",
+      "../pic_selecter": "pic_selecter",
+      "../static": "static",
+      "../assets": "assets",
+      "../requirements-fast.txt": "requirements-fast.txt",
+      "binaries/python": "python"
+    },
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"

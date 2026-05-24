@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tauri dev",
     "dev:ui": "vite --host 127.0.0.1 --port 1420",
+    "prepare:python": "powershell -ExecutionPolicy Bypass -File scripts/prepare_desktop_python.ps1",
     "build": "tauri build",
     "build:ui": "vue-tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 1420"
