@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Export Python DINOv2 embeddings for Rust ONNX parity checks.
+"""Export Python Expert vision outputs for Rust ONNX parity checks.
 
 Usage:
     python scripts/export_dinov2_golden.py C:\photos fixtures\expert_parity\dinov2.json
 
-The output contains L2-normalized CLS embeddings from pic_selecter.vision.extract_dinov2.
+The output contains L2-normalized DINOv2 CLS embeddings and optional InsightFace face data.
 It is intentionally small and deterministic so Rust can compare ONNX output cosine similarity.
 """
 
@@ -40,27 +40,43 @@ def main() -> None:
     parser.add_argument("folder", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--faces", action="store_true", help="also export InsightFace bbox/landmark/embedding data")
     args = parser.parse_args()
 
     records = []
     for path in iter_images(args.folder, args.limit):
         with Image.open(path) as img:
-            emb = vision.extract_dinov2(img)
-        records.append(
-            {
+            rgb = img.convert("RGB")
+            emb = vision.extract_dinov2(rgb)
+            item = {
                 "path": str(path),
                 "name": path.name,
-                "dim": int(len(emb)),
+                "dinov2_dim": int(len(emb)),
                 "embedding": [round(float(v), 8) for v in emb.tolist()],
             }
-        )
+            if args.faces:
+                faces = vision.extract_faces(rgb)
+                item["face_count"] = len(faces)
+                item["faces"] = [
+                    {
+                        "bbox": [int(v) for v in face["bbox"]],
+                        "det_score": round(float(face.get("det_score", 1.0)), 6),
+                        "embedding_dim": int(len(face["embedding"])),
+                        "embedding": [round(float(v), 8) for v in face["embedding"].tolist()],
+                        "kps": None if face.get("kps") is None else [[round(float(x), 4), round(float(y), 4)] for x, y in face["kps"].tolist()],
+                        "landmark_2d_68": None if face.get("landmark_2d_68") is None else [[round(float(x), 4), round(float(y), 4)] for x, y in face["landmark_2d_68"].tolist()],
+                    }
+                    for face in faces
+                ]
+        records.append(item)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(
             {
                 "model": "facebook/dinov2-small",
-                "embedding": "cls_l2_normalized",
+                "dinov2": "cls_l2_normalized",
+                "faces": "insightface_buffalo_l_optional",
                 "count": len(records),
                 "items": records,
             },

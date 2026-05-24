@@ -45,6 +45,28 @@ impl ModelManager {
             .any(|component| component.id == id && component.status == "installed")
     }
 
+    pub fn expert_capabilities(&self) -> ExpertComponentCapabilities {
+        let dir = self.cache_dir.join("expert");
+        ExpertComponentCapabilities {
+            dinov2: dir.join("models").join("dinov2-small.onnx").exists(),
+            insightface_detection: dir
+                .join("models")
+                .join("insightface")
+                .join("det_10g.onnx")
+                .exists(),
+            insightface_recognition: dir
+                .join("models")
+                .join("insightface")
+                .join("w600k_r50.onnx")
+                .exists(),
+            insightface_landmark: dir
+                .join("models")
+                .join("insightface")
+                .join("1k3d68.onnx")
+                .exists(),
+        }
+    }
+
     pub fn installed_dir(&self, id: &str) -> Result<PathBuf, String> {
         let component = self
             .list()
@@ -359,6 +381,14 @@ pub struct ComponentView {
     pub install_state: Option<InstallState>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ExpertComponentCapabilities {
+    pub dinov2: bool,
+    pub insightface_detection: bool,
+    pub insightface_recognition: bool,
+    pub insightface_landmark: bool,
+}
+
 fn component_catalog() -> Vec<ComponentDef> {
     vec![ComponentDef {
         id: "expert",
@@ -368,10 +398,9 @@ fn component_catalog() -> Vec<ComponentDef> {
         engines: &["expert"],
         models: &[
             "dinov2-small",
-            "insightface-buffalo_l",
-            "nima",
-            "musiq",
-            "clipiqa+",
+            "insightface-det_10g",
+            "insightface-w600k_r50",
+            "insightface-1k3d68",
         ],
         runtime: "onnxruntime",
     }]

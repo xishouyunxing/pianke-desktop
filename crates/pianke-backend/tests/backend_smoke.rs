@@ -171,6 +171,11 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(capabilities["expert_installed"], false);
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["python_required"], false);
+    assert_eq!(capabilities["expert_capabilities"]["dinov2"], false);
+    assert_eq!(
+        capabilities["expert_capabilities"]["insightface_detection"],
+        false
+    );
 
     let components: Value = client
         .get(format!("{base}/api/model_components"))
@@ -349,8 +354,6 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         .send()
         .expect("tycoon start response");
     assert!(tycoon_start.status().is_success());
-
-    wait_for_done(&client, &base, token);
     let job: Value = client
         .get(format!("{base}/api/job"))
         .header("X-Token", token)
@@ -358,12 +361,21 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         .expect("tycoon job response")
         .json()
         .expect("tycoon job json");
-    assert_eq!(job["status"], "done");
-    let events = job["events"].as_array().expect("recent events");
-    assert!(!events.is_empty());
-    assert_eq!(events[0]["engine"], "tycoon");
-    assert_eq!(events[0]["verdict"], "reject");
-    assert_eq!(events[0]["reason"], "too dark");
+    if job["status"] != "error" {
+        wait_for_done(&client, &base, token);
+    }
+    let job: Value = client
+        .get(format!("{base}/api/job"))
+        .header("X-Token", token)
+        .send()
+        .expect("tycoon job response")
+        .json()
+        .expect("tycoon job json");
+    assert_eq!(job["status"], "error");
+    assert!(job["error"]
+        .as_str()
+        .expect("tycoon missing component error")
+        .contains("Expert"));
 }
 
 #[test]
@@ -389,6 +401,12 @@ fn installed_model_manifest_updates_capabilities() {
         .json()
         .expect("capabilities json");
     assert_eq!(capabilities["expert_installed"], true);
+    assert_eq!(capabilities["face_aware"], false);
+    assert_eq!(capabilities["expert_capabilities"]["dinov2"], true);
+    assert_eq!(
+        capabilities["expert_capabilities"]["insightface_detection"],
+        false
+    );
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
     assert_eq!(capabilities["engines"], json!(["expert", "fast", "tycoon"]));

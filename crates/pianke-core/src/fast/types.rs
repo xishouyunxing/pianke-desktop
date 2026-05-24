@@ -66,4 +66,6 @@ pub struct FastImageInfo {
     pub orb_kps_len: Option<usize>,
     #[serde(default)]
     pub dinov2: Option<Vec<f32>>,
+    #[serde(default)]
+    pub face_embeddings: Vec<Vec<f32>>,
 }

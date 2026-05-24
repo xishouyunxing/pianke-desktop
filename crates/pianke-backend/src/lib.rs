@@ -508,6 +508,10 @@ async fn health() -> impl IntoResponse {
 
 async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
     let expert_installed = ctx.models.is_installed("expert");
+    let expert_caps = ctx.models.expert_capabilities();
+    let face_aware = expert_installed && expert_caps.insightface_detection
+        && expert_caps.insightface_recognition
+        && expert_caps.insightface_landmark;
     let llm_status = ctx.llm.provider_status();
     let tycoon_ready = llm_status.configured;
     let mut engines = ctx.models.available_engines();
@@ -515,12 +519,13 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
     engines.sort();
     engines.dedup();
     Json(json!({
-        "face_aware": false,
+        "face_aware": face_aware,
         "engines": engines,
         "backend": "rust-fast",
         "rust_fast": true,
         "watermark": true,
         "expert_installed": expert_installed,
+        "expert_capabilities": expert_caps,
         "tycoon_ready": tycoon_ready,
         "model_components": ctx.models.status_map(),
         "llm_provider": {
@@ -837,12 +842,30 @@ async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> 
 }
 
 fn run_job(ctx: AppCtx, req: StartRequest) {
-    let mut expert_model = if req.engine == "expert" {
-        match ctx
-            .models
-            .installed_dir("expert")
-            .and_then(|dir| expert_vision::Dinov2Model::from_component_dir(&dir))
-        {
+    let expert_dir = if req.engine == "expert" || req.engine == "tycoon" {
+        match ctx.models.installed_dir("expert") {
+            Ok(dir) => Some(dir),
+            Err(err) if req.engine == "tycoon" => {
+                let mut state = ctx.inner.lock().expect("backend state lock");
+                state.job.status = "error".to_string();
+                state.job.error =
+                    Some(format!("Tycoon 模式需要先安装 Expert DINOv2 + 人脸组件: {err}"));
+                state.job.finished_at = now_secs();
+                return;
+            }
+            Err(err) => {
+                let mut state = ctx.inner.lock().expect("backend state lock");
+                state.job.status = "error".to_string();
+                state.job.error = Some(err);
+                state.job.finished_at = now_secs();
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let mut expert_model = if let Some(dir) = &expert_dir {
+        match expert_vision::Dinov2Model::from_component_dir(dir) {
             Ok(model) => Some(model),
             Err(err) => {
                 let mut state = ctx.inner.lock().expect("backend state lock");
@@ -851,6 +874,33 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
                 state.job.finished_at = now_secs();
                 return;
             }
+        }
+    } else {
+        None
+    };
+    let mut face_model = if let Some(dir) = &expert_dir {
+        if expert_vision::InsightFaceModels::component_files_ready(dir) {
+            match expert_vision::InsightFaceModels::from_component_dir(dir) {
+                Ok(model) => Some(model),
+                Err(err) if req.engine == "tycoon" => {
+                    let mut state = ctx.inner.lock().expect("backend state lock");
+                    state.job.status = "error".to_string();
+                    state.job.error =
+                        Some(format!("Tycoon 模式需要可用的人脸组件，当前加载失败: {err}"));
+                    state.job.finished_at = now_secs();
+                    return;
+                }
+                Err(_) => None,
+            }
+        } else if req.engine == "tycoon" {
+            let mut state = ctx.inner.lock().expect("backend state lock");
+            state.job.status = "error".to_string();
+            state.job.error =
+                Some("Tycoon 模式需要 Expert 人脸组件：det_10g / w600k_r50 / 1k3d68".to_string());
+            state.job.finished_at = now_secs();
+            return;
+        } else {
+            None
         }
     } else {
         None
@@ -920,6 +970,33 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
                         }
                     }
                 }
+                if let Some(model) = face_model.as_mut() {
+                    let Some(analysis) = pair.analysis.as_ref() else {
+                        let mut state = ctx.inner.lock().expect("backend state lock");
+                        state.job.status = "error".to_string();
+                        state.job.error =
+                            Some("Expert/Tycoon 人脸模式需要可解码的 JPG/PNG/WebP/TIFF companion".to_string());
+                        state.job.finished_at = now_secs();
+                        return;
+                    };
+                    match apply_face_analysis(model, analysis, &mut record) {
+                        Ok(()) => {}
+                        Err(reason) if req.engine == "tycoon" => {
+                            let mut state = ctx.inner.lock().expect("backend state lock");
+                            state.job.status = "error".to_string();
+                            state.job.error = Some(reason);
+                            state.job.finished_at = now_secs();
+                            return;
+                        }
+                        Err(reason) => {
+                            let mut quality = record.info.quality.clone().unwrap_or_default();
+                            quality
+                                .extra
+                                .insert("face_unavailable".to_string(), json!(reason));
+                            record.info.quality = Some(quality);
+                        }
+                    }
+                }
                 if let Some(config) = &tycoon_config {
                     match run_tycoon_judge(
                         &ctx,
@@ -962,7 +1039,7 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
     }
 
     let fast_infos = infos.iter().map(|r| r.info.clone()).collect::<Vec<_>>();
-    let idx_groups = if req.engine == "expert" {
+    let idx_groups = if req.engine == "expert" || req.engine == "tycoon" {
         expert_cluster(&fast_infos)
     } else {
         cluster(&fast_infos)
@@ -1040,7 +1117,7 @@ fn run_job(ctx: AppCtx, req: StartRequest) {
         folder: req.folder.clone(),
         dry_run: req.dry_run,
         mode: req.mode.clone(),
-        engine: "fast".to_string(),
+        engine: req.engine.clone(),
         groups,
         current_group: 0,
         threshold_near: req.threshold_near,
@@ -1242,6 +1319,95 @@ fn apply_dinov2_embedding(record: &mut InfoRecord, dinov2: Vec<f32>) {
     record.info.dinov2 = Some(dinov2);
 }
 
+fn apply_face_analysis(
+    model: &mut expert_vision::InsightFaceModels,
+    analysis: &Path,
+    record: &mut InfoRecord,
+) -> Result<(), String> {
+    let img = image::open(analysis).map_err(|e| format!("加载人脸分析图片失败: {e}"))?;
+    let faces = model.extract_faces(&img)?;
+    apply_face_infos(record, &img, faces);
+    Ok(())
+}
+
+fn apply_face_infos(record: &mut InfoRecord, img: &DynamicImage, faces: Vec<expert_vision::FaceInfo>) {
+    let signals = expert_vision::face_signals_from_data(&faces, img);
+    let mut quality = record.info.quality.clone().unwrap_or_default();
+    quality
+        .extra
+        .insert("face_count".to_string(), json!(signals.face_count));
+    if let Some(v) = signals.face_sharpness {
+        quality.extra.insert("face_sharpness".to_string(), json!(v));
+    }
+    quality
+        .extra
+        .insert("face_clipped".to_string(), json!(signals.face_clipped));
+    if let Some(v) = signals.eyes_open_score {
+        quality.extra.insert("eyes_open_score".to_string(), json!(v));
+    }
+    if let Some(v) = signals.face_area_ratio {
+        quality.extra.insert("face_area_ratio".to_string(), json!(v));
+    }
+    if let Some(v) = signals.det_score {
+        quality.extra.insert("det_score".to_string(), json!(v));
+    }
+    quality
+        .extra
+        .insert("faces_detail".to_string(), json!(signals.faces_detail));
+    apply_face_quality_flags(&mut quality);
+    record.info.face_embeddings = faces.into_iter().map(|face| face.embedding).collect();
+    record.info.quality = Some(quality);
+}
+
+fn apply_face_quality_flags(quality: &mut QualityInfo) {
+    let face_count = quality
+        .extra
+        .get("face_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let face_sharp = quality
+        .extra
+        .get("face_sharpness")
+        .and_then(|v| v.as_f64());
+    let eyes = quality
+        .extra
+        .get("eyes_open_score")
+        .and_then(|v| v.as_f64());
+    let clipped = quality
+        .extra
+        .get("face_clipped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if face_count > 0 {
+        if let Some(sharp) = face_sharp {
+            if sharp < 60.0 && !quality.flags.iter().any(|f| f == "face_very_blurry") {
+                quality.flags.push("face_very_blurry".to_string());
+            } else if sharp < 120.0 && !quality.flags.iter().any(|f| f == "face_blurry") {
+                quality.flags.push("face_blurry".to_string());
+            }
+        }
+        if let Some(eye) = eyes {
+            if eye < 0.22 && !quality.flags.iter().any(|f| f == "eyes_closed") {
+                quality.flags.push("eyes_closed".to_string());
+            }
+        }
+        if clipped && !quality.flags.iter().any(|f| f == "face_clipped") {
+            quality.flags.push("face_clipped".to_string());
+        }
+    }
+    if quality.flags.iter().any(|f| {
+        matches!(
+            f.as_str(),
+            "face_very_blurry" | "eyes_closed" | "all_eyes_closed" | "face_clipped"
+        )
+    }) {
+        quality.auto_reject = Some(true);
+        if quality.reject_reason.is_none() {
+            quality.reject_reason = Some("人脸质量不达标".to_string());
+        }
+    }
+}
+
 fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     let analysis = pair.analysis.as_ref().ok_or_else(|| {
         if RAW_EXTS.contains(&ext_lower(&pair.primary).as_str()) {
@@ -1332,6 +1498,7 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
         orb_descs_len: None,
         orb_kps_len: None,
         dinov2: None,
+        face_embeddings: Vec::new(),
     };
     Ok(InfoRecord {
         info,
@@ -1410,17 +1577,53 @@ fn expert_cluster(infos: &[FastImageInfo]) -> Vec<Vec<usize>> {
 }
 
 fn expert_pair_similarity(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
-    let dino = cosine_similarity(a.dinov2.as_deref(), b.dinov2.as_deref()).unwrap_or(0.0);
-    let time = match (a.mtime, b.mtime) {
-        (Some(x), Some(y)) => (-(x - y).abs() / 60.0).exp(),
-        _ => 0.0,
+    const W_DINOV2: f64 = 0.58;
+    const W_TIME: f64 = 0.16;
+    const W_EXIF: f64 = 0.10;
+    const W_FACE: f64 = 0.10;
+    const W_GPS: f64 = 0.03;
+    const W_FILENAME: f64 = 0.03;
+    const PORTRAIT_W_DINOV2: f64 = 0.34;
+    const PORTRAIT_W_TIME: f64 = 0.12;
+    const PORTRAIT_W_EXIF: f64 = 0.08;
+    const PORTRAIT_W_FACE: f64 = 0.40;
+    const PORTRAIT_W_GPS: f64 = 0.03;
+    const PORTRAIT_W_FILENAME: f64 = 0.03;
+
+    let dino = cosine_similarity(a.dinov2.as_deref(), b.dinov2.as_deref())
+        .expect("Expert/Tycoon clustering requires DINOv2 embeddings");
+    let time = time_similarity(a.mtime, b.mtime);
+    let exif = expert_exif_similarity(a.exif_summary.as_ref(), b.exif_summary.as_ref());
+    let (gps, has_gps) = expert_gps_similarity(a.exif_summary.as_ref(), b.exif_summary.as_ref())
+        .map_or((0.0, false), |v| (v, true));
+    let face = face_overlap_similarity(&a.face_embeddings, &b.face_embeddings);
+    let name = expert_filename_similarity(&a.path, &b.path);
+    let portrait = !a.face_embeddings.is_empty() && !b.face_embeddings.is_empty();
+    let (mut w_dino, w_time, mut w_exif, mut w_face, mut w_gps, w_name) = if portrait {
+        (
+            PORTRAIT_W_DINOV2,
+            PORTRAIT_W_TIME,
+            PORTRAIT_W_EXIF,
+            PORTRAIT_W_FACE,
+            PORTRAIT_W_GPS,
+            PORTRAIT_W_FILENAME,
+        )
+    } else {
+        (W_DINOV2, W_TIME, W_EXIF, W_FACE, W_GPS, W_FILENAME)
     };
-    let exif = match (&a.exif_summary, &b.exif_summary) {
-        (Some(x), Some(y)) if x.camera.is_some() && x.camera == y.camera => 1.0,
-        _ => 0.0,
-    };
-    let name = filename_prefix_similarity(&a.path, &b.path);
-    0.64 * dino + 0.18 * time + 0.12 * exif + 0.06 * name
+    if !has_gps {
+        w_exif += w_gps;
+        w_gps = 0.0;
+    }
+    if !portrait && face == 0.0 && (a.face_embeddings.is_empty() || b.face_embeddings.is_empty()) {
+        w_dino += w_face * 0.4;
+        let w_time_adj = w_time + w_face * 0.3;
+        w_exif += w_face * 0.3;
+        w_face = 0.0;
+        let _ = w_face;
+        return w_dino * dino + w_time_adj * time + w_exif * exif + w_gps * gps + w_name * name;
+    }
+    w_dino * dino + w_time * time + w_exif * exif + w_face * face + w_gps * gps + w_name * name
 }
 
 fn cosine_similarity(a: Option<&[f32]>, b: Option<&[f32]>) -> Option<f64> {
@@ -1446,20 +1649,124 @@ fn cosine_similarity(a: Option<&[f32]>, b: Option<&[f32]>) -> Option<f64> {
     Some((dot / (na.sqrt() * nb.sqrt())).clamp(0.0, 1.0))
 }
 
-fn filename_prefix_similarity(a: &str, b: &str) -> f64 {
-    let a = file_name(a);
-    let b = file_name(b);
-    let pa = a
-        .trim_end_matches(|c: char| c.is_ascii_digit())
-        .trim_end_matches(['_', '-']);
-    let pb = b
-        .trim_end_matches(|c: char| c.is_ascii_digit())
-        .trim_end_matches(['_', '-']);
-    if !pa.is_empty() && pa == pb {
+fn face_overlap_similarity(a: &[Vec<f32>], b: &[Vec<f32>]) -> f64 {
+    let n1 = a.len();
+    let n2 = b.len();
+    if n1 == 0 && n2 == 0 {
         1.0
+    } else if n1 == 0 || n2 == 0 {
+        0.0
+    } else {
+        let mut matched_a = HashSet::new();
+        let mut matched_b = HashSet::new();
+        for (i, emb_a) in a.iter().enumerate() {
+            if matched_a.contains(&i) {
+                continue;
+            }
+            let mut best_j = None;
+            let mut best_sim = -1.0;
+            for (j, emb_b) in b.iter().enumerate() {
+                if matched_b.contains(&j) {
+                    continue;
+                }
+                let sim = cosine_similarity(Some(emb_a), Some(emb_b)).unwrap_or(0.0);
+                if sim > best_sim {
+                    best_sim = sim;
+                    best_j = Some(j);
+                }
+            }
+            if let Some(j) = best_j {
+                if best_sim > 0.45 {
+                    matched_a.insert(i);
+                    matched_b.insert(j);
+                }
+            }
+        }
+        let matched = matched_a.len();
+        let denom = n1 + n2 - matched;
+        if denom == 0 {
+            0.0
+        } else {
+            matched as f64 / denom as f64
+        }
+    }
+}
+
+fn time_similarity(a: Option<f64>, b: Option<f64>) -> f64 {
+    match (a, b) {
+        (Some(x), Some(y)) => (-(x - y).abs() / 60.0).exp(),
+        _ => 0.0,
+    }
+}
+
+fn expert_exif_similarity(a: Option<&ExifSummary>, b: Option<&ExifSummary>) -> f64 {
+    let (Some(a), Some(b)) = (a, b) else {
+        return 0.0;
+    };
+    let mut score = 0.0;
+    let mut parts = 0.0;
+    if let (Some(x), Some(y)) = (&a.camera, &b.camera) {
+        parts += 1.0;
+        if x == y {
+            score += 1.0;
+        }
+    }
+    if let (Some(x), Some(y)) = (&a.lens, &b.lens) {
+        parts += 1.0;
+        if x == y {
+            score += 1.0;
+        }
+    }
+    if parts > 0.0 {
+        score / parts
     } else {
         0.0
     }
+}
+
+fn expert_gps_similarity(a: Option<&ExifSummary>, b: Option<&ExifSummary>) -> Option<f64> {
+    let a = a?;
+    let b = b?;
+    let (lat1, lon1, lat2, lon2) = (a.gps_lat?, a.gps_lon?, b.gps_lat?, b.gps_lon?);
+    let avg_lat_rad = ((lat1 + lat2) / 2.0).to_radians();
+    let dist = ((lat1 - lat2).powi(2) + ((lon1 - lon2) * avg_lat_rad.cos()).powi(2)).sqrt();
+    Some((-dist / 0.0009).exp())
+}
+
+fn expert_filename_similarity(a: &str, b: &str) -> f64 {
+    let name_a = file_name(a);
+    let name_b = file_name(b);
+    let (Some(n1), Some(n2)) = (filename_number_from_name(&name_a), filename_number_from_name(&name_b)) else {
+        return 0.0;
+    };
+    if filename_prefix_from_name(&name_a) != filename_prefix_from_name(&name_b) {
+        return 0.0;
+    }
+    let delta = n1.abs_diff(n2) as f64;
+    if delta == 0.0 {
+        1.0
+    } else {
+        (1.0 - delta / 30.0).max(0.0)
+    }
+}
+
+fn filename_number_from_name(name: &str) -> Option<u64> {
+    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let digits = stem
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.chars().rev().collect::<String>().parse().ok()
+    }
+}
+
+fn filename_prefix_from_name(name: &str) -> String {
+    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    stem.trim_end_matches(|ch: char| ch.is_ascii_digit()).to_string()
 }
 
 fn whash_image_scale(width: u32, height: u32) -> u32 {
@@ -2596,22 +2903,30 @@ fn push_job_event(ctx: &AppCtx, record: &InfoRecord, reason: Option<String>) {
         .and_then(|q| q.extra.get("llm_reason"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let _signals = if engine == "expert" {
+    let signals = if engine == "expert" || engine == "tycoon" {
         let dino_value = record
             .info
             .dinov2
             .as_ref()
-            .map(|v| format!("{}维", v.len()))
+            .map(|v| format!("{} dims", v.len()))
             .unwrap_or_else(|| "missing".to_string());
+        let face_value = if record.info.face_embeddings.is_empty() {
+            q.and_then(|q| q.extra.get("face_unavailable"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| "0 faces".to_string())
+        } else {
+            format!("{} faces", record.info.face_embeddings.len())
+        };
         vec![
             json!({"kind": "dino", "label": "DINOv2", "value": dino_value}),
-            json!({"kind": "nima", "label": "美学", "value": "未接入"}),
-            json!({"kind": "face", "label": "脸", "value": "未接入"}),
+            json!({"kind": "face", "label": "Face", "value": face_value}),
+            json!({"kind": "llm", "label": "LLM", "value": llm_verdict.clone().unwrap_or_else(|| "none".to_string())}),
         ]
     } else {
         vec![
-            json!({"kind": if engine == "expert" { "dino" } else { "hash" }, "label": if engine == "expert" { "DINOv2" } else { "hash" }, "value": if engine == "expert" { record.info.dinov2.as_ref().map(|v| format!("{}维", v.len())).unwrap_or_else(|| "missing".to_string()) } else { record.info.ahash.clone().unwrap_or_default() }}),
-            json!({"kind": "color", "label": "HSV", "value": if record.info.color_hist.is_some() { "已建" } else { "数据不足" }}),
+            json!({"kind": "hash", "label": "hash", "value": record.info.ahash.clone().unwrap_or_default()}),
+            json!({"kind": "color", "label": "HSV", "value": if record.info.color_hist.is_some() { "ready" } else { "missing" }}),
             json!({"kind": "orb", "label": "ORB", "value": "pending"}),
             json!({"kind": "llm", "label": "LLM", "value": llm_verdict.clone().unwrap_or_else(|| "none".to_string())}),
         ]
@@ -2643,12 +2958,7 @@ fn push_job_event(ctx: &AppCtx, record: &InfoRecord, reason: Option<String>) {
             .exif_summary
             .as_ref()
             .and_then(|e| e.iso.clone()),
-        signals: vec![
-            json!({"kind": "hash", "label": "hash", "value": record.info.ahash.clone().unwrap_or_default()}),
-            json!({"kind": "color", "label": "HSV", "value": if record.info.color_hist.is_some() { "已建" } else { "数据不足" }}),
-            json!({"kind": "orb", "label": "ORB", "value": "pending"}),
-            json!({"kind": "llm", "label": "LLM", "value": llm_verdict.unwrap_or_else(|| "none".to_string())}),
-        ],
+        signals,
     };
     state.job.recent_events.push(event);
     if state.job.recent_events.len() > 200 {
@@ -2697,6 +3007,12 @@ fn meta_entry(record: &InfoRecord) -> Value {
     }
     if let Some(dinov2) = &record.info.dinov2 {
         map.insert("dinov2_dim".to_string(), json!(dinov2.len()));
+    }
+    if !record.info.face_embeddings.is_empty() {
+        map.insert(
+            "face_embedding_count".to_string(),
+            json!(record.info.face_embeddings.len()),
+        );
     }
     Value::Object(map)
 }
@@ -2912,5 +3228,40 @@ mod tests {
         assert!(group.finished);
         assert_eq!(group.winner.as_deref(), Some("a.jpg"));
         assert_eq!(group.losers, vec!["b.jpg"]);
+    }
+
+    #[test]
+    fn face_overlap_matches_arcface_threshold_logic() {
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let b = vec![vec![0.99, 0.01], vec![1.0, 0.0]];
+        assert_eq!(face_overlap_similarity(&a, &[]), 0.0);
+        assert_eq!(face_overlap_similarity(&[], &[]), 1.0);
+        assert!((face_overlap_similarity(&a, &b) - (1.0 / 3.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn expert_pair_similarity_uses_face_signal_for_portraits() {
+        let mut a = FastImageInfo {
+            path: "IMG_0001.jpg".to_string(),
+            mtime: Some(100.0),
+            dinov2: Some(vec![0.9, 0.1]),
+            face_embeddings: vec![vec![1.0, 0.0]],
+            ..FastImageInfo::default()
+        };
+        let mut b = FastImageInfo {
+            path: "IMG_0002.jpg".to_string(),
+            mtime: Some(101.0),
+            dinov2: Some(vec![0.9, 0.1]),
+            face_embeddings: vec![vec![1.0, 0.0]],
+            ..FastImageInfo::default()
+        };
+        let same_face = expert_pair_similarity(&a, &b);
+        b.face_embeddings = vec![vec![0.0, 1.0]];
+        let different_face = expert_pair_similarity(&a, &b);
+        assert!(same_face > different_face);
+        assert!(same_face > 0.8);
+        a.face_embeddings.clear();
+        b.face_embeddings.clear();
+        assert!(expert_pair_similarity(&a, &b) > 0.5);
     }
 }
