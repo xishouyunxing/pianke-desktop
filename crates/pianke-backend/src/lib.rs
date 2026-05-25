@@ -1677,8 +1677,51 @@ fn compute_orb_inliers_for_records(records: &[InfoRecord]) -> HashMap<(usize, us
         keypoints: Vec<Point2f>,
     }
 
-    fn features_from_image(img: &DynamicImage) -> Result<Option<OrbFeatures>, String> {
-        let gray = img.to_luma8();
+    const ORB_ANALYSIS_MAX_SIDE: u32 = 2048;
+
+    fn load_rgb(path: &str) -> Result<image::RgbImage, String> {
+        let path = Path::new(path);
+        let rgb = if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+            .unwrap_or(false)
+        {
+            let bytes = fs::read(path).map_err(|e| format!("read ORB JPEG failed: {e}"))?;
+            turbojpeg::decompress_image(&bytes)
+                .map_err(|e| format!("libjpeg-turbo decode ORB JPEG failed: {e}"))?
+        } else {
+            image::open(path)
+                .map(|img| img.to_rgb8())
+                .map_err(|e| format!("load ORB image failed: {e}"))?
+        };
+        let (w, h) = rgb.dimensions();
+        if w.max(h) <= ORB_ANALYSIS_MAX_SIDE {
+            Ok(rgb)
+        } else {
+            let scale = ORB_ANALYSIS_MAX_SIDE as f32 / w.max(h) as f32;
+            let new_w = ((w as f32 * scale) as u32).max(1);
+            let new_h = ((h as f32 * scale) as u32).max(1);
+            Ok(expert_vision::pillow_lanczos_resize_rgb(&rgb, new_w, new_h))
+        }
+    }
+
+    fn pillow_luma(rgb: &image::RgbImage) -> image::GrayImage {
+        let (w, h) = rgb.dimensions();
+        let mut out = image::GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b] = rgb.get_pixel(x, y).0;
+                let luma =
+                    (19595u32 * r as u32 + 38470u32 * g as u32 + 7471u32 * b as u32 + 32768) >> 16;
+                out.put_pixel(x, y, image::Luma([luma.min(255) as u8]));
+            }
+        }
+        out
+    }
+
+    fn features_from_rgb(rgb: &image::RgbImage) -> Result<Option<OrbFeatures>, String> {
+        let gray = pillow_luma(rgb);
         let (w, h) = gray.dimensions();
         if w < 32 || h < 32 {
             return Ok(None);
@@ -1737,8 +1780,8 @@ fn compute_orb_inliers_for_records(records: &[InfoRecord]) -> HashMap<(usize, us
     }
 
     fn features(path: &str) -> Result<Option<OrbFeatures>, String> {
-        let img = image::open(path).map_err(|e| format!("load ORB image failed: {e}"))?;
-        features_from_image(&img)
+        let img = load_rgb(path)?;
+        features_from_rgb(&img)
     }
 
     fn inliers(a: &OrbFeatures, b: &OrbFeatures) -> Result<usize, String> {
@@ -3797,5 +3840,148 @@ mod tests {
             same_scene > different_scene,
             "same scene should outrank different scene: same={same_scene}, different={different_scene}"
         );
+    }
+
+    #[cfg(feature = "opencv-orb")]
+    #[test]
+    fn opencv_orb_fixture_matches_when_configured() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            #[serde(default)]
+            source_folder: Option<String>,
+            #[serde(default)]
+            images: Vec<FixtureImage>,
+            #[serde(default)]
+            orb_pairs: Vec<FixtureOrbPair>,
+        }
+
+        #[derive(Deserialize)]
+        struct FixtureImage {
+            path: String,
+        }
+
+        #[derive(Deserialize)]
+        struct FixtureOrbPair {
+            i: usize,
+            j: usize,
+            #[serde(default)]
+            base_sim: f64,
+            orb_inliers: usize,
+            #[serde(default)]
+            time_hard_split: bool,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum OrbEffect {
+            Strong,
+            Medium,
+            WeakDowngrade,
+            Neutral,
+        }
+
+        fn orb_effect(inliers: usize, base_sim: f64) -> OrbEffect {
+            if inliers >= 80 {
+                OrbEffect::Strong
+            } else if inliers >= 30 {
+                OrbEffect::Medium
+            } else if inliers < 5 && base_sim > 0.55 {
+                OrbEffect::WeakDowngrade
+            } else {
+                OrbEffect::Neutral
+            }
+        }
+
+        fn resolve_path(
+            workspace: &Path,
+            fixture_dir: &Path,
+            source_folder: Option<&str>,
+            path: &str,
+        ) -> PathBuf {
+            let raw = PathBuf::from(path);
+            if raw.is_absolute() {
+                return raw;
+            }
+            let workspace_path = workspace.join(&raw);
+            if workspace_path.exists() {
+                return workspace_path;
+            }
+            if let Some(source_folder) = source_folder {
+                let source = PathBuf::from(source_folder);
+                let source = if source.is_absolute() {
+                    source
+                } else {
+                    workspace.join(source)
+                };
+                let source_path = source.join(&raw);
+                if source_path.exists() {
+                    return source_path;
+                }
+            }
+            fixture_dir.join(raw)
+        }
+
+        let Ok(fixture_path) = std::env::var("PIANKE_FAST_ORB_FIXTURE") else {
+            return;
+        };
+        let fixture_path = PathBuf::from(fixture_path);
+        if !fixture_path.exists() {
+            return;
+        }
+        let text = fs::read_to_string(&fixture_path).expect("read fast ORB fixture");
+        let fixture: Fixture = serde_json::from_str(&text).expect("parse fast ORB fixture");
+        if fixture.images.is_empty() || fixture.orb_pairs.is_empty() {
+            return;
+        }
+
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let fixture_dir = fixture_path.parent().unwrap_or(Path::new("."));
+        let records = fixture
+            .images
+            .iter()
+            .map(|image| InfoRecord {
+                info: FastImageInfo {
+                    path: resolve_path(
+                        &workspace,
+                        fixture_dir,
+                        fixture.source_folder.as_deref(),
+                        &image.path,
+                    )
+                    .to_string_lossy()
+                    .to_string(),
+                    ..FastImageInfo::default()
+                },
+                companions: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let actual = compute_orb_inliers_for_records(&records);
+        let mut checked = 0usize;
+        for pair in fixture.orb_pairs {
+            if pair.time_hard_split {
+                continue;
+            }
+            let key = (pair.i.min(pair.j), pair.i.max(pair.j));
+            let actual_inliers = *actual.get(&key).unwrap_or(&0);
+            let expected_effect = orb_effect(pair.orb_inliers, pair.base_sim);
+            let actual_effect = orb_effect(actual_inliers, pair.base_sim);
+            assert_eq!(
+                actual_effect, expected_effect,
+                "ORB behavior bucket mismatch for pair {:?}: actual={} ({:?}), expected={} ({:?}), base_sim={}",
+                key, actual_inliers, actual_effect, pair.orb_inliers, expected_effect, pair.base_sim
+            );
+            let tolerance = 8usize.max(((pair.orb_inliers as f64) * 0.2).ceil() as usize);
+            let delta = actual_inliers.abs_diff(pair.orb_inliers);
+            assert!(
+                delta <= tolerance,
+                "ORB inliers mismatch for pair {:?}: actual={}, expected={}, tolerance={}",
+                key,
+                actual_inliers,
+                pair.orb_inliers,
+                tolerance
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "fast ORB fixture had no comparable pairs");
     }
 }

@@ -584,7 +584,7 @@ struct PillowCoeffs {
     ksize: usize,
 }
 
-fn pillow_lanczos_resize_rgb(src: &RgbImage, dst_w: u32, dst_h: u32) -> RgbImage {
+pub(crate) fn pillow_lanczos_resize_rgb(src: &RgbImage, dst_w: u32, dst_h: u32) -> RgbImage {
     let (src_w, src_h) = src.dimensions();
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return RgbImage::new(dst_w, dst_h);
