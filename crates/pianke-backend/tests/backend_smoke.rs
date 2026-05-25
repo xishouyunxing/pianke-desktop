@@ -451,7 +451,10 @@ fn llm_test_accepts_all_supported_protocols_with_mock_provider() {
             .expect("llm test response")
             .json()
             .expect("llm test json");
-        assert_eq!(resp["ok"], true, "protocol {protocol} should pass mock test");
+        assert_eq!(
+            resp["ok"], true,
+            "protocol {protocol} should pass mock test"
+        );
         assert_eq!(resp["protocol"], protocol);
     }
 }

@@ -1678,8 +1678,7 @@ fn compute_orb_inliers_for_records(records: &[InfoRecord]) -> HashMap<(usize, us
         keypoints: Vec<Point2f>,
     }
 
-    fn features(path: &str) -> Result<Option<OrbFeatures>, String> {
-        let img = image::open(path).map_err(|e| format!("load ORB image failed: {e}"))?;
+    fn features_from_image(img: &DynamicImage) -> Result<Option<OrbFeatures>, String> {
         let gray = img.to_luma8();
         let (w, h) = gray.dimensions();
         if w < 32 || h < 32 {
@@ -1736,6 +1735,11 @@ fn compute_orb_inliers_for_records(records: &[InfoRecord]) -> HashMap<(usize, us
             descriptors,
             keypoints: points,
         }))
+    }
+
+    fn features(path: &str) -> Result<Option<OrbFeatures>, String> {
+        let img = image::open(path).map_err(|e| format!("load ORB image failed: {e}"))?;
+        features_from_image(&img)
     }
 
     fn inliers(a: &OrbFeatures, b: &OrbFeatures) -> Result<usize, String> {
@@ -3726,5 +3730,73 @@ mod tests {
         a.face_embeddings.clear();
         b.face_embeddings.clear();
         assert!(expert_pair_similarity(&a, &b) > 0.5);
+    }
+
+    #[cfg(feature = "opencv-orb")]
+    #[test]
+    fn opencv_orb_inliers_detect_repeated_scene_geometry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a_path = dir.path().join("scene_a.png");
+        let b_path = dir.path().join("scene_b.png");
+        let c_path = dir.path().join("scene_c.png");
+
+        let mut a = image::RgbImage::from_pixel(420, 320, image::Rgb([8, 8, 8]));
+        for i in 0..24u32 {
+            let x = 20 + (i * 37) % 340;
+            let y = 24 + (i * 53) % 250;
+            for yy in y..(y + 14).min(320) {
+                for xx in x..(x + 22).min(420) {
+                    a.put_pixel(
+                        xx,
+                        yy,
+                        image::Rgb([(40 + i * 7) as u8, (190 - i * 3) as u8, (80 + i * 5) as u8]),
+                    );
+                }
+            }
+        }
+        let mut b = image::RgbImage::from_pixel(420, 320, image::Rgb([8, 8, 8]));
+        for y in 0..300u32 {
+            for x in 0..395u32 {
+                let px = *a.get_pixel(x, y);
+                b.put_pixel(x + 18, y + 11, px);
+            }
+        }
+        let mut c = image::RgbImage::from_pixel(420, 320, image::Rgb([18, 18, 18]));
+        for i in 0..18u32 {
+            let cx = 30 + (i * 71) % 350;
+            let cy = 28 + (i * 41) % 250;
+            for yy in cy..(cy + 28).min(320) {
+                for xx in cx..(cx + 7).min(420) {
+                    c.put_pixel(xx, yy, image::Rgb([220, (20 + i * 11) as u8, 40]));
+                }
+            }
+        }
+
+        a.save(&a_path).expect("save a");
+        b.save(&b_path).expect("save b");
+        c.save(&c_path).expect("save c");
+
+        let records = [&a_path, &b_path, &c_path]
+            .into_iter()
+            .map(|path| InfoRecord {
+                info: FastImageInfo {
+                    path: path.to_string_lossy().to_string(),
+                    ..FastImageInfo::default()
+                },
+                companions: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let inliers = compute_orb_inliers_for_records(&records);
+        let same_scene = *inliers.get(&(0, 1)).unwrap_or(&0);
+        let different_scene = *inliers.get(&(0, 2)).unwrap_or(&0);
+
+        assert!(
+            same_scene >= 8,
+            "translated same-scene pair should have ORB inliers, got {same_scene}"
+        );
+        assert!(
+            same_scene > different_scene,
+            "same scene should outrank different scene: same={same_scene}, different={different_scene}"
+        );
     }
 }

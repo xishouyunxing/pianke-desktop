@@ -11,11 +11,15 @@ It is intentionally small and deterministic so Rust can compare ONNX output cosi
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PIL import Image
+from insightface.utils import face_align
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -89,6 +93,35 @@ def jsonable(value):
     return value
 
 
+def image_checksum(arr) -> str:
+    return hashlib.sha256(np.asarray(arr).tobytes()).hexdigest()
+
+
+def face_debug_records(pil_img: Image.Image, faces: list[dict], max_dim: int = 1024) -> dict:
+    img = pil_img.convert("RGB")
+    w, h = img.size
+    scale = 1.0
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    arr_bgr = np.array(img)[:, :, ::-1]
+    return {
+        "pre_scale": round(float(scale), 10),
+        "pre_size": [int(img.size[0]), int(img.size[1])],
+        "det_size": [640, 640],
+        "source_rgb_sha256": image_checksum(np.array(img)),
+        "source_bgr_sha256": image_checksum(arr_bgr),
+        "faces": [
+            {
+                "pre_bbox": None if face.get("bbox") is None else [round(float(v) * scale, 6) for v in face["bbox"]],
+                "pre_kps": None if face.get("kps") is None else [[round(float(x) * scale, 6), round(float(y) * scale, 6)] for x, y in face["kps"].tolist()],
+                "arcface_crop_sha256": None if face.get("kps") is None else image_checksum(face_align.norm_crop(arr_bgr, landmark=face["kps"] * scale, image_size=112)),
+            }
+            for face in faces
+        ],
+    }
+
+
 def build_group_fixture(records: list[dict]) -> dict:
     infos = []
     for idx, item in enumerate(records):
@@ -119,6 +152,7 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--faces", action="store_true", help="also export InsightFace bbox/landmark/embedding data")
+    parser.add_argument("--faces-debug", action="store_true", help="also export InsightFace pre-resize and ArcFace crop debug data")
     parser.add_argument("--quality", action="store_true", help="also export Python MUSIQ / CLIP-IQA+ scores and quality flags")
     parser.add_argument("--strength", choices=["standard", "advanced", "aggressive"], default="standard")
     parser.add_argument("--path-root", type=Path, default=ROOT, help="root used to store image paths relatively")
@@ -144,6 +178,8 @@ def main() -> None:
                 face_signals = quality._face_signals_from_data(faces, rgb)
                 item["face_count"] = len(faces)
                 item["face_signals"] = jsonable(face_signals)
+                if args.faces_debug:
+                    item["faces_debug"] = face_debug_records(rgb, faces)
                 item["faces"] = [
                     {
                         "bbox": [round(float(v), 4) for v in face["bbox"]],
