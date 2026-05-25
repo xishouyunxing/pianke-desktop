@@ -97,6 +97,31 @@ def image_checksum(arr) -> str:
     return hashlib.sha256(np.asarray(arr).tobytes()).hexdigest()
 
 
+def _rounded_points(points, scale: float, digits: int = 6) -> list[list[float]]:
+    return [[round(float(x) * scale, digits), round(float(y) * scale, digits)] for x, y in points.tolist()]
+
+
+def arcface_debug_terms(arr_bgr: np.ndarray, pre_kps: list[list[float]]) -> dict:
+    src = np.asarray(pre_kps, dtype=np.float32)
+    dst = face_align.arcface_dst.astype(np.float32)
+    src_mean = src.mean(axis=0)
+    dst_mean = dst.mean(axis=0)
+    src_demean = src - src_mean
+    dst_demean = dst - dst_mean
+    covariance = dst_demean.T @ src_demean / src.shape[0]
+    variance = src_demean.var(axis=0).sum()
+    matrix = face_align.estimate_norm(src, 112)
+    crop = face_align.norm_crop(arr_bgr, landmark=src, image_size=112)
+    return {
+        "src_mean": [round(float(v), 10) for v in src_mean.tolist()],
+        "dst_mean": [round(float(v), 10) for v in dst_mean.tolist()],
+        "covariance": [[round(float(v), 10) for v in row] for row in covariance.tolist()],
+        "src_variance": round(float(variance), 10),
+        "matrix": [[round(float(v), 10) for v in row] for row in matrix.tolist()],
+        "arcface_crop_sha256": image_checksum(crop),
+    }
+
+
 def face_debug_records(pil_img: Image.Image, faces: list[dict], max_dim: int = 1024) -> dict:
     img = pil_img.convert("RGB")
     w, h = img.size
@@ -105,20 +130,32 @@ def face_debug_records(pil_img: Image.Image, faces: list[dict], max_dim: int = 1
         scale = max_dim / max(w, h)
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     arr_bgr = np.array(img)[:, :, ::-1]
+
+    def _debug_face(face: dict) -> dict:
+        pre_bbox = None
+        if face.get("bbox") is not None:
+            pre_bbox = [round(float(v) * scale, 6) for v in face["bbox"]]
+        pre_kps = None
+        crop_hash = None
+        arcface_debug = None
+        if face.get("kps") is not None:
+            pre_kps = _rounded_points(face["kps"], scale)
+            arcface_debug = arcface_debug_terms(arr_bgr, pre_kps)
+            crop_hash = arcface_debug["arcface_crop_sha256"]
+        return {
+            "pre_bbox": pre_bbox,
+            "pre_kps": pre_kps,
+            "arcface_crop_sha256": crop_hash,
+            "arcface": arcface_debug,
+        }
+
     return {
         "pre_scale": round(float(scale), 10),
         "pre_size": [int(img.size[0]), int(img.size[1])],
         "det_size": [640, 640],
         "source_rgb_sha256": image_checksum(np.array(img)),
         "source_bgr_sha256": image_checksum(arr_bgr),
-        "faces": [
-            {
-                "pre_bbox": None if face.get("bbox") is None else [round(float(v) * scale, 6) for v in face["bbox"]],
-                "pre_kps": None if face.get("kps") is None else [[round(float(x) * scale, 6), round(float(y) * scale, 6)] for x, y in face["kps"].tolist()],
-                "arcface_crop_sha256": None if face.get("kps") is None else image_checksum(face_align.norm_crop(arr_bgr, landmark=face["kps"] * scale, image_size=112)),
-            }
-            for face in faces
-        ],
+        "faces": [_debug_face(face) for face in faces],
     }
 
 

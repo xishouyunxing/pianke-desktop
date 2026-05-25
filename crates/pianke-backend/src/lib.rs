@@ -1473,8 +1473,7 @@ fn apply_face_analysis(
     analysis: &Path,
     record: &mut InfoRecord,
 ) -> Result<(), String> {
-    let img = image::open(analysis).map_err(|e| format!("加载人脸分析图片失败: {e}"))?;
-    let faces = model.extract_faces(&img)?;
+    let (img, faces) = model.extract_path(analysis)?;
     apply_face_infos(record, &img, faces);
     Ok(())
 }
