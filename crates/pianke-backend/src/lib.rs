@@ -1606,13 +1606,13 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     let signals = quality_signals(&img, file_size);
     let quality_result = analyze_from_signals(&signals, FastQualityProfile::from_name(strength));
     let quality = QualityInfo {
-        blur_score: Some(signals.blur_score),
-        brightness_mean: Some(signals.brightness_mean),
-        brightness_std: Some(signals.brightness_std),
-        contrast_score: Some(signals.contrast_score),
-        overexposed_ratio: Some(signals.overexposed_ratio),
-        underexposed_ratio: Some(signals.underexposed_ratio),
-        entropy: Some(signals.entropy),
+        blur_score: Some(round3(signals.blur_score)),
+        brightness_mean: Some(round3(signals.brightness_mean)),
+        brightness_std: Some(round3(signals.brightness_std)),
+        contrast_score: Some(round3(signals.contrast_score)),
+        overexposed_ratio: Some(round5(signals.overexposed_ratio)),
+        underexposed_ratio: Some(round5(signals.underexposed_ratio)),
+        entropy: Some(round5(signals.entropy)),
         width: Some(width),
         height: Some(height),
         file_size: Some(file_size),
@@ -1620,13 +1620,13 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
         flags: quality_result.flags,
         auto_reject: Some(quality_result.auto_reject),
         reject_reason: quality_result.reject_reason,
-        blur_combined: Some(signals.blur_combined),
-        motion_anisotropy: Some(signals.motion_anisotropy),
-        edge_width_pix: signals.edge_width_pix,
-        focus_ratio: signals.focus_ratio,
-        horizon_tilt_deg: signals.horizon_tilt_deg,
-        composition: signals.composition,
-        salient_sharpness: signals.salient_sharpness,
+        blur_combined: Some(round3(signals.blur_combined)),
+        motion_anisotropy: Some(round3(signals.motion_anisotropy)),
+        edge_width_pix: signals.edge_width_pix.map(round2),
+        focus_ratio: signals.focus_ratio.map(round3),
+        horizon_tilt_deg: signals.horizon_tilt_deg.map(round2),
+        composition: signals.composition.map(round3),
+        salient_sharpness: signals.salient_sharpness.map(round3),
         extra: HashMap::new(),
     };
 
@@ -2300,59 +2300,962 @@ fn previous_power_of_two(value: u32) -> u32 {
 }
 
 fn quality_signals(img: &DynamicImage, file_size: u64) -> FastQualitySignals {
-    let gray = img
-        .resize(768, 768, FilterType::Triangle)
-        .to_luma8()
-        .into_raw();
-    let count = gray.len().max(1) as f64;
-    let mean = gray.iter().map(|v| f64::from(*v)).sum::<f64>() / count;
-    let var = gray
-        .iter()
-        .map(|v| (f64::from(*v) - mean).powi(2))
-        .sum::<f64>()
-        / count;
-    let std = var.sqrt();
-    let under = gray.iter().filter(|v| **v <= 8).count() as f64 / count;
-    let over = gray.iter().filter(|v| **v >= 247).count() as f64 / count;
-    let entropy = entropy(&gray);
-    let blur_combined = (std / 64.0).clamp(0.0, 1.0);
-    let (w, h) = img.dimensions();
+    let rgb = img.to_rgb8();
+    let gray = pillow_luma(&rgb);
+    let work = expert_vision::pillow_thumbnail_luma(&gray, 768, 768);
+    let arr = GrayMatrix::from_luma(&work);
+    let (width, height) = img.dimensions();
+
+    let brightness_mean = arr.mean();
+    let brightness_std = arr.std();
+    let contrast_score = brightness_std;
+    let underexposed_ratio = arr.ratio_le(8.0);
+    let overexposed_ratio = arr.ratio_ge(247.0);
+    let entropy = matrix_entropy(&arr);
+    let lap = laplacian_variance(&arr).max(laplacian_variance(&arr.center_crop(0.6)));
+    let tenengrad = tenengrad(&arr);
+    let (high_ratio, motion_anisotropy) = fft_high_freq_ratio(&arr);
+    let edge_width = edge_width_marziliano(&arr);
+
+    let lap_norm = (lap.max(0.0).ln_1p() / 900.0f64.ln_1p()).min(1.0);
+    let tenengrad_norm = (tenengrad.max(0.0).ln_1p() / 2000.0f64.ln_1p()).min(1.0);
+    let high_norm = (high_ratio.max(0.0) / 0.40).min(1.0);
+    let mut parts = vec![lap_norm, tenengrad_norm, high_norm];
+    if let Some(width) = edge_width {
+        parts.push(((10.0 - width) / 7.0).clamp(0.0, 1.0));
+    }
+    let blur_combined = parts.iter().sum::<f64>() / parts.len().max(1) as f64;
+
+    let saliency = saliency_map(&arr);
+    let salient_sharpness = saliency
+        .as_ref()
+        .and_then(|smap| salient_region_sharpness(&arr, smap));
+    let focus_ratio = saliency
+        .as_ref()
+        .and_then(|smap| saliency_focus_consistency(&arr, smap));
+    let composition = saliency.as_ref().map(|smap| composition_score(&arr, smap));
+    let exposure = nine_grid_exposure(&arr);
+    let horizon_tilt_deg = horizon_tilt_degrees(&arr);
+
     FastQualitySignals {
-        width: w,
-        height: h,
+        width,
+        height,
         file_size,
-        blur_score: std * std,
-        brightness_mean: round3(mean),
-        brightness_std: round3(std),
-        contrast_score: round3(std),
-        overexposed_ratio: round5(over),
-        underexposed_ratio: round5(under),
-        entropy: round5(entropy),
-        blur_combined: round3(blur_combined),
-        salient_sharpness: None,
-        motion_anisotropy: 0.0,
-        edge_width_pix: None,
-        focus_ratio: None,
-        horizon_tilt_deg: None,
-        composition: Some(0.5),
-        worst_clip_dark: under,
-        worst_clip_bright: over,
+        blur_score: lap,
+        brightness_mean,
+        brightness_std,
+        contrast_score,
+        overexposed_ratio,
+        underexposed_ratio,
+        entropy,
+        blur_combined,
+        salient_sharpness,
+        motion_anisotropy,
+        edge_width_pix: edge_width,
+        focus_ratio,
+        horizon_tilt_deg,
+        composition,
+        worst_clip_dark: exposure.worst_clip_dark,
+        worst_clip_bright: exposure.worst_clip_bright,
     }
 }
 
-fn entropy(bytes: &[u8]) -> f64 {
-    let mut hist = [0usize; 256];
-    for b in bytes {
-        hist[*b as usize] += 1;
+#[derive(Clone)]
+struct GrayMatrix {
+    width: usize,
+    height: usize,
+    data: Vec<f64>,
+}
+
+impl GrayMatrix {
+    fn new(width: usize, height: usize, data: Vec<f64>) -> Self {
+        Self {
+            width,
+            height,
+            data,
+        }
     }
-    let total = bytes.len().max(1) as f64;
+
+    fn from_luma(img: &image::GrayImage) -> Self {
+        let (w, h) = img.dimensions();
+        let data = img.as_raw().iter().map(|v| f64::from(*v)).collect();
+        Self::new(w as usize, h as usize, data)
+    }
+
+    fn zeros(width: usize, height: usize) -> Self {
+        Self::new(width, height, vec![0.0; width.saturating_mul(height)])
+    }
+
+    fn get(&self, x: usize, y: usize) -> f64 {
+        self.data[y * self.width + x]
+    }
+
+    fn set(&mut self, x: usize, y: usize, value: f64) {
+        self.data[y * self.width + x] = value;
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn mean(&self) -> f64 {
+        self.data.iter().sum::<f64>() / self.len().max(1) as f64
+    }
+
+    fn std(&self) -> f64 {
+        let mean = self.mean();
+        (self.data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / self.len().max(1) as f64)
+            .sqrt()
+    }
+
+    fn ratio_le(&self, threshold: f64) -> f64 {
+        self.data.iter().filter(|v| **v <= threshold).count() as f64 / self.len().max(1) as f64
+    }
+
+    fn ratio_ge(&self, threshold: f64) -> f64 {
+        self.data.iter().filter(|v| **v >= threshold).count() as f64 / self.len().max(1) as f64
+    }
+
+    fn center_crop(&self, ratio: f64) -> Self {
+        let crop_h = ((self.height as f64 * ratio) as usize).max(1);
+        let crop_w = ((self.width as f64 * ratio) as usize).max(1);
+        let y0 = (self.height.saturating_sub(crop_h)) / 2;
+        let x0 = (self.width.saturating_sub(crop_w)) / 2;
+        let mut data = Vec::with_capacity(crop_w * crop_h);
+        for y in y0..(y0 + crop_h).min(self.height) {
+            for x in x0..(x0 + crop_w).min(self.width) {
+                data.push(self.get(x, y));
+            }
+        }
+        Self::new(crop_w, crop_h, data)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NineGridExposure {
+    worst_clip_dark: f64,
+    worst_clip_bright: f64,
+}
+
+fn matrix_entropy(arr: &GrayMatrix) -> f64 {
+    let mut hist = [0usize; 256];
+    for value in &arr.data {
+        let idx = value.round().clamp(0.0, 255.0) as usize;
+        hist[idx] += 1;
+    }
+    let total = hist.iter().sum::<usize>();
+    if total == 0 {
+        return 0.0;
+    }
     hist.iter()
-        .filter(|v| **v > 0)
-        .map(|v| {
-            let p = *v as f64 / total;
+        .filter(|count| **count > 0)
+        .map(|count| {
+            let p = *count as f64 / total as f64;
             -p * p.log2()
         })
         .sum()
+}
+
+fn laplacian_variance(arr: &GrayMatrix) -> f64 {
+    if arr.height < 3 || arr.width < 3 {
+        return 0.0;
+    }
+    let mut values = Vec::with_capacity((arr.width - 2) * (arr.height - 2));
+    for y in 1..arr.height - 1 {
+        for x in 1..arr.width - 1 {
+            let lap = arr.get(x, y) * 4.0
+                - arr.get(x, y - 1)
+                - arr.get(x, y + 1)
+                - arr.get(x - 1, y)
+                - arr.get(x + 1, y);
+            values.push(lap);
+        }
+    }
+    variance(&values)
+}
+
+fn tenengrad(arr: &GrayMatrix) -> f64 {
+    if arr.height < 3 || arr.width < 3 {
+        return 0.0;
+    }
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for y in 1..arr.height - 1 {
+        for x in 1..arr.width - 1 {
+            let gx = arr.get(x + 1, y) - arr.get(x - 1, y);
+            let gy = arr.get(x, y + 1) - arr.get(x, y - 1);
+            total += gx * gx + gy * gy;
+            count += 1;
+        }
+    }
+    total / count.max(1) as f64
+}
+
+fn fft_high_freq_ratio(arr: &GrayMatrix) -> (f64, f64) {
+    use rustfft::{num_complex::Complex, FftPlanner};
+
+    if arr.height < 16 || arr.width < 16 {
+        return (0.0, 0.0);
+    }
+    let side = arr.height.min(arr.width);
+    let y0 = (arr.height - side) / 2;
+    let x0 = (arr.width - side) / 2;
+    let mut crop = GrayMatrix::zeros(side, side);
+    for y in 0..side {
+        for x in 0..side {
+            crop.set(x, y, arr.get(x0 + x, y0 + y));
+        }
+    }
+    if side > 256 {
+        crop = resize_area_matrix(&crop, 256, 256);
+    }
+    let side = crop.width;
+    let mean = crop.mean();
+    let hann = hann_window(side);
+    let mut spec = vec![Complex::new(0.0, 0.0); side * side];
+    for y in 0..side {
+        for x in 0..side {
+            spec[y * side + x] = Complex::new((crop.get(x, y) - mean) * hann[y] * hann[x], 0.0);
+        }
+    }
+    fft2_in_place(&mut spec, side, side, false, &mut FftPlanner::new());
+
+    let mut mag = vec![0.0; side * side];
+    for y in 0..side {
+        for x in 0..side {
+            let src_y = (y + side / 2) % side;
+            let src_x = (x + side / 2) % side;
+            mag[y * side + x] = spec[src_y * side + src_x].norm();
+        }
+    }
+    mag[(side / 2) * side + side / 2] = 0.0;
+
+    let center = side as f64 / 2.0;
+    let r_max = side as f64 / 2.0;
+    let mut total = 1e-8;
+    let mut high = 0.0;
+    let mut sums = [0.0f64; 12];
+    let mut counts = [1e-6f64; 12];
+    let mut band_count = 0usize;
+    for y in 0..side {
+        for x in 0..side {
+            let dy = y as f64 - center;
+            let dx = x as f64 - center;
+            let r = (dy * dy + dx * dx).sqrt();
+            let value = mag[y * side + x];
+            total += value;
+            if r > 0.30 * r_max {
+                high += value;
+            }
+            if r > 0.10 * r_max && r < 0.50 * r_max {
+                let mut theta = dy.atan2(dx);
+                if theta < 0.0 {
+                    theta += std::f64::consts::PI;
+                }
+                let bin = ((theta / std::f64::consts::PI * 12.0) as usize).min(11);
+                sums[bin] += value;
+                counts[bin] += 1.0;
+                band_count += 1;
+            }
+        }
+    }
+    let high_ratio = high / total;
+    if band_count < 50 {
+        return (high_ratio, 0.0);
+    }
+    let avgs = sums
+        .iter()
+        .zip(counts.iter())
+        .map(|(sum, count)| sum / count)
+        .collect::<Vec<_>>();
+    let max_avg = avgs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min_avg = avgs.iter().copied().fold(f64::INFINITY, f64::min);
+    let aniso = (max_avg - min_avg) / (max_avg + 1e-8);
+    (high_ratio, aniso)
+}
+
+fn nine_grid_exposure(arr: &GrayMatrix) -> NineGridExposure {
+    if arr.height < 9 || arr.width < 9 {
+        return NineGridExposure {
+            worst_clip_dark: 0.0,
+            worst_clip_bright: 0.0,
+        };
+    }
+    let ys = [0, arr.height / 3, 2 * arr.height / 3, arr.height];
+    let xs = [0, arr.width / 3, 2 * arr.width / 3, arr.width];
+    let mut worst_clip_dark = 0.0f64;
+    let mut worst_clip_bright = 0.0f64;
+    for gy in 0..3 {
+        for gx in 0..3 {
+            let mut dark = 0usize;
+            let mut bright = 0usize;
+            let mut count = 0usize;
+            for y in ys[gy]..ys[gy + 1] {
+                for x in xs[gx]..xs[gx + 1] {
+                    let value = arr.get(x, y);
+                    if value <= 8.0 {
+                        dark += 1;
+                    }
+                    if value >= 247.0 {
+                        bright += 1;
+                    }
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                worst_clip_dark = worst_clip_dark.max(dark as f64 / count as f64);
+                worst_clip_bright = worst_clip_bright.max(bright as f64 / count as f64);
+            }
+        }
+    }
+    NineGridExposure {
+        worst_clip_dark,
+        worst_clip_bright,
+    }
+}
+
+#[cfg(feature = "opencv-orb")]
+fn edge_width_marziliano(arr: &GrayMatrix) -> Option<f64> {
+    use opencv::{core, imgproc, prelude::*};
+
+    if arr.height < 16 || arr.width < 16 {
+        return None;
+    }
+    let bytes = arr
+        .data
+        .iter()
+        .map(|v| v.round().clamp(0.0, 255.0) as u8)
+        .collect::<Vec<_>>();
+    let src = core::Mat::from_slice(&bytes)
+        .ok()?
+        .reshape(1, arr.height as i32)
+        .ok()?
+        .try_clone()
+        .ok()?;
+    let mut edges = core::Mat::default();
+    imgproc::canny(&src, &mut edges, 50.0, 150.0, 3, false).ok()?;
+    let edge_bytes = edges.data_typed::<u8>().ok()?;
+    let points = edge_bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, value)| {
+            if *value > 0 {
+                Some((idx / arr.width, idx % arr.width))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if points.len() < 50 {
+        return None;
+    }
+    let mut widths = Vec::new();
+    for (y, x) in points {
+        if x < 3 || x > arr.width.saturating_sub(4) {
+            continue;
+        }
+        let mut left = x;
+        for k in 1..12 {
+            if x < k + 1 {
+                break;
+            }
+            if arr.get(x - k, y) >= arr.get(x - k + 1, y) {
+                left = x - k;
+            } else {
+                break;
+            }
+        }
+        let mut right = x;
+        for k in 1..12 {
+            if x + k > arr.width.saturating_sub(2) {
+                break;
+            }
+            if arr.get(x + k, y) <= arr.get(x + k - 1, y) {
+                right = x + k;
+            } else {
+                break;
+            }
+        }
+        let width = right.saturating_sub(left);
+        if (1..=25).contains(&width) {
+            widths.push(width as f64);
+        }
+    }
+    if widths.len() < 30 {
+        None
+    } else {
+        Some(widths.iter().sum::<f64>() / widths.len() as f64)
+    }
+}
+
+#[cfg(not(feature = "opencv-orb"))]
+fn edge_width_marziliano(_arr: &GrayMatrix) -> Option<f64> {
+    None
+}
+
+#[cfg(feature = "opencv-orb")]
+fn horizon_tilt_degrees(arr: &GrayMatrix) -> Option<f64> {
+    use opencv::{core, imgproc, prelude::*};
+
+    if arr.height < 64 || arr.width < 64 {
+        return None;
+    }
+    let bytes = arr
+        .data
+        .iter()
+        .map(|v| v.round().clamp(0.0, 255.0) as u8)
+        .collect::<Vec<_>>();
+    let src = core::Mat::from_slice(&bytes)
+        .ok()?
+        .reshape(1, arr.height as i32)
+        .ok()?
+        .try_clone()
+        .ok()?;
+    let mut edges = core::Mat::default();
+    imgproc::canny(&src, &mut edges, 50.0, 150.0, 3, false).ok()?;
+    let min_len = 40.max((arr.height.min(arr.width) as f64 * 0.35) as i32);
+    let mut lines = core::Vector::<core::Vec4i>::new();
+    imgproc::hough_lines_p(
+        &edges,
+        &mut lines,
+        1.0,
+        std::f64::consts::PI / 180.0,
+        80,
+        min_len as f64,
+        10.0,
+    )
+    .ok()?;
+    if lines.is_empty() {
+        return None;
+    }
+    let mut pairs = Vec::<(f64, f64)>::new();
+    for line in lines.iter().take(200) {
+        let dx = f64::from(line[2] - line[0]);
+        let dy = f64::from(line[3] - line[1]);
+        let length = dx.hypot(dy);
+        if length < f64::from(min_len) {
+            continue;
+        }
+        let mut theta = dy.atan2(dx).to_degrees();
+        if theta > 90.0 {
+            theta -= 180.0;
+        } else if theta < -90.0 {
+            theta += 180.0;
+        }
+        let dev = theta.abs().min((90.0 - theta.abs()).abs());
+        pairs.push((dev, length));
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let n_take = (pairs.len() / 3).max(1);
+    let (weighted, total) = pairs
+        .iter()
+        .take(n_take)
+        .fold((0.0, 0.0), |(s, w), (angle, weight)| {
+            (s + angle * weight, w + weight)
+        });
+    Some(weighted / total.max(1e-8))
+}
+
+#[cfg(not(feature = "opencv-orb"))]
+fn horizon_tilt_degrees(_arr: &GrayMatrix) -> Option<f64> {
+    None
+}
+
+fn saliency_map(arr: &GrayMatrix) -> Option<GrayMatrix> {
+    use rustfft::{num_complex::Complex, FftPlanner};
+
+    if arr.height < 8 || arr.width < 8 {
+        return None;
+    }
+    let small = resize_area_matrix(arr, 64, 64);
+    let mut spectrum = small
+        .data
+        .iter()
+        .map(|v| Complex::new(*v, 0.0))
+        .collect::<Vec<_>>();
+    fft2_in_place(&mut spectrum, 64, 64, false, &mut FftPlanner::new());
+    let log_amp = GrayMatrix::new(
+        64,
+        64,
+        spectrum
+            .iter()
+            .map(|value| (value.norm() + 1e-8).ln())
+            .collect(),
+    );
+    let smooth =
+        opencv_box_filter_3x3(&log_amp).unwrap_or_else(|| box_filter_3x3_reflect101(&log_amp));
+    let mut recon = Vec::with_capacity(spectrum.len());
+    for (idx, value) in spectrum.iter().enumerate() {
+        let residual = log_amp.data[idx] - smooth.data[idx];
+        recon.push(Complex::from_polar(residual.exp(), value.arg()));
+    }
+    fft2_in_place(&mut recon, 64, 64, true, &mut FftPlanner::new());
+    let norm = (64 * 64) as f64;
+    let squared = GrayMatrix::new(
+        64,
+        64,
+        recon
+            .iter()
+            .map(|value| (value / norm).norm_sqr())
+            .collect(),
+    );
+    let blurred =
+        opencv_gaussian_blur(&squared, 9, 2.5).unwrap_or_else(|| gaussian_blur(&squared, 9, 2.5));
+    let mut out = opencv_resize_linear_matrix(&blurred, arr.width, arr.height)
+        .unwrap_or_else(|| resize_bilinear_matrix(&blurred, arr.width, arr.height));
+    let min_v = out.data.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_v = out.data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if max_v - min_v < 1e-8 {
+        return None;
+    }
+    for value in &mut out.data {
+        *value = (*value - min_v) / (max_v - min_v);
+    }
+    if out.std() < 0.01 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn salient_region_sharpness(arr: &GrayMatrix, smap: &GrayMatrix) -> Option<f64> {
+    if arr.height < 16 || arr.width < 16 {
+        return None;
+    }
+    if smap.std() < 0.01 {
+        return None;
+    }
+    let smap = if smap.width == arr.width && smap.height == arr.height {
+        smap.clone()
+    } else {
+        resize_bilinear_matrix(smap, arr.width, arr.height)
+    };
+    let threshold = quantile(&smap.data, 0.80)?;
+    let mut selected = Vec::new();
+    for y in 1..arr.height - 1 {
+        for x in 1..arr.width - 1 {
+            if smap.get(x, y) >= threshold {
+                let lap = arr.get(x, y) * 4.0
+                    - arr.get(x, y - 1)
+                    - arr.get(x, y + 1)
+                    - arr.get(x - 1, y)
+                    - arr.get(x + 1, y);
+                selected.push(lap);
+            }
+        }
+    }
+    if selected.len() < 100 {
+        None
+    } else {
+        Some(variance(&selected))
+    }
+}
+
+fn saliency_focus_consistency(arr: &GrayMatrix, smap: &GrayMatrix) -> Option<f64> {
+    if arr.height < 32 || arr.width < 32 {
+        return None;
+    }
+    let sub_thr = quantile(&smap.data, 0.80)?;
+    let bg_thr = quantile(&smap.data, 0.30)?;
+    let mut sub_lap = Vec::new();
+    let mut bg_lap = Vec::new();
+    for y in 1..arr.height - 1 {
+        for x in 1..arr.width - 1 {
+            let sal = smap.get(x, y);
+            let lap = arr.get(x, y) * 4.0
+                - arr.get(x, y - 1)
+                - arr.get(x, y + 1)
+                - arr.get(x - 1, y)
+                - arr.get(x + 1, y);
+            if sal >= sub_thr {
+                sub_lap.push(lap);
+            }
+            if sal <= bg_thr {
+                bg_lap.push(lap);
+            }
+        }
+    }
+    if sub_lap.len() < 100 || bg_lap.len() < 100 {
+        None
+    } else {
+        Some(variance(&sub_lap) / (variance(&bg_lap) + 1e-6))
+    }
+}
+
+fn composition_score(arr: &GrayMatrix, smap: &GrayMatrix) -> f64 {
+    let total = smap.data.iter().sum::<f64>() + 1e-8;
+    if total < 1e-3 {
+        return 0.4;
+    }
+    let mut cx_sum = 0.0;
+    let mut cy_sum = 0.0;
+    for y in 0..smap.height {
+        for x in 0..smap.width {
+            let value = smap.get(x, y);
+            cx_sum += x as f64 * value;
+            cy_sum += y as f64 * value;
+        }
+    }
+    let cy = cy_sum / total / (arr.height.saturating_sub(1).max(1) as f64);
+    let cx = cx_sum / total / (arr.width.saturating_sub(1).max(1) as f64);
+    let grid_pts = [
+        (1.0 / 3.0, 1.0 / 3.0),
+        (1.0 / 3.0, 2.0 / 3.0),
+        (2.0 / 3.0, 1.0 / 3.0),
+        (2.0 / 3.0, 2.0 / 3.0),
+    ];
+    let d_grid = grid_pts
+        .iter()
+        .map(|(py, px)| (cy - py).hypot(cx - px))
+        .fold(f64::INFINITY, f64::min);
+    let d_center = (cy - 0.5).hypot(cx - 0.5);
+    let pos_score = (1.0 - d_grid.min(d_center) / 0.35).max(0.0);
+
+    let threshold = quantile(&smap.data, 0.80).unwrap_or(0.0);
+    let mut subject = 0usize;
+    let mut edge_subject = 0usize;
+    let edge_h = (arr.height as f64 * 0.05) as usize;
+    let edge_w = (arr.width as f64 * 0.05) as usize;
+    let edge_h = edge_h.max(2);
+    let edge_w = edge_w.max(2);
+    for y in 0..smap.height {
+        for x in 0..smap.width {
+            if smap.get(x, y) >= threshold {
+                subject += 1;
+                if y < edge_h
+                    || y >= smap.height.saturating_sub(edge_h)
+                    || x < edge_w
+                    || x >= smap.width.saturating_sub(edge_w)
+                {
+                    edge_subject += 1;
+                }
+            }
+        }
+    }
+    let frac = subject as f64 / smap.len().max(1) as f64;
+    let size_score = if frac < 0.04 {
+        frac / 0.04
+    } else if frac > 0.55 {
+        (1.0 - (frac - 0.55) / 0.45).max(0.0)
+    } else {
+        1.0
+    };
+    let edge_frac = edge_subject as f64 / (subject as f64 + 1e-6);
+    let edge_score = if edge_frac < 0.25 {
+        1.0
+    } else {
+        (1.0 - (edge_frac - 0.25) / 0.5).max(0.0)
+    };
+    0.5 * pos_score + 0.3 * size_score + 0.2 * edge_score
+}
+
+fn variance(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
+}
+
+fn quantile(values: &[f64], q: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pos = (sorted.len() - 1) as f64 * q;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        Some(sorted[lo])
+    } else {
+        let weight = pos - lo as f64;
+        Some(sorted[lo] * (1.0 - weight) + sorted[hi] * weight)
+    }
+}
+
+fn hann_window(size: usize) -> Vec<f64> {
+    if size <= 1 {
+        return vec![1.0; size];
+    }
+    (0..size)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (size - 1) as f64).cos())
+        .collect()
+}
+
+fn fft2_in_place(
+    data: &mut [rustfft::num_complex::Complex<f64>],
+    width: usize,
+    height: usize,
+    inverse: bool,
+    planner: &mut rustfft::FftPlanner<f64>,
+) {
+    let row_fft = if inverse {
+        planner.plan_fft_inverse(width)
+    } else {
+        planner.plan_fft_forward(width)
+    };
+    for y in 0..height {
+        row_fft.process(&mut data[y * width..(y + 1) * width]);
+    }
+    let col_fft = if inverse {
+        planner.plan_fft_inverse(height)
+    } else {
+        planner.plan_fft_forward(height)
+    };
+    let mut column = vec![rustfft::num_complex::Complex::new(0.0, 0.0); height];
+    for x in 0..width {
+        for y in 0..height {
+            column[y] = data[y * width + x];
+        }
+        col_fft.process(&mut column);
+        for y in 0..height {
+            data[y * width + x] = column[y];
+        }
+    }
+}
+
+fn box_filter_3x3_reflect101(src: &GrayMatrix) -> GrayMatrix {
+    let mut out = GrayMatrix::zeros(src.width, src.height);
+    for y in 0..src.height {
+        for x in 0..src.width {
+            let mut sum = 0.0;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let sx = reflect101(x as isize + dx, src.width);
+                    let sy = reflect101(y as isize + dy, src.height);
+                    sum += src.get(sx, sy);
+                }
+            }
+            out.set(x, y, sum / 9.0);
+        }
+    }
+    out
+}
+
+#[cfg(feature = "opencv-orb")]
+fn opencv_box_filter_3x3(src: &GrayMatrix) -> Option<GrayMatrix> {
+    use opencv::{core, imgproc, prelude::*};
+
+    let input = src.data.iter().map(|v| *v as f32).collect::<Vec<_>>();
+    let mat = core::Mat::from_slice(&input)
+        .ok()?
+        .reshape(1, src.height as i32)
+        .ok()?
+        .try_clone()
+        .ok()?;
+    let kernel_data = vec![1.0f32 / 9.0; 9];
+    let kernel = core::Mat::from_slice(&kernel_data)
+        .ok()?
+        .reshape(1, 3)
+        .ok()?
+        .try_clone()
+        .ok()?;
+    let mut dst = core::Mat::default();
+    imgproc::filter_2d(
+        &mat,
+        &mut dst,
+        -1,
+        &kernel,
+        core::Point::new(-1, -1),
+        0.0,
+        core::BORDER_DEFAULT,
+    )
+    .ok()?;
+    let data = dst.data_typed::<f32>().ok()?;
+    Some(GrayMatrix::new(
+        src.width,
+        src.height,
+        data.iter().map(|v| f64::from(*v)).collect(),
+    ))
+}
+
+#[cfg(not(feature = "opencv-orb"))]
+fn opencv_box_filter_3x3(_src: &GrayMatrix) -> Option<GrayMatrix> {
+    None
+}
+
+fn gaussian_blur(src: &GrayMatrix, kernel_size: usize, sigma: f64) -> GrayMatrix {
+    let radius = kernel_size / 2;
+    let mut kernel = Vec::with_capacity(kernel_size);
+    let mut sum = 0.0;
+    for i in 0..kernel_size {
+        let x = i as isize - radius as isize;
+        let value = (-(x * x) as f64 / (2.0 * sigma * sigma)).exp();
+        kernel.push(value);
+        sum += value;
+    }
+    for value in &mut kernel {
+        *value /= sum;
+    }
+    let mut tmp = GrayMatrix::zeros(src.width, src.height);
+    for y in 0..src.height {
+        for x in 0..src.width {
+            let mut value = 0.0;
+            for (k, weight) in kernel.iter().enumerate() {
+                let sx = reflect101(x as isize + k as isize - radius as isize, src.width);
+                value += src.get(sx, y) * weight;
+            }
+            tmp.set(x, y, value);
+        }
+    }
+    let mut out = GrayMatrix::zeros(src.width, src.height);
+    for y in 0..src.height {
+        for x in 0..src.width {
+            let mut value = 0.0;
+            for (k, weight) in kernel.iter().enumerate() {
+                let sy = reflect101(y as isize + k as isize - radius as isize, src.height);
+                value += tmp.get(x, sy) * weight;
+            }
+            out.set(x, y, value);
+        }
+    }
+    out
+}
+
+#[cfg(feature = "opencv-orb")]
+fn opencv_gaussian_blur(src: &GrayMatrix, kernel_size: usize, sigma: f64) -> Option<GrayMatrix> {
+    use opencv::{core, imgproc, prelude::*};
+
+    let input = src.data.iter().map(|v| *v as f32).collect::<Vec<_>>();
+    let mat = core::Mat::from_slice(&input)
+        .ok()?
+        .reshape(1, src.height as i32)
+        .ok()?
+        .try_clone()
+        .ok()?;
+    let mut dst = core::Mat::default();
+    imgproc::gaussian_blur(
+        &mat,
+        &mut dst,
+        core::Size::new(kernel_size as i32, kernel_size as i32),
+        sigma,
+        sigma,
+        core::BORDER_DEFAULT,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )
+    .ok()?;
+    let data = dst.data_typed::<f32>().ok()?;
+    Some(GrayMatrix::new(
+        src.width,
+        src.height,
+        data.iter().map(|v| f64::from(*v)).collect(),
+    ))
+}
+
+#[cfg(not(feature = "opencv-orb"))]
+fn opencv_gaussian_blur(_src: &GrayMatrix, _kernel_size: usize, _sigma: f64) -> Option<GrayMatrix> {
+    None
+}
+
+fn reflect101(idx: isize, len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let mut idx = idx;
+    let len_i = len as isize;
+    while idx < 0 || idx >= len_i {
+        if idx < 0 {
+            idx = -idx;
+        } else {
+            idx = 2 * len_i - idx - 2;
+        }
+    }
+    idx as usize
+}
+
+#[cfg(feature = "opencv-orb")]
+fn resize_area_matrix(src: &GrayMatrix, width: usize, height: usize) -> GrayMatrix {
+    opencv_resize_matrix(src, width, height, opencv::imgproc::INTER_AREA)
+        .unwrap_or_else(|| resize_bilinear_matrix(src, width, height))
+}
+
+#[cfg(not(feature = "opencv-orb"))]
+fn resize_area_matrix(src: &GrayMatrix, width: usize, height: usize) -> GrayMatrix {
+    resize_bilinear_matrix(src, width, height)
+}
+
+#[cfg(feature = "opencv-orb")]
+fn opencv_resize_linear_matrix(
+    src: &GrayMatrix,
+    width: usize,
+    height: usize,
+) -> Option<GrayMatrix> {
+    opencv_resize_matrix(src, width, height, opencv::imgproc::INTER_LINEAR)
+}
+
+#[cfg(not(feature = "opencv-orb"))]
+fn opencv_resize_linear_matrix(
+    _src: &GrayMatrix,
+    _width: usize,
+    _height: usize,
+) -> Option<GrayMatrix> {
+    None
+}
+
+#[cfg(feature = "opencv-orb")]
+fn opencv_resize_matrix(
+    src: &GrayMatrix,
+    width: usize,
+    height: usize,
+    interpolation: i32,
+) -> Option<GrayMatrix> {
+    use opencv::{core, imgproc, prelude::*};
+
+    let input = src.data.iter().map(|v| *v as f32).collect::<Vec<_>>();
+    let mat = core::Mat::from_slice(&input)
+        .ok()?
+        .reshape(1, src.height as i32)
+        .ok()?
+        .try_clone()
+        .ok()?;
+    let mut dst = core::Mat::default();
+    imgproc::resize(
+        &mat,
+        &mut dst,
+        core::Size::new(width as i32, height as i32),
+        0.0,
+        0.0,
+        interpolation,
+    )
+    .ok()?;
+    let data = dst.data_typed::<f32>().ok()?;
+    Some(GrayMatrix::new(
+        width,
+        height,
+        data.iter().map(|v| f64::from(*v)).collect(),
+    ))
+}
+
+fn resize_bilinear_matrix(src: &GrayMatrix, width: usize, height: usize) -> GrayMatrix {
+    if width == 0 || height == 0 || src.width == 0 || src.height == 0 {
+        return GrayMatrix::zeros(width, height);
+    }
+    if src.width == width && src.height == height {
+        return src.clone();
+    }
+    let mut out = GrayMatrix::zeros(width, height);
+    let scale_x = src.width as f64 / width as f64;
+    let scale_y = src.height as f64 / height as f64;
+    for y in 0..height {
+        let fy = (y as f64 + 0.5) * scale_y - 0.5;
+        let y0 = fy.floor().max(0.0) as usize;
+        let y1 = (y0 + 1).min(src.height - 1);
+        let wy = fy - y0 as f64;
+        for x in 0..width {
+            let fx = (x as f64 + 0.5) * scale_x - 0.5;
+            let x0 = fx.floor().max(0.0) as usize;
+            let x1 = (x0 + 1).min(src.width - 1);
+            let wx = fx - x0 as f64;
+            let top = src.get(x0, y0) * (1.0 - wx) + src.get(x1, y0) * wx;
+            let bottom = src.get(x0, y1) * (1.0 - wx) + src.get(x1, y1) * wx;
+            out.set(x, y, top * (1.0 - wy) + bottom * wy);
+        }
+    }
+    out
 }
 
 fn compute_color_hist(img: &DynamicImage) -> Option<Vec<f32>> {
@@ -3783,6 +4686,10 @@ fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
 fn round5(v: f64) -> f64 {
     (v * 100000.0).round() / 100000.0
 }
@@ -4038,6 +4945,240 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "opencv-orb")]
+    #[test]
+    fn fast_quality_fixture_matches_when_configured() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            #[serde(default)]
+            source_folder: Option<String>,
+            #[serde(default)]
+            strength: Option<String>,
+            #[serde(default)]
+            images: Vec<FixtureImage>,
+        }
+
+        #[derive(Deserialize)]
+        struct FixtureImage {
+            path: String,
+            #[serde(default)]
+            companions: Vec<String>,
+            #[serde(default)]
+            quality: Option<Value>,
+            #[serde(default)]
+            quality_signals: Option<Value>,
+        }
+
+        fn resolve_path(
+            workspace: &Path,
+            fixture_dir: &Path,
+            source_folder: Option<&str>,
+            path: &str,
+        ) -> PathBuf {
+            let raw = PathBuf::from(path);
+            if raw.is_absolute() {
+                return raw;
+            }
+            let workspace_path = workspace.join(&raw);
+            if workspace_path.exists() {
+                return workspace_path;
+            }
+            if let Some(source_folder) = source_folder {
+                let source = PathBuf::from(source_folder);
+                let source = if source.is_absolute() {
+                    source
+                } else {
+                    workspace.join(source)
+                };
+                let source_path = source.join(&raw);
+                if source_path.exists() {
+                    return source_path;
+                }
+            }
+            fixture_dir.join(raw)
+        }
+
+        fn value_f64(value: &Value, key: &str) -> Option<f64> {
+            value.get(key).and_then(Value::as_f64)
+        }
+
+        fn assert_close(label: &str, actual: Option<f64>, expected: Option<f64>, tolerance: f64) {
+            match (actual, expected) {
+                (Some(actual), Some(expected)) => assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{label}: actual={actual}, expected={expected}, tolerance={tolerance}"
+                ),
+                (None, None) => {}
+                other => panic!("{label}: optional mismatch {other:?}"),
+            }
+        }
+
+        let Ok(fixture_path) = std::env::var("PIANKE_FAST_QUALITY_FIXTURE") else {
+            return;
+        };
+        let fixture_path = PathBuf::from(fixture_path);
+        if !fixture_path.exists() {
+            return;
+        }
+        let text = fs::read_to_string(&fixture_path).expect("read fast quality fixture");
+        let fixture: Fixture = serde_json::from_str(&text).expect("parse fast quality fixture");
+        if fixture.images.is_empty() {
+            return;
+        }
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let fixture_dir = fixture_path.parent().unwrap_or(Path::new("."));
+        let strength = fixture.strength.as_deref().unwrap_or("standard");
+
+        let mut checked = 0usize;
+        for image in fixture.images {
+            let path = resolve_path(
+                &workspace,
+                fixture_dir,
+                fixture.source_folder.as_deref(),
+                &image.path,
+            );
+            if !path.exists() {
+                continue;
+            }
+            let companions = image
+                .companions
+                .iter()
+                .map(|path| {
+                    resolve_path(
+                        &workspace,
+                        fixture_dir,
+                        fixture.source_folder.as_deref(),
+                        path,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let pair = ScanPair {
+                primary: path.clone(),
+                analysis: Some(path.clone()),
+                companions,
+            };
+            let record = process_one(&pair, strength).expect("process fast quality fixture image");
+            let actual_quality = record.info.quality.expect("quality output");
+            if let Some(expected_quality) = image.quality {
+                assert_eq!(
+                    actual_quality.flags,
+                    expected_quality
+                        .get("flags")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    "flags mismatch for {}",
+                    path.display()
+                );
+                assert_eq!(
+                    actual_quality.auto_reject,
+                    expected_quality.get("auto_reject").and_then(Value::as_bool),
+                    "auto_reject mismatch for {}",
+                    path.display()
+                );
+                assert_eq!(
+                    actual_quality.reject_reason.as_deref(),
+                    expected_quality
+                        .get("reject_reason")
+                        .and_then(Value::as_str),
+                    "reject_reason mismatch for {}",
+                    path.display()
+                );
+                assert_close(
+                    &format!("quality_score {}", path.display()),
+                    actual_quality.quality_score,
+                    value_f64(&expected_quality, "quality_score"),
+                    // Python samples Marziliano edge points with NumPy default_rng(0);
+                    // Rust keeps deterministic scan order, so the score can drift slightly
+                    // while flags and edge-width buckets remain checked below.
+                    0.50,
+                );
+                assert_close(
+                    &format!("blur_score {}", path.display()),
+                    actual_quality.blur_score,
+                    value_f64(&expected_quality, "blur_score"),
+                    1.0,
+                );
+                assert_close(
+                    &format!("brightness_mean {}", path.display()),
+                    actual_quality.brightness_mean,
+                    value_f64(&expected_quality, "brightness_mean"),
+                    0.02,
+                );
+                assert_close(
+                    &format!("entropy {}", path.display()),
+                    actual_quality.entropy,
+                    value_f64(&expected_quality, "entropy"),
+                    0.0005,
+                );
+                assert_close(
+                    &format!("blur_combined {}", path.display()),
+                    actual_quality.blur_combined,
+                    value_f64(&expected_quality, "blur_combined"),
+                    0.02,
+                );
+                assert_close(
+                    &format!("edge_width_pix {}", path.display()),
+                    actual_quality.edge_width_pix,
+                    value_f64(&expected_quality, "edge_width_pix"),
+                    0.50,
+                );
+                assert_close(
+                    &format!("horizon_tilt_deg {}", path.display()),
+                    actual_quality.horizon_tilt_deg,
+                    value_f64(&expected_quality, "horizon_tilt_deg"),
+                    0.25,
+                );
+            }
+
+            if let Some(expected_signals) = image.quality_signals {
+                let analysis = load_fast_analysis_image(&path).expect("load analysis image");
+                let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let signals = quality_signals(&analysis, file_size);
+                assert_close(
+                    &format!("signal lap {}", path.display()),
+                    Some(signals.blur_score),
+                    value_f64(&expected_signals, "lap"),
+                    1.0,
+                );
+                assert_close(
+                    &format!("signal motion_anisotropy {}", path.display()),
+                    Some(signals.motion_anisotropy),
+                    value_f64(&expected_signals, "motion_anisotropy"),
+                    0.02,
+                );
+                assert_close(
+                    &format!("signal salient_sharpness {}", path.display()),
+                    signals.salient_sharpness,
+                    value_f64(&expected_signals, "salient_sharpness"),
+                    5.0,
+                );
+                assert_close(
+                    &format!("signal focus_ratio {}", path.display()),
+                    signals.focus_ratio,
+                    value_f64(&expected_signals, "focus_ratio"),
+                    0.05,
+                );
+                assert_close(
+                    &format!("signal composition {}", path.display()),
+                    signals.composition,
+                    value_f64(&expected_signals, "composition"),
+                    0.02,
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "fast quality fixture had no readable images");
     }
 
     #[cfg(feature = "opencv-orb")]

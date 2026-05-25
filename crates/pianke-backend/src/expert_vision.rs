@@ -1556,7 +1556,7 @@ fn downscale_gray(img: GrayImage, max_side: u32) -> GrayImage {
     }
 }
 
-fn pillow_thumbnail_luma(src: &GrayImage, max_w: u32, max_h: u32) -> GrayImage {
+pub(crate) fn pillow_thumbnail_luma(src: &GrayImage, max_w: u32, max_h: u32) -> GrayImage {
     let (w, h) = src.dimensions();
     if w == 0 || h == 0 || max_w == 0 || max_h == 0 {
         return GrayImage::new(0, 0);

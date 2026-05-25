@@ -22,8 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from PIL import ImageOps  # noqa: E402
+
 from pic_selecter.grouper import compute_infos, group_infos  # noqa: E402
+from pic_selecter import grouper  # noqa: E402
 from pic_selecter import fast_clustering  # noqa: E402
+from pic_selecter import fast_quality  # noqa: E402
 
 
 def _jsonable(value: Any) -> Any:
@@ -61,6 +65,7 @@ def _array_summary(arr: Any) -> dict[str, Any] | None:
 def _info_record(info: Any, index: int) -> dict[str, Any]:
     orb_descs = getattr(info, "orb_descs", None)
     orb_kps = getattr(info, "orb_kps", None)
+    quality_signals = _quality_signal_record(info)
     return {
         "index": index,
         "path": str(Path(info.path)),
@@ -77,6 +82,7 @@ def _info_record(info: Any, index: int) -> dict[str, Any]:
             "ahash": getattr(info, "ahash", None),
         },
         "quality": _jsonable(getattr(info, "quality", None)),
+        "quality_signals": _jsonable(quality_signals),
         "color_hist": _jsonable(getattr(info, "color_hist", None)),
         "color_hist_summary": _array_summary(getattr(info, "color_hist", None)),
         "orb": {
@@ -84,6 +90,74 @@ def _info_record(info: Any, index: int) -> dict[str, Any]:
             "keypoints": _array_summary(orb_kps),
         },
     }
+
+
+def _quality_signal_record(info: Any) -> dict[str, Any] | None:
+    try:
+        img = grouper._load_image_for_analysis(info.path, getattr(info, "companions", []))
+        img_t = grouper._resize_for_analysis(ImageOps.exif_transpose(img))
+        work = fast_quality._resize_for_analysis(img_t.convert("L"), 768)
+        arr = np.asarray(work, dtype=np.float32)
+        if arr.size == 0:
+            arr = np.zeros((1, 1), dtype=np.float32)
+        brightness_mean = float(arr.mean())
+        brightness_std = float(arr.std())
+        underexposed_ratio = float((arr <= 8).mean())
+        overexposed_ratio = float((arr >= 247).mean())
+        entropy = fast_quality._entropy(arr)
+        lap = max(
+            fast_quality._laplacian_variance(arr),
+            fast_quality._laplacian_variance(fast_quality._center_crop(arr, 0.6)),
+        )
+        tenengrad = fast_quality._tenengrad(arr)
+        high_ratio, motion_anisotropy = fast_quality._fft_high_freq_ratio(arr)
+        edge_width = fast_quality._edge_width_marziliano(arr)
+        lap_norm = min(1.0, np.log1p(max(0.0, lap)) / np.log1p(900.0))
+        tenengrad_norm = min(1.0, np.log1p(max(0.0, tenengrad)) / np.log1p(2000.0))
+        high_norm = min(1.0, max(0.0, high_ratio) / 0.40)
+        if edge_width is None:
+            edge_width_norm = None
+            blur_combined = float(np.mean([lap_norm, tenengrad_norm, high_norm]))
+        else:
+            edge_width_norm = max(0.0, min(1.0, (10.0 - edge_width) / 7.0))
+            blur_combined = float(np.mean([lap_norm, tenengrad_norm, high_norm, edge_width_norm]))
+        smap = fast_quality._saliency_map(arr)
+        salient_sharpness = None
+        focus_ratio = None
+        composition = None
+        if smap is not None:
+            salient_sharpness = fast_quality._salient_region_sharpness(arr, smap)
+            focus_ratio = fast_quality._saliency_focus_consistency(arr, smap)
+            composition = fast_quality._composition_score(arr, smap)
+        nine = fast_quality._nine_grid_exposure(arr)
+        horizon_tilt = fast_quality._horizon_tilt_degrees(arr)
+        return {
+            "work_width": int(arr.shape[1]),
+            "work_height": int(arr.shape[0]),
+            "brightness_mean": brightness_mean,
+            "brightness_std": brightness_std,
+            "contrast_score": brightness_std,
+            "underexposed_ratio": underexposed_ratio,
+            "overexposed_ratio": overexposed_ratio,
+            "entropy": entropy,
+            "lap": lap,
+            "tenengrad": tenengrad,
+            "high_freq_ratio": high_ratio,
+            "motion_anisotropy": motion_anisotropy,
+            "edge_width_pix": edge_width,
+            "lap_norm": lap_norm,
+            "tenengrad_norm": tenengrad_norm,
+            "high_norm": high_norm,
+            "edge_width_norm": edge_width_norm,
+            "blur_combined": blur_combined,
+            "salient_sharpness": salient_sharpness,
+            "focus_ratio": focus_ratio,
+            "horizon_tilt_deg": horizon_tilt,
+            "composition": composition,
+            "nine_grid": nine,
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def _orb_pair_records(infos: list[Any]) -> list[dict[str, Any]]:
