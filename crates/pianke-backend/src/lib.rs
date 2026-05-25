@@ -44,6 +44,7 @@ use watermark::WatermarkConfig;
 const STATE_FILENAME: &str = ".pic_selecter_state.json";
 const PIC_DIR: &str = "_pic_selecter";
 const THUMB_MAX: u32 = 1600;
+const ANALYSIS_MAX_SIDE: u32 = 2048;
 
 const IMAGE_EXTS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"];
 const RAW_EXTS: &[&str] = &[
@@ -1569,7 +1570,7 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
             "HEIC/HEIF 暂未在 Rust Fast 后端启用".to_string()
         }
     })?;
-    let img = image::open(analysis).map_err(|e| format!("加载失败: {e}"))?;
+    let img = load_fast_analysis_image(analysis)?;
     let meta = fs::metadata(&pair.primary).map_err(|e| format!("stat 失败: {e}"))?;
     let file_size = meta.len();
     let mtime = meta
@@ -1578,9 +1579,10 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
         .and_then(system_time_secs)
         .unwrap_or_else(now_secs);
     let (width, height) = img.dimensions();
+    let (exif_width, exif_height) = image::image_dimensions(analysis).unwrap_or((width, height));
     let exif = ExifSummary {
-        width: Some(width),
-        height: Some(height),
+        width: Some(exif_width),
+        height: Some(exif_height),
         file_size: Some(file_size),
         datetime: meta
             .modified()
@@ -1589,20 +1591,12 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
         ..ExifSummary::default()
     };
 
-    let gray8 = img.to_luma8();
-    let small_a = DynamicImage::ImageLuma8(gray8.clone())
-        .resize_exact(8, 8, FilterType::Lanczos3)
-        .to_luma8();
-    let small_d = DynamicImage::ImageLuma8(gray8.clone())
-        .resize_exact(9, 8, FilterType::Lanczos3)
-        .to_luma8();
-    let small_p = DynamicImage::ImageLuma8(gray8.clone())
-        .resize_exact(32, 32, FilterType::Lanczos3)
-        .to_luma8();
+    let gray8 = pillow_luma(&img.to_rgb8());
+    let small_a = expert_vision::pillow_lanczos_resize_luma(&gray8, 8, 8);
+    let small_d = expert_vision::pillow_lanczos_resize_luma(&gray8, 9, 8);
+    let small_p = expert_vision::pillow_lanczos_resize_luma(&gray8, 32, 32);
     let whash_scale = whash_image_scale(width, height);
-    let small_w = DynamicImage::ImageLuma8(gray8.clone())
-        .resize_exact(whash_scale, whash_scale, FilterType::Lanczos3)
-        .to_luma8();
+    let small_w = expert_vision::pillow_lanczos_resize_luma(&gray8, whash_scale, whash_scale);
     let ahash = average_hash_from_luma(small_a.as_raw(), 8).unwrap_or_default();
     let dhash = difference_hash_from_luma(small_d.as_raw(), 8).unwrap_or_default();
     let phash = perceptual_hash_from_luma(small_p.as_raw(), 8).unwrap_or_default();
@@ -1663,6 +1657,76 @@ fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     })
 }
 
+fn load_fast_analysis_image(path: &Path) -> Result<DynamicImage, String> {
+    let rgb = load_rgb_image(path)?;
+    let oriented = apply_exif_orientation(rgb, read_exif_orientation(path).unwrap_or(1));
+    let (w, h) = oriented.dimensions();
+    let analysis = if w.max(h) <= ANALYSIS_MAX_SIDE {
+        oriented
+    } else {
+        let scale = ANALYSIS_MAX_SIDE as f32 / w.max(h) as f32;
+        let new_w = ((w as f32 * scale) as u32).max(1);
+        let new_h = ((h as f32 * scale) as u32).max(1);
+        expert_vision::pillow_lanczos_resize_rgb(&oriented, new_w, new_h)
+    };
+    Ok(DynamicImage::ImageRgb8(analysis))
+}
+
+fn load_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
+    #[cfg(feature = "opencv-orb")]
+    {
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+            .unwrap_or(false)
+        {
+            let bytes = fs::read(path).map_err(|e| format!("读取 Fast JPEG 图片失败: {e}"))?;
+            let rgb: image::RgbImage = turbojpeg::decompress_image(&bytes)
+                .map_err(|e| format!("libjpeg-turbo 解码 Fast JPEG 失败: {e}"))?;
+            return Ok(rgb);
+        }
+    }
+    image::open(path)
+        .map(|img| img.to_rgb8())
+        .map_err(|e| format!("加载失败: {e}"))
+}
+
+fn read_exif_orientation(path: &Path) -> Option<u16> {
+    let bytes = fs::read(path).ok()?;
+    let mut cursor = Cursor::new(bytes);
+    let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+    let field = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?;
+    field.value.get_uint(0).map(|v| v as u16)
+}
+
+fn apply_exif_orientation(img: image::RgbImage, orientation: u16) -> image::RgbImage {
+    match orientation {
+        2 => image::imageops::flip_horizontal(&img),
+        3 => image::imageops::rotate180(&img),
+        4 => image::imageops::flip_vertical(&img),
+        5 => image::imageops::rotate90(&image::imageops::flip_horizontal(&img)),
+        6 => image::imageops::rotate90(&img),
+        7 => image::imageops::rotate270(&image::imageops::flip_horizontal(&img)),
+        8 => image::imageops::rotate270(&img),
+        _ => img,
+    }
+}
+
+fn pillow_luma(rgb: &image::RgbImage) -> image::GrayImage {
+    let (w, h) = rgb.dimensions();
+    let mut out = image::GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let [r, g, b] = rgb.get_pixel(x, y).0;
+            let luma =
+                (19595u32 * r as u32 + 38470u32 * g as u32 + 7471u32 * b as u32 + 32768) >> 16;
+            out.put_pixel(x, y, image::Luma([luma.min(255) as u8]));
+        }
+    }
+    out
+}
+
 #[cfg(feature = "opencv-orb")]
 fn compute_orb_inliers_for_records(records: &[InfoRecord]) -> HashMap<(usize, usize), usize> {
     use opencv::{
@@ -1675,49 +1739,6 @@ fn compute_orb_inliers_for_records(records: &[InfoRecord]) -> HashMap<(usize, us
     struct OrbFeatures {
         descriptors: Mat,
         keypoints: Vec<Point2f>,
-    }
-
-    const ORB_ANALYSIS_MAX_SIDE: u32 = 2048;
-
-    fn load_rgb(path: &str) -> Result<image::RgbImage, String> {
-        let path = Path::new(path);
-        let rgb = if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
-            .unwrap_or(false)
-        {
-            let bytes = fs::read(path).map_err(|e| format!("read ORB JPEG failed: {e}"))?;
-            turbojpeg::decompress_image(&bytes)
-                .map_err(|e| format!("libjpeg-turbo decode ORB JPEG failed: {e}"))?
-        } else {
-            image::open(path)
-                .map(|img| img.to_rgb8())
-                .map_err(|e| format!("load ORB image failed: {e}"))?
-        };
-        let (w, h) = rgb.dimensions();
-        if w.max(h) <= ORB_ANALYSIS_MAX_SIDE {
-            Ok(rgb)
-        } else {
-            let scale = ORB_ANALYSIS_MAX_SIDE as f32 / w.max(h) as f32;
-            let new_w = ((w as f32 * scale) as u32).max(1);
-            let new_h = ((h as f32 * scale) as u32).max(1);
-            Ok(expert_vision::pillow_lanczos_resize_rgb(&rgb, new_w, new_h))
-        }
-    }
-
-    fn pillow_luma(rgb: &image::RgbImage) -> image::GrayImage {
-        let (w, h) = rgb.dimensions();
-        let mut out = image::GrayImage::new(w, h);
-        for y in 0..h {
-            for x in 0..w {
-                let [r, g, b] = rgb.get_pixel(x, y).0;
-                let luma =
-                    (19595u32 * r as u32 + 38470u32 * g as u32 + 7471u32 * b as u32 + 32768) >> 16;
-                out.put_pixel(x, y, image::Luma([luma.min(255) as u8]));
-            }
-        }
-        out
     }
 
     fn features_from_rgb(rgb: &image::RgbImage) -> Result<Option<OrbFeatures>, String> {
@@ -1780,8 +1801,8 @@ fn compute_orb_inliers_for_records(records: &[InfoRecord]) -> HashMap<(usize, us
     }
 
     fn features(path: &str) -> Result<Option<OrbFeatures>, String> {
-        let img = load_rgb(path)?;
-        features_from_rgb(&img)
+        let img = load_fast_analysis_image(Path::new(path))?;
+        features_from_rgb(&img.to_rgb8())
     }
 
     fn inliers(a: &OrbFeatures, b: &OrbFeatures) -> Result<usize, String> {
@@ -2335,6 +2356,12 @@ fn entropy(bytes: &[u8]) -> f64 {
 }
 
 fn compute_color_hist(img: &DynamicImage) -> Option<Vec<f32>> {
+    #[cfg(feature = "opencv-orb")]
+    {
+        if let Some(hist) = compute_color_hist_opencv(img) {
+            return Some(hist);
+        }
+    }
     let rgb = img.resize(384, 384, FilterType::Triangle).to_rgb8();
     let (w, h) = rgb.dimensions();
     if w < 16 || h < 16 {
@@ -2357,6 +2384,85 @@ fn compute_color_hist(img: &DynamicImage) -> Option<Vec<f32>> {
                     hh[((hue / 180.0 * 16.0).floor() as usize).min(15)] += 1.0;
                     ss[((sat * 16.0).floor() as usize).min(15)] += 1.0;
                     vv[((val * 16.0).floor() as usize).min(15)] += 1.0;
+                }
+            }
+            normalize_sum(&mut hh);
+            normalize_sum(&mut ss);
+            normalize_sum(&mut vv);
+            feats.extend(hh);
+            feats.extend(ss);
+            feats.extend(vv);
+        }
+    }
+    let norm = feats.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm < 1e-8 {
+        return None;
+    }
+    for v in &mut feats {
+        *v /= norm;
+    }
+    Some(feats)
+}
+
+#[cfg(feature = "opencv-orb")]
+fn compute_color_hist_opencv(img: &DynamicImage) -> Option<Vec<f32>> {
+    use opencv::{core, imgproc, prelude::*};
+
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    if w < 16 || h < 16 {
+        return None;
+    }
+    let src = core::Mat::from_slice(rgb.as_raw())
+        .ok()?
+        .reshape(3, h as i32)
+        .ok()?
+        .try_clone()
+        .ok()?;
+    let mut work = src;
+    let mut work_w = w;
+    let mut work_h = h;
+    if w.max(h) > 384 {
+        let scale = 384.0f64 / w.max(h) as f64;
+        work_w = ((w as f64 * scale) as i32).max(1) as u32;
+        work_h = ((h as f64 * scale) as i32).max(1) as u32;
+        let mut resized = core::Mat::default();
+        imgproc::resize(
+            &work,
+            &mut resized,
+            core::Size::new(work_w as i32, work_h as i32),
+            0.0,
+            0.0,
+            imgproc::INTER_AREA,
+        )
+        .ok()?;
+        work = resized;
+    }
+    let mut hsv = core::Mat::default();
+    imgproc::cvt_color(
+        &work,
+        &mut hsv,
+        imgproc::COLOR_RGB2HSV,
+        0,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )
+    .ok()?;
+    let mut feats = Vec::with_capacity(144);
+    for gy in 0..3 {
+        for gx in 0..3 {
+            let x0 = gx * work_w / 3;
+            let x1 = (gx + 1) * work_w / 3;
+            let y0 = gy * work_h / 3;
+            let y1 = (gy + 1) * work_h / 3;
+            let mut hh = [0f32; 16];
+            let mut ss = [0f32; 16];
+            let mut vv = [0f32; 16];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = *hsv.at_2d::<core::Vec3b>(y as i32, x as i32).ok()?;
+                    hh[((p[0] as usize * 16) / 180).min(15)] += 1.0;
+                    ss[((p[1] as usize * 16) / 256).min(15)] += 1.0;
+                    vv[((p[2] as usize * 16) / 256).min(15)] += 1.0;
                 }
             }
             normalize_sum(&mut hh);
@@ -3772,6 +3878,166 @@ mod tests {
         a.face_embeddings.clear();
         b.face_embeddings.clear();
         assert!(expert_pair_similarity(&a, &b) > 0.5);
+    }
+
+    #[test]
+    fn fast_analysis_hash_fixture_matches_when_configured() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            #[serde(default)]
+            source_folder: Option<String>,
+            #[serde(default)]
+            images: Vec<FixtureImage>,
+        }
+
+        #[derive(Deserialize)]
+        struct FixtureImage {
+            path: String,
+            #[serde(default)]
+            hashes: FixtureHashes,
+            #[serde(default)]
+            color_hist: Option<Vec<f32>>,
+            #[serde(default)]
+            exif_summary: Option<ExifSummary>,
+        }
+
+        #[derive(Default, Deserialize)]
+        struct FixtureHashes {
+            #[serde(default)]
+            phash: Option<String>,
+            #[serde(default)]
+            dhash: Option<String>,
+            #[serde(default)]
+            whash: Option<String>,
+            #[serde(default)]
+            ahash: Option<String>,
+        }
+
+        fn resolve_fixture_path(
+            workspace: &Path,
+            fixture_dir: &Path,
+            source_folder: Option<&str>,
+            path: &str,
+        ) -> PathBuf {
+            let raw = PathBuf::from(path);
+            if raw.is_absolute() {
+                return raw;
+            }
+            let workspace_path = workspace.join(&raw);
+            if workspace_path.exists() {
+                return workspace_path;
+            }
+            if let Some(source_folder) = source_folder {
+                let source = PathBuf::from(source_folder);
+                let source = if source.is_absolute() {
+                    source
+                } else {
+                    workspace.join(source)
+                };
+                let source_path = source.join(&raw);
+                if source_path.exists() {
+                    return source_path;
+                }
+            }
+            fixture_dir.join(raw)
+        }
+
+        let fixture_path = std::env::var("PIANKE_FAST_ANALYSIS_FIXTURE")
+            .or_else(|_| std::env::var("PIANKE_FAST_ORB_FIXTURE"));
+        let Ok(fixture_path) = fixture_path else {
+            return;
+        };
+        let fixture_path = PathBuf::from(fixture_path);
+        if !fixture_path.exists() {
+            return;
+        }
+        let text = fs::read_to_string(&fixture_path).expect("read fast analysis fixture");
+        let fixture: Fixture = serde_json::from_str(&text).expect("parse fast analysis fixture");
+        if fixture.images.is_empty() {
+            return;
+        }
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let fixture_dir = fixture_path.parent().unwrap_or(Path::new("."));
+        for image in fixture.images {
+            let path = resolve_fixture_path(
+                &workspace,
+                fixture_dir,
+                fixture.source_folder.as_deref(),
+                &image.path,
+            );
+            let pair = ScanPair {
+                primary: path.clone(),
+                companions: Vec::new(),
+                analysis: Some(path.clone()),
+            };
+            let record = process_one(&pair, "standard").expect("process fast fixture image");
+            assert_eq!(
+                record.info.phash,
+                image.hashes.phash,
+                "pHash mismatch for {}",
+                path.display()
+            );
+            assert_eq!(
+                record.info.dhash,
+                image.hashes.dhash,
+                "dHash mismatch for {}",
+                path.display()
+            );
+            assert_eq!(
+                record.info.whash,
+                image.hashes.whash,
+                "wHash mismatch for {}",
+                path.display()
+            );
+            assert_eq!(
+                record.info.ahash,
+                image.hashes.ahash,
+                "aHash mismatch for {}",
+                path.display()
+            );
+            if let Some(expected_exif) = image.exif_summary {
+                assert_eq!(
+                    record
+                        .info
+                        .exif_summary
+                        .as_ref()
+                        .and_then(|exif| exif.width),
+                    expected_exif.width,
+                    "analysis width mismatch for {}",
+                    path.display()
+                );
+                assert_eq!(
+                    record
+                        .info
+                        .exif_summary
+                        .as_ref()
+                        .and_then(|exif| exif.height),
+                    expected_exif.height,
+                    "analysis height mismatch for {}",
+                    path.display()
+                );
+            }
+            if let (Some(actual), Some(expected)) = (&record.info.color_hist, image.color_hist) {
+                assert_eq!(
+                    actual.len(),
+                    expected.len(),
+                    "HSV length for {}",
+                    path.display()
+                );
+                let max_delta = actual
+                    .iter()
+                    .zip(expected.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_delta <= 0.00001,
+                    "HSV histogram mismatch for {}: max_delta={max_delta}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[cfg(feature = "opencv-orb")]

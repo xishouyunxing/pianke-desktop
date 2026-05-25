@@ -660,7 +660,7 @@ pub(crate) fn pillow_lanczos_resize_rgb(src: &RgbImage, dst_w: u32, dst_h: u32) 
     out
 }
 
-fn pillow_lanczos_resize_luma(src: &GrayImage, dst_w: u32, dst_h: u32) -> GrayImage {
+pub(crate) fn pillow_lanczos_resize_luma(src: &GrayImage, dst_w: u32, dst_h: u32) -> GrayImage {
     let (src_w, src_h) = src.dimensions();
     pillow_lanczos_resize_luma_box(src, dst_w, dst_h, 0.0, 0.0, src_w as f32, src_h as f32)
 }
