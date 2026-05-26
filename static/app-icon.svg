@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="片刻">
+  <defs>
+    <linearGradient id="bg" x1="44" y1="24" x2="212" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F9F3E7"/>
+      <stop offset="1" stop-color="#E9DCC7"/>
+    </linearGradient>
+    <linearGradient id="clay" x1="76" y1="58" x2="186" y2="206" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E79678"/>
+      <stop offset="0.55" stop-color="#CC785C"/>
+      <stop offset="1" stop-color="#9F4E3B"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="86" y1="82" x2="174" y2="178" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFDF8"/>
+      <stop offset="1" stop-color="#F0E6D5"/>
+    </linearGradient>
+    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#3B2A20" flood-opacity="0.18"/>
+      <feDropShadow dx="0" dy="3" stdDeviation="3" flood-color="#3B2A20" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <rect width="256" height="256" rx="58" fill="url(#bg)"/>
+  <circle cx="128" cy="128" r="82" fill="url(#clay)" filter="url(#soft-shadow)"/>
+  <circle cx="128" cy="128" r="59" fill="none" stroke="#F7DCCF" stroke-width="10" opacity="0.9"/>
+  <circle cx="128" cy="128" r="32" fill="#311C16" opacity="0.28"/>
+  <circle cx="128" cy="128" r="22" fill="#1B1210"/>
+  <circle cx="121" cy="119" r="8" fill="#F9EFE3" opacity="0.9"/>
+
+  <g transform="rotate(-8 128 133)" filter="url(#soft-shadow)">
+    <rect x="69" y="90" width="118" height="88" rx="15" fill="url(#paper)"/>
+    <rect x="82" y="103" width="92" height="56" rx="8" fill="#D6B69D"/>
+    <path d="M82 150 107 126 124 142 139 126 174 158 174 159 82 159Z" fill="#8A6A54" opacity="0.92"/>
+    <circle cx="156" cy="116" r="9" fill="#F2C494"/>
+    <rect x="95" y="172" width="62" height="9" rx="4.5" fill="#1D1713" opacity="0.72"/>
+  </g>
+
+  <path d="M189 62 195 77 210 83 195 89 189 104 183 89 168 83 183 77Z" fill="#FFF6E8"/>
+  <path d="M67 186 71 196 81 200 71 204 67 214 63 204 53 200 63 196Z" fill="#F6D1BD"/>
+</svg>
