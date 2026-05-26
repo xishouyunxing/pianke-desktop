@@ -74,11 +74,35 @@ function postFolder(folder: string) {
   );
 }
 
+function postFolderPickResult(requestId: string, payload: { folder?: string | null; error?: string }) {
+  iframeEl.value?.contentWindow?.postMessage(
+    { type: "pianke:pick-folder-result", requestId, ...payload },
+    backendOrigin.value,
+  );
+}
+
+async function handleFrameMessage(event: MessageEvent) {
+  if (!iframeEl.value?.contentWindow || event.source !== iframeEl.value.contentWindow) return;
+  const data = event.data || {};
+  if (data.type !== "pianke:pick-folder" || typeof data.requestId !== "string") return;
+
+  try {
+    const folder = await invoke<string | null>("pick_folder");
+    if (folder) selectedFolder.value = folder;
+    postFolderPickResult(data.requestId, { folder });
+  } catch (err) {
+    postFolderPickResult(data.requestId, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 function handleFrameLoad() {
   if (selectedFolder.value) postFolder(selectedFolder.value);
 }
 
 onMounted(async () => {
+  window.addEventListener("message", handleFrameMessage);
   await refreshStatus();
   pollTimer = window.setInterval(async () => {
     if (!status.value.healthy) await refreshStatus();
@@ -86,6 +110,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener("message", handleFrameMessage);
   if (pollTimer) window.clearInterval(pollTimer);
 });
 </script>

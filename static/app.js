@@ -27,6 +27,7 @@ const WALL_CELL_COUNT = 40; // 10 columns × 4 rows
 const WALL_FILL_MS = 200;
 const WALL_REPLACE_MS = 420;
 const WALL_QUEUE_CAP = 80;
+let folderPickSeq = 0;
 
 // =================================================================
 // 全局引擎状态徽章
@@ -117,6 +118,48 @@ async function fetchJSON(url, opts = {}) {
     throw new Error(msg);
   }
   return data;
+}
+
+async function pickFolderFromDesktopShell() {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (typeof invoke !== "function") {
+    if (!IS_DESKTOP_SHELL || window.parent === window) {
+      return { available: false };
+    }
+
+    const requestId = `folder-${Date.now()}-${++folderPickSeq}`;
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        window.removeEventListener("message", onMessage);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("桌面壳没有响应选择文件夹请求"));
+      }, 30000);
+      const onMessage = (event) => {
+        const data = event.data || {};
+        if (data.type !== "pianke:pick-folder-result" || data.requestId !== requestId) return;
+        cleanup();
+        if (data.error) {
+          reject(new Error(data.error));
+          return;
+        }
+        resolve({ available: true, cancelled: !data.folder, folder: data.folder || "" });
+      };
+      window.addEventListener("message", onMessage);
+      window.parent.postMessage({ type: "pianke:pick-folder", requestId }, "*");
+    });
+  }
+
+  const folder = await invoke("pick_folder");
+  return { available: true, cancelled: !folder, folder: folder || "" };
+}
+
+function applyPickedFolder(folder) {
+  $("folder-input").value = folder;
+  $("start-error").textContent = "";
+  requestFolderPeek(folder);
 }
 
 function fmtElapsed(s) {
@@ -809,13 +852,16 @@ $("browse-btn").addEventListener("click", async () => {
   const btn = $("browse-btn");
   btn.disabled = true;
   try {
+    const desktop = await pickFolderFromDesktopShell();
+    if (desktop.available) {
+      if (desktop.cancelled) return;
+      if (desktop.folder) applyPickedFolder(desktop.folder);
+      return;
+    }
+
     const r = await fetchJSON("/api/browse_folder", { method: "POST" });
     if (r.cancelled) return;
-    if (r.folder) {
-      $("folder-input").value = r.folder;
-      $("start-error").textContent = "";
-      requestFolderPeek(r.folder);
-    }
+    if (r.folder) applyPickedFolder(r.folder);
   } catch (e) {
     toast("无法打开选择对话框：" + e.message);
   } finally {
