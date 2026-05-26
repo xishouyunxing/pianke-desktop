@@ -29,7 +29,8 @@
     "icon": ["icons/icon.ico"],
     "resources": {
       "../static": "static",
-      "../assets": "assets"
+      "../assets": "assets",
+      "opencv-runtime": "."
     },
     "windows": {
       "webviewInstallMode": {

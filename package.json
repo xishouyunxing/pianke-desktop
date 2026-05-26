@@ -7,11 +7,12 @@
     "dev": "tauri dev",
     "dev:ui": "vite --host 127.0.0.1 --port 1420",
     "prepare:python": "powershell -ExecutionPolicy Bypass -File scripts/prepare_desktop_python.ps1",
-    "build": "tauri build && npm run check:no-python-bundle",
-    "build:rust": "tauri build && npm run check:no-python-bundle",
+    "build": "powershell -ExecutionPolicy Bypass -File scripts/build_rust_release.ps1",
+    "build:rust": "powershell -ExecutionPolicy Bypass -File scripts/build_rust_release.ps1",
     "build:ui": "vue-tsc --noEmit && vite build",
     "check:no-python-bundle": "powershell -ExecutionPolicy Bypass -File scripts/check_no_python_bundle.ps1",
     "smoke:release-rust": "powershell -ExecutionPolicy Bypass -File scripts/smoke_release_rust_backend.ps1",
+    "test:opencv-release": "powershell -ExecutionPolicy Bypass -File scripts/test_opencv_release.ps1",
     "preview": "vite preview --host 127.0.0.1 --port 1420"
   },
   "dependencies": {

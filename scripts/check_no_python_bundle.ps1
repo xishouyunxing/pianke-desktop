@@ -4,6 +4,37 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $tauriConfigPath = Join-Path $repoRoot "src-tauri\tauri.conf.json"
 $releaseRoot = Join-Path $repoRoot "src-tauri\target\release"
 $bundleRoot = Join-Path $repoRoot "src-tauri\target\release\bundle"
+$releaseExe = Join-Path $releaseRoot "pianke-desktop.exe"
+$requiredOpenCvDlls = @(
+    "opencv_core4.dll",
+    "opencv_imgproc4.dll",
+    "opencv_features2d4.dll",
+    "opencv_calib3d4.dll",
+    "opencv_flann4.dll",
+    "opencv_imgcodecs4.dll",
+    "opencv_dnn4.dll",
+    "opencv_highgui4.dll",
+    "opencv_ml4.dll",
+    "opencv_objdetect4.dll",
+    "opencv_photo4.dll",
+    "opencv_stitching4.dll",
+    "opencv_video4.dll",
+    "opencv_videoio4.dll",
+    "abseil_dll.dll",
+    "jpeg62.dll",
+    "liblzma.dll",
+    "libpng16.dll",
+    "libprotobuf.dll",
+    "libprotobuf-lite.dll",
+    "libsharpyuv.dll",
+    "libwebp.dll",
+    "libwebpdecoder.dll",
+    "libwebpdemux.dll",
+    "libwebpmux.dll",
+    "tiff.dll",
+    "turbojpeg.dll",
+    "z.dll"
+)
 
 function Test-ForbiddenPythonPath {
     param([Parameter(Mandatory = $true)][string]$PathText)
@@ -100,4 +131,14 @@ if ($hits.Count -gt 0) {
     exit 1
 }
 
-Write-Host "Rust-only packaging check passed: no Python runtime, Flask worker, or Python package resources were found."
+if (Test-Path -LiteralPath $releaseExe) {
+    $missingOpenCvDlls = @($requiredOpenCvDlls | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $releaseRoot $_))
+    })
+    if ($missingOpenCvDlls.Count -gt 0) {
+        Write-Error ("OpenCV runtime DLLs are missing from release output:`n" + ($missingOpenCvDlls -join "`n"))
+        exit 1
+    }
+}
+
+Write-Host "Rust-only packaging check passed: no Python runtime, Flask worker, Python package, or missing OpenCV runtime resources were found."

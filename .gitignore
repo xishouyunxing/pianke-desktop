@@ -58,6 +58,7 @@ src-tauri/target/
 crates/*/target/
 src-tauri/gen/
 src-tauri/binaries/python/
+src-tauri/opencv-runtime/
 .desktop-python-cache/
 *.msi
 *.exe

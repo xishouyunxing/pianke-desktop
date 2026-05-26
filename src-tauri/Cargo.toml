@@ -8,6 +8,10 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+opencv-orb = ["pianke-backend/opencv-orb"]
+
 [dependencies]
 pianke-backend = { path = "../crates/pianke-backend" }
 rfd = "0.15"

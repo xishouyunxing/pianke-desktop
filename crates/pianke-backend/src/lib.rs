@@ -534,6 +534,7 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "expert_capabilities": expert_caps,
         "quality_models": quality_models,
         "nima_legacy_unavailable": true,
+        "opencv_orb": opencv_orb_available(),
         "formats": format_capabilities(),
         "tycoon_ready": tycoon_ready,
         "model_components": ctx.models.status_map(),
@@ -553,7 +554,12 @@ fn format_capabilities() -> Value {
         "raw_strategy": "embedded_jpeg",
         "heic": heic_decode_available(),
         "heic_strategy": heic_decode_strategy(),
+        "opencv_orb": opencv_orb_available(),
     })
+}
+
+fn opencv_orb_available() -> bool {
+    cfg!(feature = "opencv-orb")
 }
 
 fn heic_decode_available() -> bool {

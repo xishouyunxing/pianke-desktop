@@ -175,6 +175,16 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(capabilities["nima_legacy_unavailable"], true);
     assert_eq!(capabilities["formats"]["raw_thumbnail"], true);
     assert_eq!(capabilities["formats"]["raw_strategy"], "embedded_jpeg");
+    assert_eq!(
+        capabilities["opencv_orb"],
+        cfg!(feature = "opencv-orb"),
+        "top-level OpenCV ORB capability should match compiled feature"
+    );
+    assert_eq!(
+        capabilities["formats"]["opencv_orb"],
+        cfg!(feature = "opencv-orb"),
+        "format OpenCV ORB capability should match compiled feature"
+    );
     assert!(capabilities["formats"]["heic"].is_boolean());
     assert!(matches!(
         capabilities["formats"]["heic_strategy"].as_str(),
