@@ -155,7 +155,8 @@ fn start_or_restart_backend(
     let token = Uuid::new_v4().to_string();
     let url = format!("http://127.0.0.1:{port}");
 
-    let use_python = matches!(env::var("PIANKE_BACKEND").ok().as_deref(), Some("python"));
+    let requested_python = matches!(env::var("PIANKE_BACKEND").ok().as_deref(), Some("python"));
+    let use_python = requested_python && python_fallback_allowed();
 
     if !use_python {
         let handle = pianke_backend::start(pianke_backend::ServerOptions {
@@ -179,6 +180,10 @@ fn start_or_restart_backend(
                 "Rust Fast 引擎已启动，但健康检查暂未通过".to_string()
             },
         };
+        if requested_python {
+            runtime.payload.message =
+                "正式安装包不包含 Python 后端，已启动 Rust Fast 后端。".to_string();
+        }
         runtime.rust_backend = Some(handle);
         return Ok(runtime.payload.clone());
     }
@@ -233,6 +238,10 @@ fn stop_rust_backend(handle: &mut Option<pianke_backend::ServerHandle>) {
     if let Some(handle) = handle.take() {
         handle.stop();
     }
+}
+
+fn python_fallback_allowed() -> bool {
+    cfg!(debug_assertions)
 }
 
 fn stop_child(child: &mut Option<Child>) {

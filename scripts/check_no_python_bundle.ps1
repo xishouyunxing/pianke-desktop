@@ -1,0 +1,103 @@
+$ErrorActionPreference = "Stop"
+
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$tauriConfigPath = Join-Path $repoRoot "src-tauri\tauri.conf.json"
+$releaseRoot = Join-Path $repoRoot "src-tauri\target\release"
+$bundleRoot = Join-Path $repoRoot "src-tauri\target\release\bundle"
+
+function Test-ForbiddenPythonPath {
+    param([Parameter(Mandatory = $true)][string]$PathText)
+
+    $normalized = $PathText.Replace("\", "/").ToLowerInvariant()
+    return (
+        $normalized -match '(^|/|"|:|\s)python\.exe("|,|\s|$)' -or
+        $normalized -match '(^|/|"|:|\s)app\.py("|,|\s|$)' -or
+        $normalized -match '(^|/|"|:|\s)requirements-fast\.txt("|,|\s|$)' -or
+        $normalized -match '(^|/)site-packages(/|$)' -or
+        $normalized -match '(^|/|"|:|\s)site-packages(/|"|,|\s|$)' -or
+        $normalized -match '(^|/|"|:|\s)pic_selecter(/|"|,|\s|$)' -or
+        $normalized -match '(^|/|"|:|\s)binaries/python(/|"|,|\s|$)'
+    )
+}
+
+function Add-ForbiddenHit {
+    param(
+        [System.Collections.Generic.List[string]]$Hits,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    if ($Hits.Count -ge 80) {
+        return
+    }
+
+    if (Test-ForbiddenPythonPath -PathText $Value) {
+        $Hits.Add("${Kind}: ${Value}")
+    }
+}
+
+function Get-RepoRelativePath {
+    param([Parameter(Mandatory = $true)][string]$FullName)
+
+    if ($FullName.StartsWith($repoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $FullName.Substring($repoRoot.Length).TrimStart("\", "/")
+    }
+    return $FullName
+}
+
+function Scan-ArtifactTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [string[]]$ExcludeTopLevel = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $Root)) {
+        return $false
+    }
+
+    Get-ChildItem -LiteralPath $Root -Force | ForEach-Object {
+        if ($ExcludeTopLevel -contains $_.Name) {
+            return
+        }
+
+        Add-ForbiddenHit -Hits $hits -Kind $Kind -Value (Get-RepoRelativePath -FullName $_.FullName)
+        if ($_.PSIsContainer) {
+            Get-ChildItem -LiteralPath $_.FullName -Recurse -Force | ForEach-Object {
+                Add-ForbiddenHit -Hits $hits -Kind $Kind -Value (Get-RepoRelativePath -FullName $_.FullName)
+            }
+        }
+    }
+
+    return $true
+}
+
+$hits = [System.Collections.Generic.List[string]]::new()
+
+if (-not (Test-Path -LiteralPath $tauriConfigPath)) {
+    throw "Tauri config file was not found: $tauriConfigPath"
+}
+
+Get-Content -LiteralPath $tauriConfigPath | ForEach-Object {
+    Add-ForbiddenHit -Hits $hits -Kind "tauri config" -Value $_
+}
+
+if (-not (Scan-ArtifactTree -Root $bundleRoot -Kind "bundle output")) {
+    Write-Host "Release bundle output was not found; skipping built artifact scan: $bundleRoot"
+}
+
+$releaseExcludes = @(".fingerprint", "build", "deps", "examples", "incremental")
+if (-not (Scan-ArtifactTree -Root $releaseRoot -Kind "release output" -ExcludeTopLevel $releaseExcludes)) {
+    Write-Host "Release output was not found; skipping release root scan: $releaseRoot"
+}
+
+if ($hits.Count -gt 0) {
+    $message = "Python-related resources were found in release packaging output:`n" + ($hits -join "`n")
+    if ($hits.Count -ge 80) {
+        $message += "`n... output truncated after 80 hits ..."
+    }
+    Write-Error $message
+    exit 1
+}
+
+Write-Host "Rust-only packaging check passed: no Python runtime, Flask worker, or Python package resources were found."

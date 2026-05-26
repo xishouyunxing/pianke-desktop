@@ -7,8 +7,10 @@
     "dev": "tauri dev",
     "dev:ui": "vite --host 127.0.0.1 --port 1420",
     "prepare:python": "powershell -ExecutionPolicy Bypass -File scripts/prepare_desktop_python.ps1",
-    "build": "tauri build",
+    "build": "tauri build && npm run check:no-python-bundle",
+    "build:rust": "tauri build && npm run check:no-python-bundle",
     "build:ui": "vue-tsc --noEmit && vite build",
+    "check:no-python-bundle": "powershell -ExecutionPolicy Bypass -File scripts/check_no_python_bundle.ps1",
     "preview": "vite preview --host 127.0.0.1 --port 1420"
   },
   "dependencies": {
