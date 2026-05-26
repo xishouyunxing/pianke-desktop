@@ -175,7 +175,16 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(capabilities["nima_legacy_unavailable"], true);
     assert_eq!(capabilities["formats"]["raw_thumbnail"], true);
     assert_eq!(capabilities["formats"]["raw_strategy"], "embedded_jpeg");
-    assert_eq!(capabilities["formats"]["heic"], false);
+    assert!(capabilities["formats"]["heic"].is_boolean());
+    assert!(matches!(
+        capabilities["formats"]["heic_strategy"].as_str(),
+        Some("windows_wic" | "unavailable")
+    ));
+    if capabilities["formats"]["heic"].as_bool().unwrap_or(false) {
+        assert_eq!(capabilities["formats"]["heic_strategy"], "windows_wic");
+    } else {
+        assert_eq!(capabilities["formats"]["heic_strategy"], "unavailable");
+    }
     assert_eq!(capabilities["expert_capabilities"]["dinov2"], false);
     assert_eq!(
         capabilities["expert_capabilities"]["insightface_detection"],

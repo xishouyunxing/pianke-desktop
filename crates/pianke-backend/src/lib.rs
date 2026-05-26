@@ -31,6 +31,9 @@ use std::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 mod model_components;
 use model_components::{ComponentInstallRequest, ModelManager};
 
@@ -554,11 +557,25 @@ fn format_capabilities() -> Value {
 }
 
 fn heic_decode_available() -> bool {
-    false
+    heic_runtime_available()
 }
 
 fn heic_decode_strategy() -> &'static str {
-    "unavailable"
+    if heic_decode_available() {
+        "windows_wic"
+    } else {
+        "unavailable"
+    }
+}
+
+#[cfg(windows)]
+fn heic_runtime_available() -> bool {
+    windows_heif_decoder_available().unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn heic_runtime_available() -> bool {
+    false
 }
 
 async fn model_components(State(ctx): State<AppCtx>) -> impl IntoResponse {
@@ -1699,8 +1716,7 @@ fn load_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
     let ext = ext_lower(path);
     if RAW_EXTS.contains(&ext.as_str()) {
         let bytes = fs::read(path).map_err(|e| format!("读取 RAW 文件失败: {e}"))?;
-        let jpeg = extract_embedded_jpeg_preview(&bytes)
-            .ok_or_else(|| "纯 RAW 暂未找到可解码的内嵌 JPEG 预览图".to_string())?;
+        let jpeg = extract_embedded_jpeg_preview(&bytes).map_err(|e| e.to_message())?;
         return image::load_from_memory_with_format(jpeg, ImageFormat::Jpeg)
             .map(|img| img.to_rgb8())
             .map_err(|e| format!("RAW 内嵌 JPEG 预览图解码失败: {e}"));
@@ -1727,21 +1743,45 @@ fn load_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
         .map_err(|e| format!("加载失败: {e}"))
 }
 
-fn extract_embedded_jpeg_preview(bytes: &[u8]) -> Option<&[u8]> {
+#[derive(Debug)]
+enum RawPreviewError {
+    NoEmbeddedJpeg,
+    DecodeFailed(String),
+}
+
+impl RawPreviewError {
+    fn to_message(&self) -> String {
+        match self {
+            RawPreviewError::NoEmbeddedJpeg => {
+                "纯 RAW 暂未找到内嵌 JPEG 预览图".to_string()
+            }
+            RawPreviewError::DecodeFailed(e) => {
+                format!("RAW 内嵌 JPEG 预览图解码失败: {e}")
+            }
+        }
+    }
+}
+
+fn extract_embedded_jpeg_preview(bytes: &[u8]) -> Result<&[u8], RawPreviewError> {
     let mut best: Option<&[u8]> = None;
+    let mut saw_jpeg = false;
+    let mut last_decode_error: Option<String> = None;
     let mut i = 0usize;
     while i + 1 < bytes.len() {
         if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 {
+            saw_jpeg = true;
             let start = i;
             let mut j = i + 2;
             while j + 1 < bytes.len() {
                 if bytes[j] == 0xFF && bytes[j + 1] == 0xD9 {
                     let end = j + 2;
                     let candidate = &bytes[start..end];
-                    if image::load_from_memory_with_format(candidate, ImageFormat::Jpeg).is_ok()
-                        && best.map_or(true, |current| candidate.len() > current.len())
-                    {
-                        best = Some(candidate);
+                    match image::load_from_memory_with_format(candidate, ImageFormat::Jpeg) {
+                        Ok(_) if best.map_or(true, |current| candidate.len() > current.len()) => {
+                            best = Some(candidate);
+                        }
+                        Ok(_) => {}
+                        Err(e) => last_decode_error = Some(e.to_string()),
                     }
                     i = end;
                     break;
@@ -1755,11 +1795,151 @@ fn extract_embedded_jpeg_preview(bytes: &[u8]) -> Option<&[u8]> {
         }
         i += 1;
     }
-    best
+    if let Some(best) = best {
+        Ok(best)
+    } else if saw_jpeg {
+        Err(RawPreviewError::DecodeFailed(
+            last_decode_error.unwrap_or_else(|| "未找到可解码的 JPEG 片段".to_string()),
+        ))
+    } else {
+        Err(RawPreviewError::NoEmbeddedJpeg)
+    }
 }
 
-fn load_heic_rgb_image(_path: &Path) -> Result<image::RgbImage, String> {
-    Err("HEIC/HEIF 系统解码能力未启用或当前安装包未包含对应 codec".to_string())
+fn load_heic_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
+    #[cfg(windows)]
+    {
+        return load_heic_rgb_image_wic(path)
+            .map_err(|e| format!("HEIC/HEIF 系统 WIC 解码失败，请确认 Windows HEIF 图像扩展已安装: {e}"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("HEIC/HEIF 解码仅在 Windows WIC 路径下启用，当前平台暂未支持".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn windows_wic_factory() -> Result<
+    windows::Win32::Graphics::Imaging::IWICImagingFactory,
+    windows::core::Error,
+> {
+    use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory2, IWICImagingFactory};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+
+    unsafe {
+        ensure_wic_com_initialized()?;
+        CoCreateInstance::<_, IWICImagingFactory>(
+            &CLSID_WICImagingFactory2,
+            None,
+            CLSCTX_INPROC_SERVER,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn ensure_wic_com_initialized() -> Result<(), windows::core::Error> {
+    use std::cell::Cell;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+    thread_local! {
+        static COM_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    COM_INITIALIZED.with(|initialized| {
+        if initialized.get() {
+            return Ok(());
+        }
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if hr.is_err() && hr.0 as u32 != 0x80010106 {
+                return Err(windows::core::Error::from_hresult(hr));
+            }
+        }
+        initialized.set(true);
+        Ok(())
+    })
+}
+
+#[cfg(windows)]
+fn windows_heif_decoder_available() -> Result<bool, windows::core::Error> {
+    use windows::Win32::Graphics::Imaging::GUID_ContainerFormatHeif;
+
+    let factory = windows_wic_factory()?;
+    unsafe {
+        Ok(factory
+            .CreateDecoder(&GUID_ContainerFormatHeif, std::ptr::null())
+            .is_ok())
+    }
+}
+
+#[cfg(windows)]
+fn load_heic_rgb_image_wic(path: &Path) -> Result<image::RgbImage, String> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::Foundation::GENERIC_READ;
+    use windows::Win32::Graphics::Imaging::{
+        GUID_WICPixelFormat24bppRGB, IWICBitmapSource, WICBitmapDitherTypeNone,
+        WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnLoad,
+    };
+
+    let factory = windows_wic_factory().map_err(|e| format!("初始化 WIC 失败: {e}"))?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    unsafe {
+        let decoder = factory
+            .CreateDecoderFromFilename(
+                PCWSTR(wide.as_ptr()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnLoad,
+            )
+            .map_err(|e| format!("打开 HEIC/HEIF 文件失败: {e}"))?;
+        let frame = decoder
+            .GetFrame(0)
+            .map_err(|e| format!("读取 HEIC/HEIF 第一帧失败: {e}"))?;
+        let converter = factory
+            .CreateFormatConverter()
+            .map_err(|e| format!("创建 WIC 像素格式转换器失败: {e}"))?;
+        converter
+            .Initialize(
+                &frame,
+                &GUID_WICPixelFormat24bppRGB,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .map_err(|e| format!("转换 HEIC/HEIF 到 RGB 失败: {e}"))?;
+
+        let source: IWICBitmapSource = converter
+            .cast()
+            .map_err(|e| format!("读取 WIC RGB 图像失败: {e}"))?;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        source
+            .GetSize(&mut width, &mut height)
+            .map_err(|e| format!("读取 HEIC/HEIF 尺寸失败: {e}"))?;
+        if width == 0 || height == 0 {
+            return Err("HEIC/HEIF 图像尺寸为空".to_string());
+        }
+        let stride = width
+            .checked_mul(3)
+            .ok_or_else(|| "HEIC/HEIF 图像宽度过大".to_string())?;
+        let len = stride
+            .checked_mul(height)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| "HEIC/HEIF 图像尺寸过大".to_string())?;
+        let mut buffer = vec![0u8; len];
+        source
+            .CopyPixels(std::ptr::null(), stride, &mut buffer)
+            .map_err(|e| format!("复制 HEIC/HEIF 像素失败: {e}"))?;
+        image::RgbImage::from_raw(width, height, buffer)
+            .ok_or_else(|| "HEIC/HEIF RGB 缓冲区尺寸不匹配".to_string())
+    }
 }
 
 fn read_exif_orientation(path: &Path) -> Option<u16> {
@@ -4820,6 +5000,31 @@ mod tests {
     }
 
     #[test]
+    fn raw_embedded_jpeg_preview_classifies_failures() {
+        let missing = extract_embedded_jpeg_preview(b"fake raw without preview")
+            .expect_err("missing embedded jpeg should fail");
+        assert!(matches!(missing, RawPreviewError::NoEmbeddedJpeg));
+        assert!(missing.to_message().contains("RAW"));
+
+        let broken = extract_embedded_jpeg_preview(b"raw\xff\xd8not a jpeg\xff\xd9tail")
+            .expect_err("broken embedded jpeg should fail");
+        assert!(matches!(broken, RawPreviewError::DecodeFailed(_)));
+        assert!(broken.to_message().contains("RAW"));
+
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([4, 8, 16])))
+            .write_to(&mut cursor, ImageFormat::Jpeg)
+            .expect("encode embedded jpeg");
+        let jpeg = cursor.into_inner();
+        let mut raw = b"raw header".to_vec();
+        raw.extend_from_slice(&jpeg);
+        raw.extend_from_slice(b"raw trailer");
+        let extracted =
+            extract_embedded_jpeg_preview(&raw).expect("valid embedded jpeg should be found");
+        assert_eq!(extracted, jpeg.as_slice());
+    }
+
+    #[test]
     fn unique_target_suffixes_existing_names() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("a.jpg"), b"x").expect("write existing");
@@ -5002,9 +5207,17 @@ mod tests {
             }
             let record = process_one(pair, "standard");
             match image.format_kind.as_deref() {
+                Some("heic") if heic_decode_available() => assert!(
+                    record.is_ok(),
+                    "HEIC fixture should decode when WIC HEIF capability is enabled: {}",
+                    path.display()
+                ),
                 Some("heic") => assert!(
-                    record.is_err() || heic_decode_available(),
-                    "HEIC fixture should either decode when capability is enabled or report a clear skip"
+                    record
+                        .as_ref()
+                        .err()
+                        .is_some_and(|reason| reason.contains("HEIC/HEIF")),
+                    "HEIC fixture should report a clear skip when capability is unavailable"
                 ),
                 Some("raw") => {
                     assert!(
