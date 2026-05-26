@@ -408,6 +408,82 @@ fn frontend_compat_endpoints_keep_expected_shape() {
 }
 
 #[test]
+fn job_log_endpoint_lists_and_reads_session_logs() {
+    let token = "job-log-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let a = photos.path().join("LOG_0001.jpg");
+    let b = photos.path().join("LOG_0002.jpg");
+    write_jpg(&a, 51);
+    fs::copy(&a, &b).expect("copy identical jpg");
+
+    let client = Client::new();
+    let no_session = client
+        .get(format!("{base}/api/job_log"))
+        .header("X-Token", token)
+        .send()
+        .expect("job log no session response");
+    assert_eq!(no_session.status(), 400);
+
+    client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "dry_run": true,
+            "mode": "copy",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start response");
+    wait_for_done(&client, &base, token);
+
+    let empty_logs: Value = client
+        .get(format!("{base}/api/job_log"))
+        .header("X-Token", token)
+        .send()
+        .expect("empty job log response")
+        .json()
+        .expect("empty job log json");
+    assert_eq!(empty_logs["logs"], json!([]));
+
+    let jobs_dir = photos.path().join("_pic_selecter").join("jobs");
+    fs::create_dir_all(&jobs_dir).expect("create jobs dir");
+    fs::write(jobs_dir.join("20260526-fast.log"), "hello job log\n").expect("write job log");
+    fs::write(jobs_dir.join("not-log.txt"), "ignored").expect("write ignored log");
+
+    let logs: Value = client
+        .get(format!("{base}/api/job_log"))
+        .header("X-Token", token)
+        .send()
+        .expect("job log list response")
+        .json()
+        .expect("job log list json");
+    let list = logs["logs"].as_array().expect("logs list");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "20260526-fast.log");
+    assert_eq!(list[0]["size"], 14);
+    assert!(list[0]["mtime"].as_f64().unwrap_or_default() > 0.0);
+
+    let content = client
+        .get(format!("{base}/api/job_log?name=20260526-fast.log"))
+        .header("X-Token", token)
+        .send()
+        .expect("job log read response")
+        .text()
+        .expect("job log text");
+    assert_eq!(content, "hello job log\n");
+
+    let bad_name = client
+        .get(format!("{base}/api/job_log?name=../secret.log"))
+        .header("X-Token", token)
+        .send()
+        .expect("bad job log name response");
+    assert_eq!(bad_name.status(), 400);
+}
+
+#[test]
 fn unsupported_raw_and_heic_are_reported_as_skipped() {
     let token = "unsupported-formats-token";
     let (_backend, _handle, base) = start_test_backend(token);

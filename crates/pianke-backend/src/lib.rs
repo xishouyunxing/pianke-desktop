@@ -435,7 +435,7 @@ fn build_router(ctx: AppCtx) -> Router {
         .route("/api/preview_groups", get(preview_groups))
         .route("/api/peek_folder", post(peek_folder))
         .route("/api/open_folder", post(open_folder))
-        .route("/api/browse_folder", post(unavailable))
+        .route("/api/browse_folder", post(browse_folder))
         .route(
             "/api/ark_key",
             get(ark_key_status)
@@ -443,7 +443,7 @@ fn build_router(ctx: AppCtx) -> Router {
                 .delete(ark_key_clear),
         )
         .route("/api/llm_models", get(llm_models))
-        .route("/api/job_log", get(unavailable))
+        .route("/api/job_log", get(job_log))
         .route("/api/llm_concurrency", get(llm_concurrency))
         .route("/api/watermark/templates", get(watermark_templates))
         .route("/api/watermark/preview", post(watermark_preview))
@@ -674,6 +674,95 @@ async fn llm_concurrency(State(ctx): State<AppCtx>) -> impl IntoResponse {
     Json(json!({"limit": limit}))
 }
 
+#[derive(Debug, Deserialize)]
+struct JobLogQuery {
+    name: Option<String>,
+}
+
+async fn job_log(State(ctx): State<AppCtx>, Query(q): Query<JobLogQuery>) -> Response {
+    let folder = {
+        let state = ctx.inner.lock().expect("backend state lock");
+        state.session.as_ref().map(|s| s.folder.clone())
+    };
+    let Some(folder) = folder else {
+        return json_error(StatusCode::BAD_REQUEST, "no session");
+    };
+
+    let jobs_dir = Path::new(&folder).join(PIC_DIR).join("jobs");
+    if let Some(name) = q.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || !name.ends_with(".log")
+        {
+            return json_error(StatusCode::BAD_REQUEST, "非法文件名");
+        }
+        let target = jobs_dir.join(name);
+        if !target.exists() {
+            return json_error(StatusCode::NOT_FOUND, "文件不存在");
+        }
+        match fs::read_to_string(&target) {
+            Ok(content) => {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    content,
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("读取日志失败: {err}"),
+                );
+            }
+        }
+    }
+
+    if !jobs_dir.exists() {
+        return Json(json!({"logs": []})).into_response();
+    }
+
+    let mut logs = match fs::read_dir(&jobs_dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("log") {
+                    return None;
+                }
+                let meta = entry.metadata().ok()?;
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                Some(json!({
+                    "name": entry.file_name().to_string_lossy(),
+                    "size": meta.len(),
+                    "mtime": mtime,
+                }))
+            })
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("读取日志目录失败: {err}"),
+            );
+        }
+    };
+
+    logs.sort_by(|a, b| {
+        b["mtime"]
+            .as_f64()
+            .partial_cmp(&a["mtime"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    logs.truncate(50);
+    Json(json!({"logs": logs})).into_response()
+}
+
 async fn watermark_templates(State(ctx): State<AppCtx>) -> impl IntoResponse {
     Json(json!({
         "templates": watermark::list_templates(),
@@ -826,11 +915,25 @@ async fn watermark_open_out_dir(State(ctx): State<AppCtx>) -> impl IntoResponse 
     }
 }
 
-async fn unavailable() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"error": "Rust Fast 后端暂不支持该功能", "unavailable": true})),
-    )
+async fn browse_folder() -> impl IntoResponse {
+    match tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("选择照片文件夹")
+            .pick_folder()
+    })
+    .await
+    {
+        Ok(Some(path)) => Json(json!({
+            "ok": true,
+            "folder": path.to_string_lossy(),
+        }))
+        .into_response(),
+        Ok(None) => Json(json!({"ok": true, "cancelled": true})).into_response(),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("打开选择对话框失败: {err}"),
+        ),
+    }
 }
 
 async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> Response {
@@ -1758,9 +1861,7 @@ enum RawPreviewError {
 impl RawPreviewError {
     fn to_message(&self) -> String {
         match self {
-            RawPreviewError::NoEmbeddedJpeg => {
-                "纯 RAW 暂未找到内嵌 JPEG 预览图".to_string()
-            }
+            RawPreviewError::NoEmbeddedJpeg => "纯 RAW 暂未找到内嵌 JPEG 预览图".to_string(),
             RawPreviewError::DecodeFailed(e) => {
                 format!("RAW 内嵌 JPEG 预览图解码失败: {e}")
             }
@@ -1815,8 +1916,9 @@ fn extract_embedded_jpeg_preview(bytes: &[u8]) -> Result<&[u8], RawPreviewError>
 fn load_heic_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
     #[cfg(windows)]
     {
-        return load_heic_rgb_image_wic(path)
-            .map_err(|e| format!("HEIC/HEIF 系统 WIC 解码失败，请确认 Windows HEIF 图像扩展已安装: {e}"));
+        return load_heic_rgb_image_wic(path).map_err(|e| {
+            format!("HEIC/HEIF 系统 WIC 解码失败，请确认 Windows HEIF 图像扩展已安装: {e}")
+        });
     }
     #[cfg(not(windows))]
     {
@@ -1826,10 +1928,8 @@ fn load_heic_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
 }
 
 #[cfg(windows)]
-fn windows_wic_factory() -> Result<
-    windows::Win32::Graphics::Imaging::IWICImagingFactory,
-    windows::core::Error,
-> {
+fn windows_wic_factory(
+) -> Result<windows::Win32::Graphics::Imaging::IWICImagingFactory, windows::core::Error> {
     use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory2, IWICImagingFactory};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
@@ -5231,7 +5331,11 @@ mod tests {
                         "RAW fixture should be queued for embedded-preview analysis when no JPG companion exists"
                     );
                 }
-                _ => assert!(record.is_ok(), "image fixture should process: {}", path.display()),
+                _ => assert!(
+                    record.is_ok(),
+                    "image fixture should process: {}",
+                    path.display()
+                ),
             }
             checked += 1;
         }

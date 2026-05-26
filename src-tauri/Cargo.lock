@@ -3521,6 +3521,7 @@ dependencies = [
  "ort",
  "pianke-core",
  "reqwest 0.12.28",
+ "rfd",
  "rustfft",
  "serde",
  "serde_json",
