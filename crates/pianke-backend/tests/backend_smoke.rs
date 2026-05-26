@@ -68,7 +68,16 @@ fn write_jpg(path: &Path, seed: u8) {
 }
 
 fn wait_for_done(client: &Client, base: &str, token: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_done_with_timeout(client, base, token, Duration::from_secs(10))
+}
+
+fn wait_for_done_with_timeout(
+    client: &Client,
+    base: &str,
+    token: &str,
+    timeout: Duration,
+) -> Value {
+    let deadline = Instant::now() + timeout;
     loop {
         let job: Value = client
             .get(format!("{base}/api/job"))
@@ -120,6 +129,106 @@ fn start_test_backend(token: &str) -> (tempfile::TempDir, pianke_backend::Server
     .expect("start backend");
     let base = format!("http://127.0.0.1:{port}");
     (backend, handle, base)
+}
+
+fn start_test_backend_in(
+    backend: tempfile::TempDir,
+    token: &str,
+) -> (tempfile::TempDir, pianke_backend::ServerHandle, String) {
+    fs::create_dir_all(backend.path().join("static")).expect("static dir");
+    fs::write(
+        backend.path().join("static").join("index.html"),
+        "<!doctype html><meta charset='utf-8'><title>test</title>",
+    )
+    .expect("write index");
+    let port = reserve_port();
+    let handle = start(ServerOptions {
+        port,
+        token: Some(token.to_string()),
+        backend_dir: backend.path().to_path_buf(),
+    })
+    .expect("start backend");
+    let base = format!("http://127.0.0.1:{port}");
+    (backend, handle, base)
+}
+
+fn materialize_component_for_test(source: &Path, backend: &Path) -> PathBuf {
+    let target = backend.join("model_components").join("expert");
+    if target.exists() {
+        fs::remove_dir_all(&target).expect("remove old test component");
+    }
+    materialize_tree(source, &target);
+    fs::write(
+        target.join("component.json"),
+        r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small","insightface-det_10g","insightface-w600k_r50","insightface-1k3d68"],"checksum_status":"verified"}"#,
+    )
+    .expect("write test expert manifest");
+    target
+}
+
+fn materialize_tree(source: &Path, target: &Path) {
+    fs::create_dir_all(target).expect("create component target");
+    for entry in fs::read_dir(source).expect("read component source") {
+        let entry = entry.expect("component source entry");
+        let src = entry.path();
+        let dst = target.join(entry.file_name());
+        if src.is_dir() {
+            materialize_tree(&src, &dst);
+        } else {
+            if fs::hard_link(&src, &dst).is_err() {
+                fs::copy(&src, &dst).expect("copy component file");
+            }
+        }
+    }
+}
+
+fn tycoon_e2e_photo_dir() -> Option<PathBuf> {
+    if std::env::var("PIANKE_TYCOON_E2E").ok().as_deref() != Some("1") {
+        return None;
+    }
+    if let Ok(dir) = std::env::var("PIANKE_TYCOON_E2E_PHOTO_DIR") {
+        let path = PathBuf::from(dir);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let path = workspace
+        .join(".tmp_expert_parity")
+        .join("private_photos")
+        .join("cos");
+    path.is_dir().then_some(path)
+}
+
+fn copy_e2e_photos(source_dir: &Path, target_dir: &Path, limit: usize) -> usize {
+    let entries = fs::read_dir(source_dir)
+        .expect("read e2e photo dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+    if limit == 2 && !entries.is_empty() {
+        fs::copy(&entries[0], target_dir.join("TYCOON_E2E_0001.jpg"))
+            .expect("copy first e2e photo");
+        fs::copy(&entries[0], target_dir.join("TYCOON_E2E_0002.jpg"))
+            .expect("copy duplicated e2e photo");
+        return 2;
+    }
+    let mut copied = 0;
+    for (idx, src) in entries.into_iter().enumerate() {
+        let name = format!("TYCOON_E2E_{:04}.jpg", idx + 1);
+        fs::copy(&src, target_dir.join(name)).expect("copy e2e photo");
+        copied += 1;
+    }
+    copied
 }
 
 #[test]
@@ -632,7 +741,10 @@ fn installed_model_manifest_updates_capabilities() {
         .expect("capabilities response")
         .json()
         .expect("capabilities json");
-    assert_eq!(capabilities["expert_installed"], true);
+    assert_eq!(
+        capabilities["expert_installed"], true,
+        "expected materialized Expert component to be installed: {capabilities}"
+    );
     assert_eq!(capabilities["face_aware"], false);
     assert_eq!(capabilities["quality_models"], false);
     assert_eq!(capabilities["expert_capabilities"]["dinov2"], true);
@@ -647,6 +759,154 @@ fn installed_model_manifest_updates_capabilities() {
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
     assert_eq!(capabilities["engines"], json!(["expert", "fast", "tycoon"]));
+}
+
+#[test]
+fn tycoon_mock_e2e_runs_with_complete_expert_component_when_configured() {
+    let Some(photo_dir) = tycoon_e2e_photo_dir() else {
+        return;
+    };
+    let Ok(component_dir) = std::env::var("PIANKE_EXPERT_COMPONENT_DIR") else {
+        return;
+    };
+    let component_dir = PathBuf::from(component_dir);
+    if !component_dir.join("component.json").exists()
+        || !component_dir
+            .join("models")
+            .join("dinov2-small.onnx")
+            .exists()
+        || !component_dir
+            .join("models")
+            .join("insightface")
+            .join("det_10g.onnx")
+            .exists()
+        || !component_dir
+            .join("models")
+            .join("insightface")
+            .join("w600k_r50.onnx")
+            .exists()
+        || !component_dir
+            .join("models")
+            .join("insightface")
+            .join("1k3d68.onnx")
+            .exists()
+    {
+        return;
+    }
+
+    let token = "tycoon-e2e-token";
+    let backend = backend_dir();
+    materialize_component_for_test(&component_dir, backend.path());
+    let (_backend, _handle, base) = start_test_backend_in(backend, token);
+    let photos = tempfile::tempdir().expect("tycoon e2e photos dir");
+    let copied = copy_e2e_photos(&photo_dir, photos.path(), 2);
+    if copied == 0 {
+        return;
+    }
+
+    let llm_base = start_mock_llm_server(
+        r#"{"choices":[{"message":{"content":"{\"verdict\":\"pass\",\"reason\":\"mock ok\",\"flaws\":\"none\",\"fixable\":\"none\"}"}}]}"#,
+    );
+    let client = Client::new();
+    let save_provider: Value = client
+        .post(format!("{base}/api/llm/provider"))
+        .header("X-Token", token)
+        .json(&json!({
+            "protocol": "openai_chat_completions",
+            "base_url": llm_base,
+            "api_key": "mock-key",
+            "model": "mock-vision",
+            "display_name": "Mock Vision",
+            "timeout_seconds": 30
+        }))
+        .send()
+        .expect("save mock provider response")
+        .json()
+        .expect("save mock provider json");
+    assert_eq!(save_provider["configured"], true);
+
+    let capabilities: Value = client
+        .get(format!("{base}/api/capabilities"))
+        .header("X-Token", token)
+        .send()
+        .expect("capabilities response")
+        .json()
+        .expect("capabilities json");
+    assert_eq!(
+        capabilities["expert_installed"], true,
+        "expected materialized Expert component to be installed: {capabilities}"
+    );
+    assert_eq!(
+        capabilities["expert_capabilities"]["dinov2"], true,
+        "expected DINOv2 capability: {capabilities}"
+    );
+    assert_eq!(
+        capabilities["expert_capabilities"]["insightface_detection"], true,
+        "expected InsightFace detection capability: {capabilities}"
+    );
+    assert_eq!(
+        capabilities["expert_capabilities"]["insightface_recognition"], true,
+        "expected InsightFace recognition capability: {capabilities}"
+    );
+    assert_eq!(
+        capabilities["expert_capabilities"]["insightface_landmark"], true,
+        "expected InsightFace landmark capability: {capabilities}"
+    );
+    assert_eq!(
+        capabilities["tycoon_ready"], true,
+        "expected Tycoon provider readiness: {capabilities}"
+    );
+
+    let start_resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "tycoon",
+            "llm_model": "mock-vision",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("tycoon start response");
+    assert!(start_resp.status().is_success());
+
+    let job = wait_for_done_with_timeout(&client, &base, token, Duration::from_secs(120));
+    assert_eq!(job["engine"], "tycoon");
+    let events = job["events"].as_array().expect("job events");
+    assert!(
+        events.iter().any(|event| {
+            event["signals"].as_array().is_some_and(|signals| {
+                signals.iter().any(|signal| {
+                    signal["kind"] == "llm" && signal["value"].as_str() == Some("pass")
+                })
+            }) && event["reason"].as_str() == Some("mock ok")
+        }),
+        "expected Tycoon job event with LLM verdict and reason: {job}"
+    );
+
+    let group: Value = client
+        .get(format!("{base}/api/group"))
+        .header("X-Token", token)
+        .send()
+        .expect("tycoon group response")
+        .json()
+        .expect("tycoon group json");
+    assert_eq!(group["done"], false, "expected Tycoon group: {group}");
+    for side in ["left_meta", "right_meta"] {
+        if group["group"][side].is_object() {
+            assert_eq!(group["group"][side]["llm_verdict"], "pass");
+            assert_eq!(group["group"][side]["llm_reason"], "mock ok");
+            assert_eq!(group["group"][side]["dinov2_dim"], 384);
+            assert!(
+                group["group"][side]["face_embedding_count"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    >= 1,
+                "expected face embeddings in {side}: {group}"
+            );
+        }
+    }
 }
 
 #[test]
