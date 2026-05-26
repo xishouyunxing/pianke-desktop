@@ -1123,8 +1123,24 @@ fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
         .expect("templates response")
         .json()
         .expect("templates json");
-    assert!(templates["templates"].as_array().expect("templates").len() >= 1);
+    let template_list = templates["templates"].as_array().expect("templates");
+    assert!(template_list.len() >= 1);
+    let first_template = template_list.first().expect("first template");
+    for key in ["id", "name", "desc"] {
+        assert!(
+            first_template.get(key).and_then(|v| v.as_str()).is_some(),
+            "missing template field {key}: {templates}"
+        );
+    }
     assert!(templates["logos"].as_array().expect("logos").is_empty());
+
+    let idle_cancel = client
+        .post(format!("{base}/api/watermark/cancel"))
+        .header("X-Token", token)
+        .json(&json!({}))
+        .send()
+        .expect("idle cancel response");
+    assert_eq!(idle_cancel.status(), 400);
 
     let start_resp = client
         .post(format!("{base}/api/start"))
@@ -1148,6 +1164,10 @@ fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
         .json()
         .expect("group json");
     assert_eq!(group_resp["done"], false, "expected comparable group");
+    let left = group_resp["group"]["left"]
+        .as_str()
+        .expect("left path")
+        .to_string();
 
     let choose_resp = client
         .post(format!("{base}/api/choose"))
@@ -1166,6 +1186,9 @@ fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
         .json()
         .expect("preview json");
     assert!(preview["image_b64"].as_str().expect("preview b64").len() > 100);
+    assert!(preview["size_kb"].as_f64().expect("preview size") > 0.0);
+    assert_eq!(preview["preview_index"], 0);
+    assert_eq!(preview["source_name"], file_name(&left));
     assert_eq!(preview["total_winners"], 1);
     assert!(preview["exif"].is_object());
 
@@ -1179,10 +1202,20 @@ fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
         .expect("watermark start json");
     assert_eq!(export["ok"], true);
     assert_eq!(export["total"], 1);
+    assert!(PathBuf::from(export["out_dir"].as_str().expect("export out dir")).exists());
 
     let status = wait_for_watermark_done(&client, &base, token);
+    assert_eq!(status["status"], "done");
+    assert_eq!(status["done"], 1);
+    assert_eq!(status["total"], 1);
     assert_eq!(status["ok"], 1);
     assert_eq!(status["failed_count"], 0);
+    assert!(status["failed"].as_array().expect("failed list").is_empty());
+    assert!(status["failed_sample"]
+        .as_array()
+        .expect("failed sample")
+        .is_empty());
+    assert!(status["elapsed"].as_f64().expect("elapsed") >= 0.0);
     let out_dir = PathBuf::from(status["out_dir"].as_str().expect("out dir"));
     assert!(out_dir.exists(), "watermark output dir exists");
     assert!(
@@ -1192,6 +1225,18 @@ fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
             .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jpg")),
         "watermark output jpg exists"
     );
+
+    if std::env::var("PIANKE_WATERMARK_OPEN_OUT_DIR_SMOKE").ok().as_deref() == Some("1") {
+        let open_out_dir: Value = client
+            .post(format!("{base}/api/watermark/open_out_dir"))
+            .header("X-Token", token)
+            .json(&json!({}))
+            .send()
+            .expect("open out dir response")
+            .json()
+            .expect("open out dir json");
+        assert_eq!(open_out_dir["ok"], true);
+    }
 }
 
 #[test]
