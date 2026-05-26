@@ -11,6 +11,7 @@
     "build:rust": "tauri build && npm run check:no-python-bundle",
     "build:ui": "vue-tsc --noEmit && vite build",
     "check:no-python-bundle": "powershell -ExecutionPolicy Bypass -File scripts/check_no_python_bundle.ps1",
+    "smoke:release-rust": "powershell -ExecutionPolicy Bypass -File scripts/smoke_release_rust_backend.ps1",
     "preview": "vite preview --host 127.0.0.1 --port 1420"
   },
   "dependencies": {
