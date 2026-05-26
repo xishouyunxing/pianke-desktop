@@ -51,7 +51,7 @@ const RAW_EXTS: &[&str] = &[
     ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".dng", ".raf", ".orf", ".rw2",
     ".pef", ".rwl", ".srw", ".x3f",
 ];
-const UNSUPPORTED_IMAGE_EXTS: &[&str] = &[".heic", ".heif"];
+const HEIC_EXTS: &[&str] = &[".heic", ".heif"];
 const SIDECAR_EXTS: &[&str] = &[".xmp"];
 
 #[derive(Debug)]
@@ -531,6 +531,7 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "expert_capabilities": expert_caps,
         "quality_models": quality_models,
         "nima_legacy_unavailable": true,
+        "formats": format_capabilities(),
         "tycoon_ready": tycoon_ready,
         "model_components": ctx.models.status_map(),
         "llm_provider": {
@@ -541,6 +542,23 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "install_mode": "base",
         "python_required": false
     }))
+}
+
+fn format_capabilities() -> Value {
+    json!({
+        "raw_thumbnail": true,
+        "raw_strategy": "embedded_jpeg",
+        "heic": heic_decode_available(),
+        "heic_strategy": heic_decode_strategy(),
+    })
+}
+
+fn heic_decode_available() -> bool {
+    false
+}
+
+fn heic_decode_strategy() -> &'static str {
+    "unavailable"
 }
 
 async fn model_components(State(ctx): State<AppCtx>) -> impl IntoResponse {
@@ -1243,9 +1261,9 @@ fn scan_folder(folder: &Path) -> Vec<ScanPair> {
             .filter(|p| IMAGE_EXTS.contains(&ext_lower(p).as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        let unsupported = files
+        let heics = files
             .iter()
-            .filter(|p| UNSUPPORTED_IMAGE_EXTS.contains(&ext_lower(p).as_str()))
+            .filter(|p| HEIC_EXTS.contains(&ext_lower(p).as_str()))
             .cloned()
             .collect::<Vec<_>>();
         let sidecars = files
@@ -1262,9 +1280,9 @@ fn scan_folder(folder: &Path) -> Vec<ScanPair> {
                 .cloned()
                 .collect::<Vec<_>>();
             out.push(ScanPair {
-                primary,
+                primary: primary.clone(),
                 companions,
-                analysis: images.first().cloned(),
+                analysis: images.first().cloned().or(Some(primary)),
             });
         } else if let Some(primary) = images.first().cloned() {
             out.push(ScanPair {
@@ -1277,11 +1295,16 @@ fn scan_folder(folder: &Path) -> Vec<ScanPair> {
                     .collect(),
                 analysis: Some(primary),
             });
-        } else if let Some(primary) = unsupported.first().cloned() {
+        } else if let Some(primary) = heics.first().cloned() {
             out.push(ScanPair {
-                primary,
-                companions: Vec::new(),
-                analysis: None,
+                primary: primary.clone(),
+                companions: heics
+                    .iter()
+                    .skip(1)
+                    .chain(sidecars.iter())
+                    .cloned()
+                    .collect(),
+                analysis: Some(primary),
             });
         }
     }
@@ -1306,7 +1329,7 @@ fn scan_dir(root: &Path, dir: &Path, groups: &mut HashMap<(PathBuf, String), Vec
         let ext = ext_lower(&path);
         if !IMAGE_EXTS.contains(&ext.as_str())
             && !RAW_EXTS.contains(&ext.as_str())
-            && !UNSUPPORTED_IMAGE_EXTS.contains(&ext.as_str())
+            && !HEIC_EXTS.contains(&ext.as_str())
             && !SIDECAR_EXTS.contains(&ext.as_str())
         {
             continue;
@@ -1565,9 +1588,9 @@ fn apply_face_quality_flags(quality: &mut QualityInfo) {
 fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     let analysis = pair.analysis.as_ref().ok_or_else(|| {
         if RAW_EXTS.contains(&ext_lower(&pair.primary).as_str()) {
-            "纯 RAW 暂未在 Rust Fast 后端启用，请保留同名 JPG".to_string()
+            "RAW without same-stem JPG could not be queued for analysis".to_string()
         } else {
-            "HEIC/HEIF 暂未在 Rust Fast 后端启用".to_string()
+            "HEIC/HEIF could not be queued for analysis".to_string()
         }
     })?;
     let img = load_fast_analysis_image(analysis)?;
@@ -1673,6 +1696,18 @@ fn load_fast_analysis_image(path: &Path) -> Result<DynamicImage, String> {
 }
 
 fn load_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
+    let ext = ext_lower(path);
+    if RAW_EXTS.contains(&ext.as_str()) {
+        let bytes = fs::read(path).map_err(|e| format!("读取 RAW 文件失败: {e}"))?;
+        let jpeg = extract_embedded_jpeg_preview(&bytes)
+            .ok_or_else(|| "纯 RAW 暂未找到可解码的内嵌 JPEG 预览图".to_string())?;
+        return image::load_from_memory_with_format(jpeg, ImageFormat::Jpeg)
+            .map(|img| img.to_rgb8())
+            .map_err(|e| format!("RAW 内嵌 JPEG 预览图解码失败: {e}"));
+    }
+    if HEIC_EXTS.contains(&ext.as_str()) {
+        return load_heic_rgb_image(path);
+    }
     #[cfg(feature = "opencv-orb")]
     {
         if path
@@ -1690,6 +1725,41 @@ fn load_rgb_image(path: &Path) -> Result<image::RgbImage, String> {
     image::open(path)
         .map(|img| img.to_rgb8())
         .map_err(|e| format!("加载失败: {e}"))
+}
+
+fn extract_embedded_jpeg_preview(bytes: &[u8]) -> Option<&[u8]> {
+    let mut best: Option<&[u8]> = None;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 {
+            let start = i;
+            let mut j = i + 2;
+            while j + 1 < bytes.len() {
+                if bytes[j] == 0xFF && bytes[j + 1] == 0xD9 {
+                    let end = j + 2;
+                    let candidate = &bytes[start..end];
+                    if image::load_from_memory_with_format(candidate, ImageFormat::Jpeg).is_ok()
+                        && best.map_or(true, |current| candidate.len() > current.len())
+                    {
+                        best = Some(candidate);
+                    }
+                    i = end;
+                    break;
+                }
+                j += 1;
+            }
+            if j + 1 >= bytes.len() {
+                break;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    best
+}
+
+fn load_heic_rgb_image(_path: &Path) -> Result<image::RgbImage, String> {
+    Err("HEIC/HEIF 系统解码能力未启用或当前安装包未包含对应 codec".to_string())
 }
 
 fn read_exif_orientation(path: &Path) -> Option<u16> {
@@ -4665,6 +4735,22 @@ fn ext_lower(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+fn format_kind_for_path(path: &Path) -> &'static str {
+    let ext = ext_lower(path);
+    if RAW_EXTS.contains(&ext.as_str()) {
+        "raw"
+    } else if HEIC_EXTS.contains(&ext.as_str()) {
+        "heic"
+    } else if IMAGE_EXTS.contains(&ext.as_str()) {
+        "image"
+    } else if SIDECAR_EXTS.contains(&ext.as_str()) {
+        "sidecar"
+    } else {
+        "other"
+    }
+}
+
 fn file_name(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -4785,6 +4871,183 @@ mod tests {
         a.face_embeddings.clear();
         b.face_embeddings.clear();
         assert!(expert_pair_similarity(&a, &b) > 0.5);
+    }
+
+    #[test]
+    fn fast_format_fixture_matches_when_configured() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            #[serde(default)]
+            source_folder: Option<String>,
+            #[serde(default)]
+            images: Vec<FixtureImage>,
+            #[serde(default)]
+            skipped: Vec<FixtureSkipped>,
+        }
+
+        #[derive(Deserialize)]
+        struct FixtureImage {
+            path: String,
+            #[serde(default)]
+            format_kind: Option<String>,
+            #[serde(default)]
+            companions: Vec<String>,
+            #[serde(default)]
+            companion_kinds: Vec<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct FixtureSkipped {
+            path: String,
+            #[serde(default)]
+            format_kind: Option<String>,
+        }
+
+        fn resolve_fixture_path(
+            workspace: &Path,
+            fixture_dir: &Path,
+            source_folder: Option<&str>,
+            path: &str,
+        ) -> PathBuf {
+            let raw = PathBuf::from(path);
+            if raw.is_absolute() {
+                return raw;
+            }
+            let workspace_path = workspace.join(&raw);
+            if workspace_path.exists() {
+                return workspace_path;
+            }
+            if let Some(source_folder) = source_folder {
+                let source = PathBuf::from(source_folder);
+                let source = if source.is_absolute() {
+                    source
+                } else {
+                    workspace.join(source)
+                };
+                let source_path = source.join(&raw);
+                if source_path.exists() {
+                    return source_path;
+                }
+            }
+            fixture_dir.join(raw)
+        }
+
+        fn path_key(path: &Path) -> String {
+            path.to_string_lossy().replace('\\', "/").to_lowercase()
+        }
+
+        let Ok(fixture_path) = std::env::var("PIANKE_FAST_FORMAT_FIXTURE") else {
+            return;
+        };
+        let fixture_path = PathBuf::from(fixture_path);
+        if !fixture_path.exists() {
+            return;
+        }
+        let text = fs::read_to_string(&fixture_path).expect("read fast format fixture");
+        let fixture: Fixture = serde_json::from_str(&text).expect("parse fast format fixture");
+        if fixture.images.is_empty() && fixture.skipped.is_empty() {
+            return;
+        }
+
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let fixture_dir = fixture_path.parent().unwrap_or(Path::new("."));
+        let source_folder = fixture
+            .source_folder
+            .as_deref()
+            .map(|folder| resolve_fixture_path(&workspace, fixture_dir, None, folder))
+            .unwrap_or_else(|| fixture_dir.to_path_buf());
+        if !source_folder.exists() {
+            return;
+        }
+
+        let pairs = scan_folder(&source_folder);
+        let pair_by_primary = pairs
+            .iter()
+            .map(|pair| (path_key(&pair.primary), pair))
+            .collect::<HashMap<_, _>>();
+
+        let mut checked = 0usize;
+        for image in fixture.images {
+            let path = resolve_fixture_path(
+                &workspace,
+                fixture_dir,
+                fixture.source_folder.as_deref(),
+                &image.path,
+            );
+            let Some(pair) = pair_by_primary.get(&path_key(&path)) else {
+                continue;
+            };
+            let companion_kinds = pair
+                .companions
+                .iter()
+                .map(|p| format_kind_for_path(p).to_string())
+                .collect::<Vec<_>>();
+            if !image.companion_kinds.is_empty() {
+                assert_eq!(
+                    companion_kinds,
+                    image.companion_kinds,
+                    "companion kind mismatch for {}",
+                    path.display()
+                );
+            }
+            if !image.companions.is_empty() {
+                assert_eq!(
+                    pair.companions.len(),
+                    image.companions.len(),
+                    "companion count mismatch for {}",
+                    path.display()
+                );
+            }
+            let record = process_one(pair, "standard");
+            match image.format_kind.as_deref() {
+                Some("heic") => assert!(
+                    record.is_err() || heic_decode_available(),
+                    "HEIC fixture should either decode when capability is enabled or report a clear skip"
+                ),
+                Some("raw") => {
+                    assert!(
+                        record.is_ok() || pair.analysis.as_ref() == Some(&pair.primary),
+                        "RAW fixture should be queued for embedded-preview analysis when no JPG companion exists"
+                    );
+                }
+                _ => assert!(record.is_ok(), "image fixture should process: {}", path.display()),
+            }
+            checked += 1;
+        }
+
+        for skipped in fixture.skipped {
+            let path = resolve_fixture_path(
+                &workspace,
+                fixture_dir,
+                fixture.source_folder.as_deref(),
+                &skipped.path,
+            );
+            let Some(pair) = pair_by_primary.get(&path_key(&path)) else {
+                continue;
+            };
+            let result = process_one(pair, "standard");
+            match skipped.format_kind.as_deref() {
+                Some("raw") => assert!(
+                    result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|reason| reason.contains("RAW")),
+                    "skipped RAW should return RAW-specific reason"
+                ),
+                Some("heic") => assert!(
+                    result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|reason| reason.contains("HEIC/HEIF")),
+                    "skipped HEIC should return HEIC/HEIF-specific reason"
+                ),
+                _ => {}
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "fast format fixture had no comparable entries");
     }
 
     #[test]

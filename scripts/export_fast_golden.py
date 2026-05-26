@@ -62,6 +62,28 @@ def _array_summary(arr: Any) -> dict[str, Any] | None:
     }
 
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+RAW_EXTS = {
+    ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".dng",
+    ".raf", ".orf", ".rw2", ".pef", ".rwl", ".srw", ".x3f",
+}
+HEIC_EXTS = {".heic", ".heif"}
+SIDECAR_EXTS = {".xmp"}
+
+
+def _format_kind(path: str | Path) -> str:
+    ext = Path(path).suffix.lower()
+    if ext in RAW_EXTS:
+        return "raw"
+    if ext in HEIC_EXTS:
+        return "heic"
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in SIDECAR_EXTS:
+        return "sidecar"
+    return "other"
+
+
 def _info_record(info: Any, index: int) -> dict[str, Any]:
     orb_descs = getattr(info, "orb_descs", None)
     orb_kps = getattr(info, "orb_kps", None)
@@ -70,7 +92,9 @@ def _info_record(info: Any, index: int) -> dict[str, Any]:
         "index": index,
         "path": str(Path(info.path)),
         "name": Path(info.path).name,
+        "format_kind": _format_kind(info.path),
         "companions": [str(Path(p)) for p in getattr(info, "companions", [])],
+        "companion_kinds": [_format_kind(p) for p in getattr(info, "companions", [])],
         "timestamp": getattr(info, "timestamp", None),
         "size": getattr(info, "size", None),
         "mtime": getattr(info, "mtime", None),
@@ -226,7 +250,10 @@ def export_fast_golden(
         "source_folder": str(folder),
         "strength": strength,
         "count": len(infos),
-        "skipped": [{"path": p, "reason": r} for p, r in skipped],
+        "skipped": [
+            {"path": p, "reason": r, "format_kind": _format_kind(p)}
+            for p, r in skipped
+        ],
         "images": [_info_record(info, i) for i, info in enumerate(infos)],
         "orb_pairs": _orb_pair_records(infos) if include_pairs else [],
         "groups": group_indices,

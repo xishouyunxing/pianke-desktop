@@ -173,6 +173,9 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(capabilities["python_required"], false);
     assert_eq!(capabilities["quality_models"], false);
     assert_eq!(capabilities["nima_legacy_unavailable"], true);
+    assert_eq!(capabilities["formats"]["raw_thumbnail"], true);
+    assert_eq!(capabilities["formats"]["raw_strategy"], "embedded_jpeg");
+    assert_eq!(capabilities["formats"]["heic"], false);
     assert_eq!(capabilities["expert_capabilities"]["dinov2"], false);
     assert_eq!(
         capabilities["expert_capabilities"]["insightface_detection"],
@@ -422,8 +425,61 @@ fn unsupported_raw_and_heic_are_reported_as_skipped() {
         .iter()
         .filter_map(|item| item["reason"].as_str())
         .collect::<Vec<_>>();
-    assert!(reasons.iter().any(|reason| reason.contains("纯 RAW")));
+    assert!(reasons.iter().any(|reason| reason.contains("RAW")));
     assert!(reasons.iter().any(|reason| reason.contains("HEIC/HEIF")));
+}
+
+#[test]
+fn pure_raw_with_embedded_jpeg_preview_enters_fast_flow() {
+    let token = "raw-preview-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let jpg = photos.path().join("preview.jpg");
+    write_jpg(&jpg, 91);
+    let jpeg_bytes = fs::read(&jpg).expect("read preview jpg");
+    fs::remove_file(&jpg).expect("remove preview jpg");
+    let raw = photos.path().join("ONLY_RAW.CR2");
+    let mut raw_bytes = b"fake raw header".to_vec();
+    raw_bytes.extend_from_slice(&jpeg_bytes);
+    raw_bytes.extend_from_slice(b"fake raw trailer");
+    fs::write(&raw, raw_bytes).expect("write raw with preview");
+
+    let client = Client::new();
+    let start = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start raw preview response");
+    assert!(start.status().is_success());
+    let job = wait_for_done(&client, &base, token);
+    assert_eq!(job["skipped_count"], 0);
+
+    let status: Value = client
+        .get(format!("{base}/api/status"))
+        .header("X-Token", token)
+        .send()
+        .expect("status response")
+        .json()
+        .expect("status json");
+    assert_eq!(status["image_count"], 1);
+
+    let skipped: Value = client
+        .get(format!("{base}/api/skipped"))
+        .header("X-Token", token)
+        .send()
+        .expect("skipped response")
+        .json()
+        .expect("skipped json");
+    assert_eq!(
+        skipped["skipped"].as_array().expect("skipped list").len(),
+        0
+    );
 }
 
 #[test]
