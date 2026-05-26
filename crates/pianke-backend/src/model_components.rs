@@ -9,6 +9,8 @@ use std::{
 
 const MANIFEST_FILENAME: &str = "component.json";
 const INSTALL_STATE_FILENAME: &str = "install_state.json";
+pub const DEFAULT_EXPERT_MANIFEST_URL: &str =
+    "https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json";
 
 #[derive(Debug, Clone)]
 pub struct ModelManager {
@@ -478,6 +480,7 @@ impl InstallSource {
                     .map(|u| Self::ManifestUrl(u.clone()))
             })
             .or_else(|| Self::from_environment(&req.id))
+            .or_else(|| Self::default_official(&req.id))
     }
 
     fn from_environment(id: &str) -> Option<Self> {
@@ -498,6 +501,13 @@ impl InstallSource {
                     .filter(|v| !v.trim().is_empty())
                     .map(Self::ManifestUrl)
             })
+    }
+
+    fn default_official(id: &str) -> Option<Self> {
+        match id {
+            "expert" => Some(Self::ManifestUrl(DEFAULT_EXPERT_MANIFEST_URL.to_string())),
+            _ => None,
+        }
     }
 }
 
@@ -710,6 +720,20 @@ mod tests {
         assert!(caps.musiq);
         assert!(caps.clipiqa);
         assert!(caps.quality_models);
+    }
+
+    #[test]
+    fn expert_install_defaults_to_official_full_manifest_url() {
+        let req = ComponentInstallRequest {
+            id: "expert".to_string(),
+            source_dir: None,
+            manifest_path: None,
+            manifest_url: None,
+        };
+        match InstallSource::from_request(&req).expect("default expert source") {
+            InstallSource::ManifestUrl(url) => assert_eq!(url, DEFAULT_EXPERT_MANIFEST_URL),
+            _ => panic!("expected official manifest url"),
+        }
     }
 
     #[tokio::test]

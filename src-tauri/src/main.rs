@@ -99,6 +99,15 @@ fn pick_folder() -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("只能打开 http/https 下载链接".to_string());
+    }
+    open_url_with_system(url)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(BackendState::default())
@@ -125,7 +134,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             backend_status,
             restart_backend,
-            pick_folder
+            pick_folder,
+            open_external_url
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
@@ -140,6 +150,34 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("failed to run pianke desktop");
+}
+
+#[cfg(windows)]
+fn open_url_with_system(url: &str) -> Result<(), String> {
+    Command::new("rundll32")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开下载链接失败：{e}"))
+}
+
+#[cfg(target_os = "macos")]
+fn open_url_with_system(url: &str) -> Result<(), String> {
+    Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开下载链接失败：{e}"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_url_with_system(url: &str) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开下载链接失败：{e}"))
 }
 
 fn start_or_restart_backend(

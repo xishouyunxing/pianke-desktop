@@ -156,6 +156,20 @@ async function pickFolderFromDesktopShell() {
   return { available: true, cancelled: !folder, folder: folder || "" };
 }
 
+async function openExternalUrl(url) {
+  if (!url) return;
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (typeof invoke === "function") {
+    try {
+      await invoke("open_external_url", { url });
+      return;
+    } catch (err) {
+      console.warn("桌面壳打开下载链接失败，回退到浏览器打开", err);
+    }
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
 function applyPickedFolder(folder) {
   $("folder-input").value = folder;
   $("start-error").textContent = "";
@@ -583,7 +597,8 @@ let backendCapabilities = null;
 
 async function requestModelComponentInstall(componentId) {
   if (!componentId) return;
-  setStatus("正在检查增强组件", "busy");
+  const isExpert = componentId === "expert";
+  setStatus(isExpert ? "正在安装完整 Expert 组件" : "正在检查增强组件", "busy");
   try {
     await fetchJSON("/api/model_components/install", {
       method: "POST",
@@ -591,11 +606,11 @@ async function requestModelComponentInstall(componentId) {
     });
     const cap = await fetchJSON("/api/capabilities");
     applyBackendCapabilities(cap);
-    toast("增强组件已安装");
-    setStatus("增强组件已安装", "done");
+    toast(isExpert ? "完整 Expert 组件已安装" : "增强组件已安装");
+    setStatus(isExpert ? "完整 Expert 组件已安装" : "增强组件已安装", "done");
   } catch (err) {
     toast(err.message || "增强组件安装器尚未完成");
-    setStatus("增强组件暂不可安装", "error");
+    setStatus(isExpert ? "完整 Expert 组件暂不可安装" : "增强组件暂不可安装", "error");
   }
 }
 
@@ -631,7 +646,7 @@ function applyBackendCapabilities(cap) {
           action.className = "model-install-chip";
           action.role = "button";
           action.tabIndex = 0;
-          action.textContent = "安装增强组件";
+          action.textContent = engine === "expert" ? "安装完整 Expert 组件" : "安装增强组件";
           action.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -645,6 +660,7 @@ function applyBackendCapabilities(cap) {
           });
           el.appendChild(action);
         }
+        action.textContent = engine === "expert" ? "安装完整 Expert 组件" : "安装增强组件";
         action.dataset.component = engine;
       } else if (action) {
         action.remove();
@@ -681,6 +697,36 @@ function applyBackendCapabilities(cap) {
     applyBackendCapabilities(cap);
   } catch {}
 })();
+
+async function checkAppUpdate() {
+  const btn = $("app-update-btn");
+  if (!btn) return;
+  try {
+    const data = await fetchJSON("/api/app_update");
+    if (!data?.update_available || !data.url) {
+      btn.classList.add("hidden");
+      return;
+    }
+    const latest = data.latest_version || "";
+    const notes = (data.notes || "").trim();
+    btn.textContent = "有新版本";
+    btn.title = `发现新版本 ${latest}${notes ? `：${notes}` : ""}`;
+    btn.dataset.url = data.url;
+    btn.classList.remove("hidden");
+  } catch (err) {
+    console.info("软件更新检查失败，已静默忽略", err);
+    btn.classList.add("hidden");
+  }
+}
+
+const appUpdateBtn = $("app-update-btn");
+if (appUpdateBtn) {
+  appUpdateBtn.addEventListener("click", () => {
+    const url = appUpdateBtn.dataset.url;
+    if (url) openExternalUrl(url);
+  });
+}
+checkAppUpdate();
 
 // ---------- 文件夹快照（路径选好的瞬间触发） ----------
 let peekTimer = null;

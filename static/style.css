@@ -197,11 +197,34 @@ code {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 0 24px;
 }
+.site-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
 .site-tag {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--ink-faint);
   letter-spacing: 0.04em;
+}
+.app-update-btn {
+  border: 1px solid rgba(178, 92, 65, 0.34);
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  border-radius: 999px;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .18s var(--ease), border-color .18s var(--ease), transform .18s var(--ease);
+}
+.app-update-btn:hover {
+  background: #f7d4c2;
+  border-color: rgba(178, 92, 65, 0.54);
+  transform: translateY(-1px);
 }
 
 .landing-main {

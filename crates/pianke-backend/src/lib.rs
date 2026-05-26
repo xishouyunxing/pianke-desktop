@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    env, fs,
     io::Cursor,
     net::{SocketAddr, TcpListener},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -48,6 +48,7 @@ const STATE_FILENAME: &str = ".pic_selecter_state.json";
 const PIC_DIR: &str = "_pic_selecter";
 const THUMB_MAX: u32 = 1600;
 const ANALYSIS_MAX_SIDE: u32 = 2048;
+const DEFAULT_APP_UPDATE_URL: &str = "https://pianke.moeuu.cn/pianke/desktop/latest.json";
 
 const IMAGE_EXTS: &[&str] = &[".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"];
 const RAW_EXTS: &[&str] = &[
@@ -397,6 +398,7 @@ fn build_router(ctx: AppCtx) -> Router {
         .route("/", get(index))
         .route("/static/*path", get(static_file))
         .route("/api/desktop/health", get(health))
+        .route("/api/app_update", get(app_update))
         .route("/api/capabilities", get(capabilities))
         .route("/api/model_components", get(model_components))
         .route("/api/model_components/status", get(model_components))
@@ -508,6 +510,89 @@ async fn static_file(State(ctx): State<AppCtx>, AxumPath(path): AxumPath<String>
 
 async fn health() -> impl IntoResponse {
     Json(json!({"ok": true, "backend": "rust-fast"}))
+}
+
+#[derive(Debug, Deserialize)]
+struct AppUpdateManifest {
+    version: String,
+    url: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    published_at: String,
+}
+
+async fn app_update() -> impl IntoResponse {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let manifest_url =
+        env::var("PIANKE_APP_UPDATE_URL").unwrap_or_else(|_| DEFAULT_APP_UPDATE_URL.to_string());
+
+    match fetch_app_update_manifest(&manifest_url).await {
+        Ok(manifest) => {
+            let update_available = compare_versions(&manifest.version, &current_version).is_gt();
+            Json(json!({
+                "current_version": current_version,
+                "latest_version": manifest.version,
+                "update_available": update_available,
+                "url": manifest.url,
+                "notes": manifest.notes,
+                "published_at": manifest.published_at
+            }))
+        }
+        Err(err) => Json(json!({
+            "current_version": current_version,
+            "latest_version": Value::Null,
+            "update_available": false,
+            "url": Value::Null,
+            "notes": "",
+            "published_at": "",
+            "error": err
+        })),
+    }
+}
+
+async fn fetch_app_update_manifest(url: &str) -> Result<AppUpdateManifest, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .map_err(|e| format!("创建软件更新检查客户端失败：{e}"))?;
+    let manifest = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("检查软件更新失败：{e}"))?
+        .error_for_status()
+        .map_err(|e| format!("检查软件更新失败：{e}"))?
+        .json::<AppUpdateManifest>()
+        .await
+        .map_err(|e| format!("解析软件更新清单失败：{e}"))?;
+    if manifest.version.trim().is_empty() || manifest.url.trim().is_empty() {
+        return Err("软件更新清单缺少 version 或 url".to_string());
+    }
+    Ok(manifest)
+}
+
+fn compare_versions(remote: &str, current: &str) -> std::cmp::Ordering {
+    let remote_parts = version_parts(remote);
+    let current_parts = version_parts(current);
+    let len = remote_parts.len().max(current_parts.len()).max(1);
+    for idx in 0..len {
+        let left = *remote_parts.get(idx).unwrap_or(&0);
+        let right = *current_parts.get(idx).unwrap_or(&0);
+        match left.cmp(&right) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn version_parts(version: &str) -> Vec<u64> {
+    version
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect()
 }
 
 async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {

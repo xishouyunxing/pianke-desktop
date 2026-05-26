@@ -7,9 +7,19 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("env lock")
+}
 
 fn reserve_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test port");
@@ -49,6 +59,28 @@ fn start_mock_llm_server(response_body: &'static str) -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
+fn start_mock_json_server(response_body: impl Into<String>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("mock json bind");
+    let port = listener.local_addr().expect("mock json addr").port();
+    let body = response_body.into();
+    thread::spawn(move || {
+        for _ in 0..8 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    format!("http://127.0.0.1:{port}/latest.json")
+}
+
 fn write_jpg(path: &Path, seed: u8) {
     let mut img = RgbImage::new(64, 64);
     for y in 0..64 {
@@ -65,6 +97,103 @@ fn write_jpg(path: &Path, seed: u8) {
         }
     }
     img.save(path).expect("save jpg");
+}
+
+#[test]
+fn app_update_reports_available_for_newer_manifest() {
+    let _env = env_lock();
+    let token = "update-newer-token";
+    let update_url = start_mock_json_server(
+        r#"{"version":"0.1.10","url":"https://pianke.moeuu.cn/pianke/desktop/片刻桌面版_0.1.10_x64-setup.exe","notes":"测试更新","published_at":"2026-05-27"}"#,
+    );
+    std::env::set_var("PIANKE_APP_UPDATE_URL", update_url);
+    let (_backend, _handle, base) = start_test_backend(token);
+    let client = Client::new();
+    let update: Value = client
+        .get(format!("{base}/api/app_update"))
+        .header("X-Token", token)
+        .send()
+        .expect("app update response")
+        .json()
+        .expect("app update json");
+    std::env::remove_var("PIANKE_APP_UPDATE_URL");
+
+    assert_eq!(update["current_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(update["latest_version"], "0.1.10");
+    assert_eq!(update["update_available"], true);
+    assert_eq!(update["notes"], "测试更新");
+    assert!(update["url"]
+        .as_str()
+        .expect("update url")
+        .contains("0.1.10"));
+}
+
+#[test]
+fn app_update_hides_equal_or_broken_manifest() {
+    let _env = env_lock();
+    let token = "update-equal-token";
+    let update_url = start_mock_json_server(&format!(
+        r#"{{"version":"{}","url":"https://pianke.moeuu.cn/pianke/desktop/current.exe","notes":"","published_at":"2026-05-27"}}"#,
+        env!("CARGO_PKG_VERSION")
+    ));
+    std::env::set_var("PIANKE_APP_UPDATE_URL", update_url);
+    let (_backend, _handle, base) = start_test_backend(token);
+    let client = Client::new();
+    let update: Value = client
+        .get(format!("{base}/api/app_update"))
+        .header("X-Token", token)
+        .send()
+        .expect("app update response")
+        .json()
+        .expect("app update json");
+    assert_eq!(update["update_available"], false);
+    assert_eq!(update["latest_version"], env!("CARGO_PKG_VERSION"));
+
+    let lower_url = start_mock_json_server(
+        r#"{"version":"0.0.9","url":"https://pianke.moeuu.cn/pianke/desktop/old.exe","notes":"","published_at":"2026-05-27"}"#,
+    );
+    std::env::set_var("PIANKE_APP_UPDATE_URL", lower_url);
+    let lower: Value = client
+        .get(format!("{base}/api/app_update"))
+        .header("X-Token", token)
+        .send()
+        .expect("lower app update response")
+        .json()
+        .expect("lower app update json");
+    assert_eq!(lower["update_available"], false);
+    assert_eq!(lower["latest_version"], "0.0.9");
+
+    let bad_url = start_mock_json_server(r#"{"bad":true}"#);
+    std::env::set_var("PIANKE_APP_UPDATE_URL", bad_url);
+    let broken: Value = client
+        .get(format!("{base}/api/app_update"))
+        .header("X-Token", token)
+        .send()
+        .expect("broken app update response")
+        .json()
+        .expect("broken app update json");
+    std::env::remove_var("PIANKE_APP_UPDATE_URL");
+    assert_eq!(broken["update_available"], false);
+    assert!(broken["error"].as_str().unwrap_or("").contains("软件更新"));
+
+    let closed_port = reserve_port();
+    std::env::set_var(
+        "PIANKE_APP_UPDATE_URL",
+        format!("http://127.0.0.1:{closed_port}/latest.json"),
+    );
+    let network_error: Value = client
+        .get(format!("{base}/api/app_update"))
+        .header("X-Token", token)
+        .send()
+        .expect("network app update response")
+        .json()
+        .expect("network app update json");
+    std::env::remove_var("PIANKE_APP_UPDATE_URL");
+    assert_eq!(network_error["update_available"], false);
+    assert!(network_error["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("软件更新"));
 }
 
 fn wait_for_done(client: &Client, base: &str, token: &str) -> Value {
@@ -335,15 +464,21 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         .expect("cache dir")
         .contains("model_components"));
 
+    let _env = env_lock();
+    let manifest_url = start_mock_json_server(
+        r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small"],"files":[]}"#,
+    );
+    std::env::set_var("PIANKE_EXPERT_MANIFEST_URL", manifest_url);
     let install_resp = client
         .post(format!("{base}/api/model_components/install"))
         .header("X-Token", token)
         .json(&json!({"id": "expert"}))
         .send()
         .expect("install response");
-    assert_eq!(install_resp.status(), 428);
+    std::env::remove_var("PIANKE_EXPERT_MANIFEST_URL");
+    assert!(install_resp.status().is_success());
     let install_json: Value = install_resp.json().expect("install json");
-    assert_eq!(install_json["manual_supported"], true);
+    assert_eq!(install_json["ok"], true);
     assert_eq!(install_json["component"]["id"], "expert");
 
     let unknown_install = client
@@ -1226,7 +1361,11 @@ fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
         "watermark output jpg exists"
     );
 
-    if std::env::var("PIANKE_WATERMARK_OPEN_OUT_DIR_SMOKE").ok().as_deref() == Some("1") {
+    if std::env::var("PIANKE_WATERMARK_OPEN_OUT_DIR_SMOKE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let open_out_dir: Value = client
             .post(format!("{base}/api/watermark/open_out_dir"))
             .header("X-Token", token)

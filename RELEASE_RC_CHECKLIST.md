@@ -20,6 +20,43 @@ This checklist is the release gate for the Rust-only desktop package. It records
 - MUSIQ and CLIP-IQA+ are optional Expert quality models and should only be presented as available when ONNX parity is passing.
 - NIMA is intentionally unavailable in Rust because the Python legacy path replaces the MobileNetV2 classifier without loading a verifiable NIMA-trained head. Rust reports `nima_legacy_unavailable=true` and keeps `aesthetic_score=null`.
 - Tycoon supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages compatible providers. Mock E2E is automated; real provider calls require user-supplied credentials and are not part of the default RC gate.
+- Software update checking is prompt-only. The app reads `https://pianke.moeuu.cn/pianke/desktop/latest.json`, shows a small "有新版本" button when the remote version is newer, and opens the download URL when clicked. It does not perform silent auto-update.
+
+## Official Server Upload Layout
+
+Upload the desktop software update manifest and installer to:
+
+```text
+/pianke/desktop/latest.json
+/pianke/desktop/片刻桌面版_<version>_x64-setup.exe
+```
+
+`latest.json` must use this shape:
+
+```json
+{
+  "version": "0.1.1",
+  "url": "https://pianke.moeuu.cn/pianke/desktop/片刻桌面版_0.1.1_x64-setup.exe",
+  "notes": "更新说明",
+  "published_at": "2026-05-27"
+}
+```
+
+Upload the full Expert component package to:
+
+```text
+/pianke/components/expert/onnx-v1/component.json
+/pianke/components/expert/onnx-v1/quality_preprocessor.json
+/pianke/components/expert/onnx-v1/models/dinov2-small.onnx
+/pianke/components/expert/onnx-v1/models/insightface/det_10g.onnx
+/pianke/components/expert/onnx-v1/models/insightface/w600k_r50.onnx
+/pianke/components/expert/onnx-v1/models/insightface/1k3d68.onnx
+/pianke/components/expert/onnx-v1/models/quality/musiq.onnx
+/pianke/components/expert/onnx-v1/models/quality/musiq.onnx.data
+/pianke/components/expert/onnx-v1/models/quality/clipiqa_plus.onnx
+```
+
+The desktop app installs Expert from `https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json` by default. Development builds can still override this with `PIANKE_EXPERT_MANIFEST_URL`, `PIANKE_EXPERT_MANIFEST_PATH`, or `PIANKE_EXPERT_SOURCE_DIR`.
 
 ## Gated Local Checks
 
