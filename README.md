@@ -13,13 +13,11 @@
 <p align="center">
   <a href="https://pianke.moeuu.cn">官网</a>
   ·
-  <a href="#给小白用户看的介绍">用户介绍</a>
+  <a href="#简介">用户介绍</a>
   ·
-  <a href="#rust-only-开发包">开发包</a>
+  <a href="#开发者">开发包</a>
   ·
-  <a href="#rust-重构技术细节">技术细节</a>
-  ·
-  <a href="#发布边界">发布边界</a>
+  <a href="#重构">技术细节</a>
 </p>
 
 <p align="center">
@@ -34,7 +32,7 @@
 
 ---
 
-## 给小白用户看的介绍
+## 简介
 
 片刻是一款给摄影师、摄影爱好者和大量照片整理场景使用的桌面选片工具。你只需要选择一个照片文件夹，软件会自动扫描里面的照片，把相似连拍、相近构图或同一场景的照片分到一起，并先帮你过滤明显模糊、欠曝、过曝、闭眼或质量较差的照片。
 
@@ -61,7 +59,7 @@
 
 ---
 
-## Rust-only 开发包
+## 开发者
 
 当前 GitHub 仓库是 Rust-only 开发包，只保留 Tauri 桌面壳、Vue 前端、Rust 后端和构建/验收脚本，不再包含旧 Python 后端、Python runtime、Flask worker、requirements 文件或旧的一键启动器。
 
@@ -91,7 +89,7 @@ npm run check:no-python-bundle
 
 ### Expert 组件来源
 
-Expert 组件默认从片刻官方完整组件 manifest 安装：
+Expert 组件默认从由我本地验证过的 manifest 安装：
 
 ```text
 https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json
@@ -118,7 +116,7 @@ https://pianke.moeuu.cn/pianke/desktop/latest.json
 
 ---
 
-## Rust 重构技术细节
+## 重构
 
 这次重构的核心目标是把最终安装包收口为 Rust 默认、无 Python runtime、安装即用的桌面软件。Tauri 负责桌面壳和系统能力，Vue 负责前端交互，Rust backend 负责本地 HTTP API、任务状态、图片分析、归档、水印、模型组件和 provider 配置。
 
@@ -142,16 +140,3 @@ https://pianke.moeuu.cn/pianke/desktop/latest.json
 - Tycoon 的真实远程调用由用户自行配置 API，仓库默认使用 mock 验收本地流程。
 
 ---
-
-## 发布边界
-
-这个仓库只保存 Rust-only 开发包源码和必要配置。
-
-不会提交：
-
-- 私有照片、生成 fixture、`.tmp_*`
-- ONNX 模型、Expert 组件包、安装包产物
-- `src-tauri/opencv-runtime/` 或本机收集的 native runtime 缓存
-- 旧 Python backend/reference 代码
-
-发布前请按 [RELEASE_RC_CHECKLIST.md](RELEASE_RC_CHECKLIST.md) 做安装包 smoke、首页选择文件夹、Fast copy/move、水印视觉、Expert 组件下载速度和真实 provider 配置等人工确认。
