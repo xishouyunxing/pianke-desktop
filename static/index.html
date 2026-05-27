@@ -26,6 +26,19 @@
       </div>
       <div class="site-actions">
         <button type="button" id="app-update-btn" class="app-update-btn hidden" title="">有新版本</button>
+        <div id="app-update-popover" class="app-update-popover hidden" role="tooltip" aria-live="polite">
+          <div class="app-update-popover-title">发现新版本</div>
+          <div class="app-update-popover-row">
+            <span>最新版本</span>
+            <strong id="app-update-version">-</strong>
+          </div>
+          <div class="app-update-popover-row">
+            <span>发布时间</span>
+            <strong id="app-update-date">-</strong>
+          </div>
+          <p id="app-update-notes" class="app-update-popover-notes">点击下载最新版安装包。</p>
+          <div class="app-update-popover-action">点击下载</div>
+        </div>
         <span class="site-tag">本地运行 · 不上传</span>
       </div>
     </header>

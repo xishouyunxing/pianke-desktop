@@ -201,6 +201,7 @@ code {
   display: flex;
   align-items: center;
   gap: 12px;
+  position: relative;
 }
 .site-tag {
   font-family: var(--font-mono);
@@ -225,6 +226,62 @@ code {
   background: #f7d4c2;
   border-color: rgba(178, 92, 65, 0.54);
   transform: translateY(-1px);
+}
+.app-update-popover {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  width: min(300px, calc(100vw - 48px));
+  z-index: 20;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-card);
+  box-shadow: var(--shadow-lg);
+  color: var(--ink);
+  font-size: 12px;
+}
+.app-update-popover.hidden { display: none; }
+.app-update-popover::before {
+  content: "";
+  position: absolute;
+  top: -6px;
+  right: 34px;
+  width: 10px;
+  height: 10px;
+  border-left: 1px solid var(--line);
+  border-top: 1px solid var(--line);
+  background: var(--bg-card);
+  transform: rotate(45deg);
+}
+.app-update-popover-title {
+  font-weight: 650;
+  font-size: 13px;
+  margin-bottom: 9px;
+}
+.app-update-popover-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 5px 0;
+  color: var(--ink-muted);
+}
+.app-update-popover-row strong {
+  color: var(--ink-2);
+  font-weight: 600;
+  text-align: right;
+}
+.app-update-popover-notes {
+  margin: 10px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-faint);
+  color: var(--ink-muted);
+  line-height: 1.5;
+}
+.app-update-popover-action {
+  margin-top: 10px;
+  color: var(--accent-deep);
+  font-weight: 600;
 }
 
 .landing-main {

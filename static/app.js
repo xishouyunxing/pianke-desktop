@@ -732,27 +732,56 @@ function applyBackendCapabilities(cap) {
 async function checkAppUpdate() {
   const btn = $("app-update-btn");
   if (!btn) return;
+  const clearUpdate = () => {
+    btn.classList.add("hidden");
+    btn.title = "";
+    delete btn.dataset.url;
+    delete btn.dataset.latestVersion;
+    delete btn.dataset.publishedAt;
+    delete btn.dataset.notes;
+    hideAppUpdatePopover();
+  };
   try {
     const data = await fetchJSON("/api/app_update");
     if (!data?.update_available || !data.url) {
-      btn.classList.add("hidden");
-      delete btn.dataset.url;
+      clearUpdate();
       return;
     }
     const latest = data.latest_version || "";
     const notes = (data.notes || "").trim();
+    const publishedAt = data.published_at || "";
     btn.textContent = "有新版本";
-    btn.title = `发现新版本 ${latest}${notes ? `：${notes}` : ""}`;
+    btn.title = `发现新版本 ${latest}${publishedAt ? ` · ${publishedAt}` : ""}${notes ? `\n${notes}` : ""}\n点击下载最新版安装包`;
     btn.dataset.url = data.url;
+    btn.dataset.latestVersion = latest;
+    btn.dataset.publishedAt = publishedAt;
+    btn.dataset.notes = notes;
     btn.classList.remove("hidden");
   } catch (err) {
     console.info("软件更新检查失败，已静默忽略", err);
-    btn.classList.add("hidden");
+    clearUpdate();
   }
 }
 
 const appUpdateBtn = $("app-update-btn");
+function hideAppUpdatePopover() {
+  $("app-update-popover")?.classList.add("hidden");
+}
+function showAppUpdatePopover() {
+  const btn = $("app-update-btn");
+  const popover = $("app-update-popover");
+  if (!btn || !popover || btn.classList.contains("hidden") || !btn.dataset.url) return;
+  $("app-update-version").textContent = btn.dataset.latestVersion || "-";
+  $("app-update-date").textContent = btn.dataset.publishedAt || "未提供";
+  $("app-update-notes").textContent = btn.dataset.notes || "点击下载最新版安装包。";
+  popover.classList.remove("hidden");
+}
 if (appUpdateBtn) {
+  appUpdateBtn.setAttribute("aria-describedby", "app-update-popover");
+  appUpdateBtn.addEventListener("mouseenter", showAppUpdatePopover);
+  appUpdateBtn.addEventListener("mouseleave", hideAppUpdatePopover);
+  appUpdateBtn.addEventListener("focus", showAppUpdatePopover);
+  appUpdateBtn.addEventListener("blur", hideAppUpdatePopover);
   appUpdateBtn.addEventListener("click", async () => {
     const url = appUpdateBtn.dataset.url;
     if (!url) return;
