@@ -412,11 +412,14 @@ code {
 
 .landing-foot-github {
   justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
   border-top: 1px dashed var(--line-soft, rgba(0, 0, 0, 0.08));
   padding-top: 10px;
 }
 
-.landing-foot-github a {
+.landing-foot-github a,
+.landing-foot-origin {
   color: var(--ink-faint);
   text-decoration: none;
   transition: color 0.15s ease;
@@ -424,6 +427,10 @@ code {
 
 .landing-foot-github a:hover {
   color: var(--ink, #1a1a1a);
+}
+
+.landing-foot-origin {
+  opacity: 0.72;
 }
 
 /* =========================================================
