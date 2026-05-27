@@ -563,16 +563,23 @@ async fn fetch_app_update_manifest(url: &str) -> Result<AppUpdateManifest, Strin
         .map_err(|e| format!("检查软件更新失败：{e}"))?
         .error_for_status()
         .map_err(|e| format!("检查软件更新失败：{e}"))?
-        .json::<AppUpdateManifest>()
+        .text()
         .await
+        .map_err(|e| format!("读取软件更新清单失败：{e}"))?;
+    let manifest: AppUpdateManifest = serde_json::from_str(manifest.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("解析软件更新清单失败：{e}"))?;
-    if manifest.version.trim().is_empty() || manifest.url.trim().is_empty() {
+    if manifest.version.trim().is_empty() {
         return Err("软件更新清单缺少 version 或 url".to_string());
     }
     Ok(manifest)
 }
 
 fn compare_versions(remote: &str, current: &str) -> std::cmp::Ordering {
+    let remote = remote.trim().trim_start_matches('v');
+    let current = current.trim().trim_start_matches('v');
+    if remote == current {
+        return std::cmp::Ordering::Equal;
+    }
     let remote_parts = version_parts(remote);
     let current_parts = version_parts(current);
     let len = remote_parts.len().max(current_parts.len()).max(1);

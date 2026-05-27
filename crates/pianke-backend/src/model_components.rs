@@ -442,7 +442,7 @@ fn component_files_ready(id: &str, install_dir: &Path) -> bool {
 
 fn read_manifest(path: &Path) -> Option<ComponentManifest> {
     let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    parse_manifest_text(&text).ok()
 }
 
 fn read_install_state(path: &Path) -> Option<InstallState> {
@@ -480,6 +480,7 @@ impl InstallSource {
                     .map(|u| Self::ManifestUrl(u.clone()))
             })
             .or_else(|| Self::from_environment(&req.id))
+            .or_else(|| Self::local_packaged(&req.id))
             .or_else(|| Self::default_official(&req.id))
     }
 
@@ -508,6 +509,25 @@ impl InstallSource {
             "expert" => Some(Self::ManifestUrl(DEFAULT_EXPERT_MANIFEST_URL.to_string())),
             _ => None,
         }
+    }
+
+    fn local_packaged(id: &str) -> Option<Self> {
+        if id != "expert" {
+            return None;
+        }
+        let candidates = [
+            PathBuf::from("model_components").join(id),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new("."))
+                .join("model_components")
+                .join(id),
+        ];
+        candidates
+            .into_iter()
+            .find(|dir| dir.join(MANIFEST_FILENAME).exists())
+            .map(Self::SourceDir)
     }
 }
 
@@ -551,7 +571,7 @@ async fn load_manifest(source: InstallSource) -> Result<LoadedManifest, String> 
                 .await
                 .map_err(|e| format!("read manifest body failed: {e}"))?;
             let manifest =
-                serde_json::from_str(&text).map_err(|e| format!("parse manifest failed: {e}"))?;
+                parse_manifest_text(&text).map_err(|e| format!("parse manifest failed: {e}"))?;
             Ok(LoadedManifest {
                 manifest,
                 base_dir: None,
@@ -562,7 +582,11 @@ async fn load_manifest(source: InstallSource) -> Result<LoadedManifest, String> 
 
 fn read_manifest_required(path: &Path) -> Result<ComponentManifest, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read manifest failed: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("parse manifest failed: {e}"))
+    parse_manifest_text(&text).map_err(|e| format!("parse manifest failed: {e}"))
+}
+
+fn parse_manifest_text(text: &str) -> Result<ComponentManifest, serde_json::Error> {
+    serde_json::from_str(text.trim_start_matches('\u{feff}').trim_start())
 }
 
 async fn load_component_file(
@@ -734,6 +758,16 @@ mod tests {
             InstallSource::ManifestUrl(url) => assert_eq!(url, DEFAULT_EXPERT_MANIFEST_URL),
             _ => panic!("expected official manifest url"),
         }
+    }
+
+    #[test]
+    fn parses_manifest_with_utf8_bom() {
+        let manifest = parse_manifest_text(
+            "\u{feff}{\"id\":\"expert\",\"version\":\"onnx-v1\",\"runtime\":\"onnxruntime\"}",
+        )
+        .expect("manifest with bom");
+        assert_eq!(manifest.id, "expert");
+        assert_eq!(manifest.version, "onnx-v1");
     }
 
     #[tokio::test]

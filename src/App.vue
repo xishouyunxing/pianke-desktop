@@ -77,13 +77,35 @@ function postFolder(folder: string) {
 function postFolderPickResult(requestId: string, payload: { folder?: string | null; error?: string }) {
   iframeEl.value?.contentWindow?.postMessage(
     { type: "pianke:pick-folder-result", requestId, ...payload },
-    backendOrigin.value,
+    "*",
+  );
+}
+
+function postOpenUrlResult(requestId: string, payload: { ok?: boolean; error?: string }) {
+  iframeEl.value?.contentWindow?.postMessage(
+    { type: "pianke:open-url-result", requestId, ...payload },
+    "*",
   );
 }
 
 async function handleFrameMessage(event: MessageEvent) {
-  if (!iframeEl.value?.contentWindow || event.source !== iframeEl.value.contentWindow) return;
+  const frame = iframeEl.value?.contentWindow;
+  if (!frame) return;
+  if (event.source !== frame && event.source !== window) return;
   const data = event.data || {};
+  if (data.type === "pianke:open-url" && typeof data.requestId === "string" && typeof data.url === "string") {
+    try {
+      await invoke("open_external_url", { url: data.url });
+      postOpenUrlResult(data.requestId, { ok: true });
+    } catch (err) {
+      postOpenUrlResult(data.requestId, {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
   if (data.type !== "pianke:pick-folder" || typeof data.requestId !== "string") return;
 
   try {
@@ -131,10 +153,6 @@ onUnmounted(() => {
         <h1>{{ status.healthy ? "引擎已就绪" : "正在唤醒引擎" }}</h1>
         <p class="copy">{{ status.message }}</p>
         <dl class="facts">
-          <div>
-            <dt>端口</dt>
-            <dd>{{ status.port ?? "待分配" }}</dd>
-          </div>
           <div>
             <dt>引擎</dt>
             <dd>{{ status.backend_kind === "rust-fast" ? "Rust Fast" : (status.python ?? "Python") }}</dd>

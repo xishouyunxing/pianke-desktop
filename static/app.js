@@ -18,6 +18,7 @@ let currentGroup = null;
 let currentMode = IS_DESKTOP_SHELL ? "copy" : "move";
 let recentWinners = []; // 最近胜出路径，给 arena-stack 用
 let streamSeq = 0;       // streaming log 已渲染到的 event_seq
+let openUrlSeq = 0;
 
 // ---- 处理页照片墙 ----
 let wallCells = [];          // [{el, ev, addedAt}]
@@ -123,7 +124,7 @@ async function fetchJSON(url, opts = {}) {
 async function pickFolderFromDesktopShell() {
   const invoke = window.__TAURI__?.core?.invoke;
   if (typeof invoke !== "function") {
-    if (!IS_DESKTOP_SHELL || window.parent === window) {
+    if (window.parent === window) {
       return { available: false };
     }
 
@@ -167,7 +168,37 @@ async function openExternalUrl(url) {
       console.warn("桌面壳打开下载链接失败，回退到浏览器打开", err);
     }
   }
-  window.open(url, "_blank", "noopener,noreferrer");
+  if (window.parent !== window) {
+    const requestId = `open-url-${Date.now()}-${++openUrlSeq}`;
+    try {
+      await new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          window.removeEventListener("message", onMessage);
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error("桌面壳没有响应打开链接请求"));
+        }, 8000);
+        const onMessage = (event) => {
+          const data = event.data || {};
+          if (data.type !== "pianke:open-url-result" || data.requestId !== requestId) return;
+          cleanup();
+          if (data.ok) resolve();
+          else reject(new Error(data.error || "打开链接失败"));
+        };
+        window.addEventListener("message", onMessage);
+        window.parent.postMessage({ type: "pianke:open-url", requestId, url }, "*");
+      });
+      return;
+    } catch (err) {
+      console.warn("父级桌面壳打开链接失败，回退到浏览器打开", err);
+    }
+  }
+  const opened = window.open(url, "_blank", "noopener,noreferrer");
+  if (!opened) {
+    location.href = url;
+  }
 }
 
 function applyPickedFolder(folder) {
@@ -705,6 +736,7 @@ async function checkAppUpdate() {
     const data = await fetchJSON("/api/app_update");
     if (!data?.update_available || !data.url) {
       btn.classList.add("hidden");
+      delete btn.dataset.url;
       return;
     }
     const latest = data.latest_version || "";
@@ -721,9 +753,14 @@ async function checkAppUpdate() {
 
 const appUpdateBtn = $("app-update-btn");
 if (appUpdateBtn) {
-  appUpdateBtn.addEventListener("click", () => {
+  appUpdateBtn.addEventListener("click", async () => {
     const url = appUpdateBtn.dataset.url;
-    if (url) openExternalUrl(url);
+    if (!url) return;
+    try {
+      await openExternalUrl(url);
+    } catch (err) {
+      toast(`打开更新链接失败：${err.message || err}`);
+    }
   });
 }
 checkAppUpdate();

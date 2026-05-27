@@ -196,6 +196,29 @@ fn app_update_hides_equal_or_broken_manifest() {
         .contains("软件更新"));
 }
 
+#[test]
+fn app_update_accepts_manifest_with_utf8_bom() {
+    let _env = env_lock();
+    let token = "update-bom-token";
+    let update_url = start_mock_json_server(&format!(
+        "\u{feff}{{\"version\":\"{}\",\"url\":\"https://example.test/pianke.exe\"}}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    std::env::set_var("PIANKE_APP_UPDATE_URL", update_url);
+    let (_backend, _handle, base) = start_test_backend(token);
+    let client = Client::new();
+    let update: Value = client
+        .get(format!("{base}/api/app_update"))
+        .header("X-Token", token)
+        .send()
+        .expect("app update response")
+        .json()
+        .expect("app update json");
+    std::env::remove_var("PIANKE_APP_UPDATE_URL");
+    assert_eq!(update["latest_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(update["update_available"], false);
+}
+
 fn wait_for_done(client: &Client, base: &str, token: &str) -> Value {
     wait_for_done_with_timeout(client, base, token, Duration::from_secs(10))
 }
