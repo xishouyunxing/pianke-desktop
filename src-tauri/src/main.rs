@@ -3,10 +3,9 @@
 use serde::Serialize;
 use std::{
     env,
-    io::{BufRead, BufReader},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Command,
     sync::Mutex,
     thread,
     time::{Duration, Instant},
@@ -29,7 +28,6 @@ struct BackendPayload {
 
 #[derive(Debug)]
 struct BackendRuntime {
-    child: Option<Child>,
     rust_backend: Option<pianke_backend::ServerHandle>,
     payload: BackendPayload,
 }
@@ -37,7 +35,6 @@ struct BackendRuntime {
 impl Default for BackendRuntime {
     fn default() -> Self {
         Self {
-            child: None,
             rust_backend: None,
             payload: BackendPayload {
                 running: false,
@@ -48,7 +45,7 @@ impl Default for BackendRuntime {
                 python: None,
                 backend_kind: "rust-fast".to_string(),
                 backend_dir: None,
-                message: "片刻引擎尚未启动".to_string(),
+                message: "片刻 Rust 后端尚未启动".to_string(),
             },
         }
     }
@@ -57,27 +54,14 @@ impl Default for BackendRuntime {
 #[derive(Default)]
 struct BackendState(Mutex<BackendRuntime>);
 
-struct PythonCommand {
-    program: String,
-    prefix_args: Vec<String>,
-    label: String,
-}
-
 #[tauri::command]
 fn backend_status(state: State<'_, BackendState>) -> Result<BackendPayload, String> {
     let mut runtime = state.0.lock().map_err(|e| e.to_string())?;
-    if let Some(child) = runtime.child.as_mut() {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            runtime.child = None;
-            runtime.payload.running = false;
-            runtime.payload.healthy = false;
-            runtime.payload.message = "片刻引擎已退出，请重启引擎".to_string();
-        } else if let Some(port) = runtime.payload.port {
-            runtime.payload.healthy = can_connect(port);
-            runtime.payload.running = true;
-            if runtime.payload.healthy {
-                runtime.payload.message = "片刻引擎已就绪".to_string();
-            }
+    if let Some(port) = runtime.payload.port {
+        runtime.payload.healthy = can_connect(port);
+        runtime.payload.running = runtime.rust_backend.is_some();
+        if runtime.payload.healthy {
+            runtime.payload.message = "Rust Fast 后端已就绪".to_string();
         }
     }
     Ok(runtime.payload.clone())
@@ -140,12 +124,9 @@ fn main() {
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 let state = window.state::<BackendState>();
-                {
-                    if let Ok(mut runtime) = state.0.lock() {
-                        stop_child(&mut runtime.child);
-                        stop_rust_backend(&mut runtime.rust_backend);
-                    };
-                }
+                if let Ok(mut runtime) = state.0.lock() {
+                    stop_rust_backend(&mut runtime.rust_backend);
+                };
             }
         })
         .run(tauri::generate_context!())
@@ -185,107 +166,44 @@ fn start_or_restart_backend(
     state: &State<'_, BackendState>,
 ) -> Result<BackendPayload, String> {
     let mut runtime = state.0.lock().map_err(|e| e.to_string())?;
-    stop_child(&mut runtime.child);
     stop_rust_backend(&mut runtime.rust_backend);
 
     let backend_dir = resolve_backend_dir(app)?;
     let port = reserve_port()?;
     let token = Uuid::new_v4().to_string();
     let url = format!("http://127.0.0.1:{port}");
-
     let requested_python = matches!(env::var("PIANKE_BACKEND").ok().as_deref(), Some("python"));
-    let use_python = requested_python && python_fallback_allowed();
 
-    if !use_python {
-        let handle = pianke_backend::start(pianke_backend::ServerOptions {
-            port,
-            token: Some(token.clone()),
-            backend_dir: backend_dir.clone(),
-        })?;
-        let healthy = wait_for_port(port, Duration::from_secs(10));
-        runtime.payload = BackendPayload {
-            running: true,
-            healthy,
-            url: Some(url),
-            token: Some(token),
-            port: Some(port),
-            python: None,
-            backend_kind: "rust-fast".to_string(),
-            backend_dir: Some(backend_dir.to_string_lossy().to_string()),
-            message: if healthy {
-                "Rust Fast 引擎已就绪".to_string()
-            } else {
-                "Rust Fast 引擎已启动，但健康检查暂未通过".to_string()
-            },
-        };
-        if requested_python {
-            runtime.payload.message =
-                "正式安装包不包含 Python 后端，已启动 Rust Fast 后端。".to_string();
-        }
-        runtime.rust_backend = Some(handle);
-        return Ok(runtime.payload.clone());
-    }
-
-    let python = resolve_python(app);
-
-    let mut command = Command::new(&python.program);
-    command
-        .args(&python.prefix_args)
-        .arg("app.py")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--no-browser")
-        .current_dir(&backend_dir)
-        .env("PIANKE_DESKTOP", "1")
-        .env("PIC_SELECTER_TOKEN", &token)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = command.spawn().map_err(|e| {
-        format!(
-            "无法启动 Python 后端：{e}。请安装 Python 3.10，或设置 PIANKE_PYTHON 指向 python.exe。"
-        )
+    let handle = pianke_backend::start(pianke_backend::ServerOptions {
+        port,
+        token: Some(token.clone()),
+        backend_dir: backend_dir.clone(),
     })?;
-
-    drain_output(child.stdout.take(), "stdout");
-    drain_output(child.stderr.take(), "stderr");
-
     let healthy = wait_for_port(port, Duration::from_secs(10));
-    let message = if healthy {
-        "片刻引擎已就绪".to_string()
-    } else {
-        "Python 后端已启动，但健康检查暂未通过；请稍等或查看终端日志".to_string()
-    };
-
+    runtime.rust_backend = Some(handle);
     runtime.payload = BackendPayload {
         running: true,
         healthy,
         url: Some(url),
         token: Some(token),
         port: Some(port),
-        python: Some(python.label),
-        backend_kind: "python".to_string(),
+        python: None,
+        backend_kind: "rust-fast".to_string(),
         backend_dir: Some(backend_dir.to_string_lossy().to_string()),
-        message,
+        message: if requested_python {
+            "当前 Rust-only 开发包不包含 Python 后端，已启动 Rust Fast 后端。".to_string()
+        } else if healthy {
+            "Rust Fast 后端已就绪".to_string()
+        } else {
+            "Rust Fast 后端已启动，但健康检查暂未通过".to_string()
+        },
     };
-    runtime.child = Some(child);
     Ok(runtime.payload.clone())
 }
 
 fn stop_rust_backend(handle: &mut Option<pianke_backend::ServerHandle>) {
     if let Some(handle) = handle.take() {
         handle.stop();
-    }
-}
-
-fn python_fallback_allowed() -> bool {
-    cfg!(debug_assertions)
-}
-
-fn stop_child(child: &mut Option<Child>) {
-    if let Some(mut child) = child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
     }
 }
 
@@ -321,55 +239,6 @@ fn resolve_backend_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     )
 }
 
-fn resolve_python(app: &tauri::AppHandle) -> PythonCommand {
-    if let Ok(py) = env::var("PIANKE_PYTHON") {
-        return PythonCommand {
-            label: py.clone(),
-            program: py,
-            prefix_args: vec![],
-        };
-    }
-
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        let bundled = resource_dir.join("python").join("python.exe");
-        if bundled.exists() {
-            let py = bundled.to_string_lossy().to_string();
-            return PythonCommand {
-                label: py.clone(),
-                program: py,
-                prefix_args: vec![],
-            };
-        }
-    }
-
-    let dev_bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("binaries")
-        .join("python")
-        .join("python.exe");
-    if dev_bundled.exists() {
-        let py = dev_bundled.to_string_lossy().to_string();
-        return PythonCommand {
-            label: py.clone(),
-            program: py,
-            prefix_args: vec![],
-        };
-    }
-
-    if cfg!(windows) {
-        PythonCommand {
-            program: "py".to_string(),
-            prefix_args: vec!["-3.10".to_string()],
-            label: "py -3.10".to_string(),
-        }
-    } else {
-        PythonCommand {
-            program: "python3".to_string(),
-            prefix_args: vec![],
-            label: "python3".to_string(),
-        }
-    }
-}
-
 fn reserve_port() -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -394,15 +263,4 @@ fn can_connect(port: u16) -> bool {
         .ok()
         .and_then(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok())
         .is_some()
-}
-
-fn drain_output<T: std::io::Read + Send + 'static>(stream: Option<T>, label: &'static str) {
-    if let Some(stream) = stream {
-        thread::spawn(move || {
-            let reader = BufReader::new(stream);
-            for line in reader.lines().map_while(Result::ok) {
-                eprintln!("[python:{label}] {line}");
-            }
-        });
-    }
 }

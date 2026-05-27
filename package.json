@@ -6,7 +6,6 @@
   "scripts": {
     "dev": "tauri dev",
     "dev:ui": "vite --host 127.0.0.1 --port 1420",
-    "prepare:python": "powershell -ExecutionPolicy Bypass -File scripts/prepare_desktop_python.ps1",
     "build": "powershell -ExecutionPolicy Bypass -File scripts/build_rust_release.ps1",
     "build:rust": "powershell -ExecutionPolicy Bypass -File scripts/build_rust_release.ps1",
     "build:ui": "vue-tsc --noEmit && vite build",
