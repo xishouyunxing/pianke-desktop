@@ -6,7 +6,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{mpsc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -178,6 +178,7 @@ fn start_or_restart_backend(
         port,
         token: Some(token.clone()),
         backend_dir: backend_dir.clone(),
+        folder_picker: Some(folder_picker_for_backend(app.clone())),
     })?;
     let healthy = wait_for_port(port, Duration::from_secs(10));
     runtime.rust_backend = Some(handle);
@@ -205,6 +206,23 @@ fn stop_rust_backend(handle: &mut Option<pianke_backend::ServerHandle>) {
     if let Some(handle) = handle.take() {
         handle.stop();
     }
+}
+
+fn folder_picker_for_backend(
+    app: tauri::AppHandle,
+) -> std::sync::Arc<dyn Fn() -> Result<Option<PathBuf>, String> + Send + Sync> {
+    std::sync::Arc::new(move || {
+        let (tx, rx) = mpsc::channel();
+        app.run_on_main_thread(move || {
+            let folder = rfd::FileDialog::new()
+                .set_title("选择照片文件夹")
+                .pick_folder();
+            let _ = tx.send(folder);
+        })
+        .map_err(|e| format!("无法调度系统选择对话框: {e}"))?;
+        rx.recv()
+            .map_err(|e| format!("系统选择对话框没有返回结果: {e}"))
+    })
 }
 
 fn resolve_backend_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>片刻 — 决定性的那一张</title>
 <link rel="icon" href="/static/app-icon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/static/style.css?v=20260517f">
+<link rel="stylesheet" href="/static/style.css?v=20260528b">
 </head>
 <body>
 
@@ -39,6 +39,7 @@
           <p id="app-update-notes" class="app-update-popover-notes">点击下载最新版安装包。</p>
           <div class="app-update-popover-action">点击下载</div>
         </div>
+        <button type="button" id="addon-manager-btn" class="addon-manager-btn">附加包管理</button>
         <span class="site-tag">本地运行 · 不上传</span>
       </div>
     </header>
@@ -781,6 +782,20 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=20260517f"></script>
+<div id="addon-modal" class="addon-modal hidden">
+  <div class="addon-card">
+    <header class="addon-head">
+      <div>
+        <h3>附加包管理</h3>
+        <p>管理 Expert 本地 ONNX 组件。Fast 和水印不依赖这些组件。</p>
+      </div>
+      <button id="addon-close" class="btn-ghost">关闭</button>
+    </header>
+    <div id="addon-list" class="addon-list"></div>
+    <p id="addon-error" class="addon-error"></p>
+  </div>
+</div>
+
+<script src="/static/app.js?v=20260528b"></script>
 </body>
 </html>

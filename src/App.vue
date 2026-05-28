@@ -88,11 +88,25 @@ function postOpenUrlResult(requestId: string, payload: { ok?: boolean; error?: s
   );
 }
 
-async function handleFrameMessage(event: MessageEvent) {
+function canTrustFrameMessage(event: MessageEvent) {
   const frame = iframeEl.value?.contentWindow;
-  if (!frame) return;
-  if (event.source !== frame && event.source !== window) return;
+  if (!frame) return false;
+  if (event.source === frame) return true;
+  const origin = backendOrigin.value;
+  return origin !== "*" && event.origin === origin;
+}
+
+async function handleFrameMessage(event: MessageEvent) {
   const data = event.data || {};
+  const allowed = data.type === "pianke:open-url" || data.type === "pianke:pick-folder" || data.type === "pianke:bridge-ready";
+  if (!allowed) return;
+  if (!canTrustFrameMessage(event)) return;
+
+  if (data.type === "pianke:bridge-ready") {
+    iframeEl.value?.contentWindow?.postMessage({ type: "pianke:bridge-ack" }, "*");
+    return;
+  }
+
   if (data.type === "pianke:open-url" && typeof data.requestId === "string" && typeof data.url === "string") {
     try {
       await invoke("open_external_url", { url: data.url });

@@ -29,6 +29,15 @@ const WALL_FILL_MS = 200;
 const WALL_REPLACE_MS = 420;
 const WALL_QUEUE_CAP = 80;
 let folderPickSeq = 0;
+let desktopBridgeReady = false;
+
+if (IS_DESKTOP_SHELL && window.parent !== window) {
+  window.addEventListener("message", (event) => {
+    const data = event.data || {};
+    if (data.type === "pianke:bridge-ack") desktopBridgeReady = true;
+  });
+  window.parent.postMessage({ type: "pianke:bridge-ready" }, "*");
+}
 
 // =================================================================
 // 全局引擎状态徽章
@@ -123,9 +132,13 @@ async function fetchJSON(url, opts = {}) {
 
 async function pickFolderFromDesktopShell() {
   const invoke = window.__TAURI__?.core?.invoke;
+  if (IS_DESKTOP_SHELL) {
+    const r = await fetchJSON("/api/browse_folder", { method: "POST" });
+    return { available: true, cancelled: !!r.cancelled, folder: r.folder || "" };
+  }
   if (typeof invoke !== "function") {
     if (window.parent === window) {
-      return { available: false };
+      throw new Error("当前页面不在桌面壳内，请手动粘贴照片文件夹路径。");
     }
 
     const requestId = `folder-${Date.now()}-${++folderPickSeq}`;
@@ -136,7 +149,7 @@ async function pickFolderFromDesktopShell() {
       };
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error("桌面壳没有响应选择文件夹请求"));
+        reject(new Error("桌面壳没有响应选择文件夹请求，请重启软件或手动粘贴路径。"));
       }, 30000);
       const onMessage = (event) => {
         const data = event.data || {};
@@ -625,16 +638,131 @@ if (llmRefreshBtn) {
 syncEngineSwitch();
 
 let backendCapabilities = null;
+let addonPollHandle = null;
+
+function addonStatusLabel(status) {
+  return {
+    installed: "已安装",
+    not_installed: "未安装",
+    unverified: "待校验",
+    version_mismatch: "版本不匹配",
+    running: "下载中",
+    pause_requested: "正在暂停",
+    paused: "已暂停",
+    cancel_requested: "正在取消",
+    cancelled: "已取消",
+  }[status] || status || "未知";
+}
+
+function addonProgressPercent(component) {
+  const state = component?.install_state;
+  if (state?.bytes_total) return Math.max(0, Math.min(100, Math.round((Number(state.bytes_done || 0) / Number(state.bytes_total || 1)) * 100)));
+  if (!state || !state.total) return component?.status === "installed" ? 100 : 0;
+  return Math.max(0, Math.min(100, Math.round((Number(state.done || 0) / Number(state.total || 1)) * 100)));
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (value <= 0) return "0 MB";
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function renderAddonManager(data) {
+  const list = $("addon-list");
+  if (!list) return;
+  const components = Array.isArray(data?.components) ? data.components : [];
+  if (!components.length) {
+    list.innerHTML = `<div class="addon-item">暂无可管理的附加包。</div>`;
+    return;
+  }
+  list.innerHTML = components.map((component) => {
+    const progress = addonProgressPercent(component);
+    const state = component.install_state || {};
+    const effectiveStatus = state.status && state.status !== "done" ? state.status : component.status;
+    const installed = component.status === "installed";
+    const running = state.status === "running" || state.status === "pause_requested" || state.status === "cancel_requested";
+    const paused = state.status === "paused";
+    const current = state.current ? `当前：${escapeHtml(state.current)}` : installed ? "组件已安装完成" : "等待安装";
+    const byteText = state.bytes_total ? ` · ${formatBytes(state.bytes_done)}/${formatBytes(state.bytes_total)}` : "";
+    const models = (component.models || []).map((m) => `<span>${escapeHtml(m)}</span>`).join("");
+    return `
+      <section class="addon-item" data-component="${escapeHtml(component.id)}">
+        <div class="addon-item-top">
+          <div>
+            <h4>${escapeHtml(component.label || component.id)}</h4>
+            <div class="addon-meta">版本 ${escapeHtml(component.version || "-")} · 约 ${component.estimated_size_mb || "-"} MB · ${escapeHtml(component.runtime || "")}</div>
+          </div>
+          <span class="addon-status ${installed ? "installed" : ""}">${addonStatusLabel(effectiveStatus)}</span>
+        </div>
+        <div class="addon-progress">
+          <div class="addon-progress-bar"><div class="addon-progress-fill" style="width:${progress}%"></div></div>
+          <div class="addon-progress-text">${current}${state.total ? ` · ${state.done || 0}/${state.total}` : ""}${byteText}</div>
+        </div>
+        <div class="addon-models">${models}</div>
+        <div class="addon-actions">
+          <button class="btn btn-primary small addon-install" data-id="${escapeHtml(component.id)}" ${running ? "disabled" : ""}>${installed ? "重新安装" : paused ? "继续下载" : "安装完整组件"}</button>
+          <button class="btn-ghost addon-pause" data-id="${escapeHtml(component.id)}" ${state.status === "running" ? "" : "disabled"}>暂停</button>
+          <button class="btn-ghost addon-cancel" data-id="${escapeHtml(component.id)}" ${running || paused ? "" : "disabled"}>取消</button>
+          <button class="btn-ghost addon-refresh" data-id="${escapeHtml(component.id)}">刷新</button>
+          <button class="btn-ghost addon-delete" data-id="${escapeHtml(component.id)}" ${!running && (installed || component.status === "unverified" || component.status === "version_mismatch" || state.status === "paused" || state.status === "cancelled") ? "" : "disabled"}>删除</button>
+        </div>
+      </section>
+    `;
+  }).join("");
+}
+
+async function refreshAddonManager() {
+  const err = $("addon-error");
+  try {
+    const data = await fetchJSON("/api/model_components");
+    renderAddonManager(data);
+    if (err) err.textContent = "";
+  } catch (e) {
+    if (err) err.textContent = e.message || "读取附加包状态失败";
+  }
+}
+
+function openAddonManager() {
+  $("addon-modal")?.classList.remove("hidden");
+  refreshAddonManager();
+  if (!addonPollHandle) {
+    addonPollHandle = setInterval(refreshAddonManager, 1200);
+  }
+}
+
+function closeAddonManager() {
+  $("addon-modal")?.classList.add("hidden");
+  if (addonPollHandle) {
+    clearInterval(addonPollHandle);
+    addonPollHandle = null;
+  }
+}
 
 async function requestModelComponentInstall(componentId) {
   if (!componentId) return;
   const isExpert = componentId === "expert";
+  openAddonManager();
   setStatus(isExpert ? "正在安装完整 Expert 组件" : "正在检查增强组件", "busy");
   try {
-    await fetchJSON("/api/model_components/install", {
+    const installResult = await fetchJSON("/api/model_components/install", {
       method: "POST",
       body: JSON.stringify({ id: componentId }),
     });
+    if (installResult?.paused) {
+      toast("组件下载已暂停");
+      setStatus("组件下载已暂停", "waiting");
+      return;
+    }
+    if (installResult?.cancelled) {
+      toast("组件下载已取消");
+      setStatus("组件下载已取消", "idle");
+      return;
+    }
+    if (installResult?.ok === false) {
+      throw new Error(installResult.error || "组件安装未完成");
+    }
     const cap = await fetchJSON("/api/capabilities");
     applyBackendCapabilities(cap);
     toast(isExpert ? "完整 Expert 组件已安装" : "增强组件已安装");
@@ -643,7 +771,69 @@ async function requestModelComponentInstall(componentId) {
     toast(err.message || "增强组件安装器尚未完成");
     setStatus(isExpert ? "完整 Expert 组件暂不可安装" : "增强组件暂不可安装", "error");
   }
+  refreshAddonManager();
 }
+
+$("addon-manager-btn")?.addEventListener("click", openAddonManager);
+$("addon-close")?.addEventListener("click", closeAddonManager);
+$("addon-modal")?.addEventListener("click", (event) => {
+  if (event.target === $("addon-modal")) closeAddonManager();
+});
+$("addon-list")?.addEventListener("click", async (event) => {
+  const target = event.target;
+  const btn = target?.closest ? target.closest("button") : null;
+  if (!btn) return;
+  const id = btn.dataset.id || "expert";
+  if (btn.classList.contains("addon-refresh")) {
+    refreshAddonManager();
+    return;
+  }
+  if (btn.classList.contains("addon-install")) {
+    await requestModelComponentInstall(id);
+    return;
+  }
+  if (btn.classList.contains("addon-pause")) {
+    try {
+      await fetchJSON("/api/model_components/pause", {
+        method: "POST",
+        body: JSON.stringify({ id }),
+      });
+      toast("已请求暂停下载");
+    } catch (e) {
+      toast(e.message || "暂停下载失败");
+    }
+    refreshAddonManager();
+    return;
+  }
+  if (btn.classList.contains("addon-cancel")) {
+    try {
+      await fetchJSON("/api/model_components/cancel", {
+        method: "POST",
+        body: JSON.stringify({ id }),
+      });
+      toast("已请求取消下载");
+    } catch (e) {
+      toast(e.message || "取消下载失败");
+    }
+    refreshAddonManager();
+    return;
+  }
+  if (btn.classList.contains("addon-delete")) {
+    if (!window.confirm("确定删除这个附加包吗？删除后 Expert/Tycoon 需要重新安装组件才能使用。")) return;
+    try {
+      await fetchJSON("/api/model_components/delete", {
+        method: "POST",
+        body: JSON.stringify({ id }),
+      });
+      const cap = await fetchJSON("/api/capabilities");
+      applyBackendCapabilities(cap);
+      toast("附加包已删除");
+    } catch (e) {
+      toast(e.message || "删除附加包失败");
+    }
+    refreshAddonManager();
+  }
+});
 
 function applyBackendCapabilities(cap) {
   backendCapabilities = cap || {};
@@ -729,6 +919,35 @@ function applyBackendCapabilities(cap) {
   } catch {}
 })();
 
+function appVersionParts(version) {
+  return String(version || "")
+    .trim()
+    .replace(/^v/i, "")
+    .split(/[^0-9]+/)
+    .filter(Boolean)
+    .map((part) => Number.parseInt(part, 10) || 0);
+}
+function isRemoteVersionNewer(remote, current) {
+  const left = appVersionParts(remote);
+  const right = appVersionParts(current);
+  const len = Math.max(left.length, right.length, 1);
+  for (let i = 0; i < len; i += 1) {
+    const a = left[i] || 0;
+    const b = right[i] || 0;
+    if (a > b) return true;
+    if (a < b) return false;
+  }
+  return false;
+}
+function isHttpUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
 async function checkAppUpdate() {
   const btn = $("app-update-btn");
   if (!btn) return;
@@ -743,11 +962,13 @@ async function checkAppUpdate() {
   };
   try {
     const data = await fetchJSON("/api/app_update");
-    if (!data?.update_available || !data.url) {
+    const latest = data?.latest_version || "";
+    const current = data?.current_version || "";
+    const updateAvailable = !!data?.update_available && isRemoteVersionNewer(latest, current);
+    if (!updateAvailable || !isHttpUrl(data.url)) {
       clearUpdate();
       return;
     }
-    const latest = data.latest_version || "";
     const notes = (data.notes || "").trim();
     const publishedAt = data.published_at || "";
     btn.textContent = "有新版本";
@@ -970,10 +1191,6 @@ $("browse-btn").addEventListener("click", async () => {
       if (desktop.folder) applyPickedFolder(desktop.folder);
       return;
     }
-
-    const r = await fetchJSON("/api/browse_folder", { method: "POST" });
-    if (r.cancelled) return;
-    if (r.folder) applyPickedFolder(r.folder);
   } catch (e) {
     toast("无法打开选择对话框：" + e.message);
   } finally {

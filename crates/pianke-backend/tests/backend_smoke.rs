@@ -277,6 +277,7 @@ fn start_test_backend(token: &str) -> (tempfile::TempDir, pianke_backend::Server
         port,
         token: Some(token.to_string()),
         backend_dir: backend.path().to_path_buf(),
+        folder_picker: None,
     })
     .expect("start backend");
     let base = format!("http://127.0.0.1:{port}");
@@ -298,6 +299,7 @@ fn start_test_backend_in(
         port,
         token: Some(token.to_string()),
         backend_dir: backend.path().to_path_buf(),
+        folder_picker: None,
     })
     .expect("start backend");
     let base = format!("http://127.0.0.1:{port}");
@@ -1184,6 +1186,31 @@ fn model_component_install_from_source_dir_updates_capabilities() {
         .expect("capabilities json");
     assert_eq!(capabilities["expert_installed"], true);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
+
+    let delete: Value = client
+        .post(format!("{base}/api/model_components/delete"))
+        .header("X-Token", token)
+        .json(&json!({"id": "expert"}))
+        .send()
+        .expect("delete response")
+        .json()
+        .expect("delete json");
+    assert_eq!(delete["ok"], true);
+    assert_eq!(delete["component"]["status"], "not_installed");
+    assert!(!install_dir.exists());
+
+    let capabilities_after_delete: Value = client
+        .get(format!("{base}/api/capabilities"))
+        .header("X-Token", token)
+        .send()
+        .expect("capabilities after delete response")
+        .json()
+        .expect("capabilities after delete json");
+    assert_eq!(capabilities_after_delete["expert_installed"], false);
+    assert_eq!(
+        capabilities_after_delete["model_components"]["expert"],
+        "not_installed"
+    );
 }
 
 #[test]

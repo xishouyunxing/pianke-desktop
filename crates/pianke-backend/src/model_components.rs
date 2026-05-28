@@ -4,11 +4,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 const MANIFEST_FILENAME: &str = "component.json";
 const INSTALL_STATE_FILENAME: &str = "install_state.json";
+const INSTALL_CONTROL_FILENAME: &str = "install_control.json";
 pub const DEFAULT_EXPERT_MANIFEST_URL: &str =
     "https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json";
 
@@ -134,6 +136,81 @@ impl ModelManager {
         }
     }
 
+    pub fn delete(&self, id: &str) -> Result<ComponentView, (StatusCode, Value)> {
+        let Some(def) = component_catalog().into_iter().find(|c| c.id == id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                json!({
+                    "error": format!("unknown model component: {id}"),
+                    "unavailable": true
+                }),
+            ));
+        };
+        let install_dir = self.cache_dir.join(def.id);
+        let temp_dir = self.cache_dir.join(format!("{}.installing", def.id));
+        if let Some(state) = read_install_state(&install_dir.join(INSTALL_STATE_FILENAME)) {
+            if state.status == "running" {
+                return Err((
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": "组件正在安装中，当前版本请等待安装结束后再删除。",
+                        "component": self.view_for(def)
+                    }),
+                ));
+            }
+        }
+        if install_dir.exists() {
+            fs::remove_dir_all(&install_dir)
+                .map_err(|e| server_error(format!("remove component failed: {e}")))?;
+        }
+        if temp_dir.exists() {
+            fs::remove_dir_all(&temp_dir)
+                .map_err(|e| server_error(format!("remove temp component failed: {e}")))?;
+        }
+        Ok(self.view_for(def))
+    }
+
+    pub fn pause(&self, id: &str) -> Result<ComponentView, (StatusCode, Value)> {
+        self.write_control(id, InstallControl::pause())
+    }
+
+    pub fn cancel(&self, id: &str) -> Result<ComponentView, (StatusCode, Value)> {
+        self.write_control(id, InstallControl::cancel())
+    }
+
+    fn write_control(
+        &self,
+        id: &str,
+        control: InstallControl,
+    ) -> Result<ComponentView, (StatusCode, Value)> {
+        let Some(def) = component_catalog().into_iter().find(|c| c.id == id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                json!({
+                    "error": format!("unknown model component: {id}"),
+                    "unavailable": true
+                }),
+            ));
+        };
+        let install_dir = self.cache_dir.join(def.id);
+        fs::create_dir_all(&install_dir)
+            .map_err(|e| server_error(format!("create component dir failed: {e}")))?;
+        write_install_control(&install_dir.join(INSTALL_CONTROL_FILENAME), &control)
+            .map_err(server_error)?;
+        let state_path = install_dir.join(INSTALL_STATE_FILENAME);
+        if let Some(mut state) = read_install_state(&state_path) {
+            if state.status == "running" || state.status == "pause_requested" {
+                state.status = if control.cancel_requested {
+                    "cancel_requested".to_string()
+                } else {
+                    "pause_requested".to_string()
+                };
+                write_install_state(&state_path, &state).map_err(server_error)?;
+            }
+        }
+        Ok(self.view_for(def))
+    }
+
     fn view_for(&self, def: ComponentDef) -> ComponentView {
         let install_dir = self.cache_dir.join(def.id);
         let manifest_path = install_dir.join(MANIFEST_FILENAME);
@@ -194,6 +271,9 @@ impl ModelManager {
         let install_dir = self.cache_dir.join(def.id);
         let temp_dir = self.cache_dir.join(format!("{}.installing", def.id));
         let state_path = install_dir.join(INSTALL_STATE_FILENAME);
+        let can_resume_temp = read_install_state(&state_path)
+            .map(|state| state.status == "paused")
+            .unwrap_or(false);
         if let Err(err) = fs::create_dir_all(&install_dir) {
             return Err(server_error(format!("create component dir failed: {err}")));
         }
@@ -202,6 +282,8 @@ impl ModelManager {
             &InstallState::running(def.id, "reading_manifest", 0, 1),
         )
         .map_err(server_error)?;
+        let control_path = install_dir.join(INSTALL_CONTROL_FILENAME);
+        let _ = fs::remove_file(&control_path);
 
         let loaded = load_manifest(source).await.map_err(server_error)?;
         let mut manifest = loaded.manifest;
@@ -224,7 +306,7 @@ impl ModelManager {
             )));
         }
 
-        if temp_dir.exists() {
+        if temp_dir.exists() && !can_resume_temp {
             fs::remove_dir_all(&temp_dir).map_err(|e| {
                 server_error(format!("remove stale temp component dir failed: {e}"))
             })?;
@@ -233,6 +315,8 @@ impl ModelManager {
             .map_err(|e| server_error(format!("create temp component dir failed: {e}")))?;
 
         let total = manifest.files.len().max(1);
+        let total_bytes: u64 = manifest.files.iter().filter_map(|file| file.size_bytes).sum();
+        let mut completed_bytes = 0_u64;
         for (idx, file) in manifest.files.iter().enumerate() {
             let rel = safe_relative_path(&file.path)
                 .ok_or_else(|| bad_request(format!("unsafe model file path: {}", file.path)))?;
@@ -242,14 +326,79 @@ impl ModelManager {
                     .map_err(|e| server_error(format!("create model subdir failed: {e}")))?;
             }
             let label = rel.to_string_lossy().to_string();
+            if target.exists() {
+                let existing_len = fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+                if file.size_bytes.map(|size| size == existing_len).unwrap_or(true) {
+                    completed_bytes = completed_bytes.saturating_add(existing_len);
+                    continue;
+                }
+            }
             write_install_state(
                 &state_path,
-                &InstallState::running(def.id, &label, idx, total),
+                &InstallState::running(def.id, &label, idx, total)
+                    .with_total_bytes(completed_bytes, total_bytes)
+                    .with_file_bytes(0, file.size_bytes.unwrap_or(0)),
             )
             .map_err(server_error)?;
-            let bytes = load_component_file(file, loaded.base_dir.as_deref())
-                .await
-                .map_err(server_error)?;
+            let outcome = load_component_file_to_path(
+                file,
+                loaded.base_dir.as_deref(),
+                &target,
+                &state_path,
+                &control_path,
+                DownloadProgress {
+                    id: def.id,
+                    label: &label,
+                    done: idx,
+                    total,
+                    completed_bytes,
+                    total_bytes,
+                },
+            )
+            .await
+            .map_err(server_error)?;
+            match outcome {
+                DownloadOutcome::Complete(bytes_written) => {
+                    completed_bytes = completed_bytes.saturating_add(bytes_written);
+                }
+                DownloadOutcome::Paused => {
+                    write_install_state(
+                        &state_path,
+                        &InstallState::paused(def.id, &label, idx, total)
+                            .with_total_bytes(completed_bytes, total_bytes),
+                    )
+                    .map_err(server_error)?;
+                    return Err((
+                        StatusCode::OK,
+                        json!({
+                            "ok": false,
+                            "paused": true,
+                            "component": self.view_for(def),
+                            "cache_dir": self.cache_dir.to_string_lossy()
+                        }),
+                    ));
+                }
+                DownloadOutcome::Cancelled => {
+                    write_install_state(
+                        &state_path,
+                        &InstallState::cancelled(def.id, &label, idx, total)
+                            .with_total_bytes(completed_bytes, total_bytes),
+                    )
+                    .map_err(server_error)?;
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    return Err((
+                        StatusCode::OK,
+                        json!({
+                            "ok": false,
+                            "cancelled": true,
+                            "component": self.view_for(def),
+                            "cache_dir": self.cache_dir.to_string_lossy()
+                        }),
+                    ));
+                }
+            }
+            let bytes = fs::read(&target)
+                .map_err(|e| server_error(format!("read downloaded component file failed: {e}")))?;
             if let Some(expected_size) = file.size_bytes {
                 if expected_size != bytes.len() as u64 {
                     return Err(bad_request(format!(
@@ -269,8 +418,6 @@ impl ModelManager {
                     )));
                 }
             }
-            fs::write(&target, bytes)
-                .map_err(|e| server_error(format!("write model file failed: {e}")))?;
         }
 
         manifest.installed_at = Some(chrono_like_timestamp());
@@ -290,7 +437,7 @@ impl ModelManager {
             .map_err(|e| server_error(format!("activate component failed: {e}")))?;
         write_install_state(
             &install_dir.join(INSTALL_STATE_FILENAME),
-            &InstallState::done(def.id, total),
+            &InstallState::done(def.id, total).with_total_bytes(completed_bytes, total_bytes),
         )
         .map_err(server_error)?;
         Ok(self.view_for(def))
@@ -353,6 +500,14 @@ pub struct InstallState {
     pub total: usize,
     pub current: String,
     #[serde(default)]
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub bytes_total: u64,
+    #[serde(default)]
+    pub current_file_bytes_done: u64,
+    #[serde(default)]
+    pub current_file_bytes_total: u64,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -364,6 +519,40 @@ impl InstallState {
             done,
             total,
             current: current.to_string(),
+            bytes_done: 0,
+            bytes_total: 0,
+            current_file_bytes_done: 0,
+            current_file_bytes_total: 0,
+            error: None,
+        }
+    }
+
+    fn paused(id: &str, current: &str, done: usize, total: usize) -> Self {
+        Self {
+            id: id.to_string(),
+            status: "paused".to_string(),
+            done,
+            total,
+            current: current.to_string(),
+            bytes_done: 0,
+            bytes_total: 0,
+            current_file_bytes_done: 0,
+            current_file_bytes_total: 0,
+            error: None,
+        }
+    }
+
+    fn cancelled(id: &str, current: &str, done: usize, total: usize) -> Self {
+        Self {
+            id: id.to_string(),
+            status: "cancelled".to_string(),
+            done,
+            total,
+            current: current.to_string(),
+            bytes_done: 0,
+            bytes_total: 0,
+            current_file_bytes_done: 0,
+            current_file_bytes_total: 0,
             error: None,
         }
     }
@@ -375,7 +564,47 @@ impl InstallState {
             done: total,
             total,
             current: String::new(),
+            bytes_done: 0,
+            bytes_total: 0,
+            current_file_bytes_done: 0,
+            current_file_bytes_total: 0,
             error: None,
+        }
+    }
+
+    fn with_total_bytes(mut self, done: u64, total: u64) -> Self {
+        self.bytes_done = done;
+        self.bytes_total = total;
+        self
+    }
+
+    fn with_file_bytes(mut self, done: u64, total: u64) -> Self {
+        self.current_file_bytes_done = done;
+        self.current_file_bytes_total = total;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct InstallControl {
+    #[serde(default)]
+    pause_requested: bool,
+    #[serde(default)]
+    cancel_requested: bool,
+}
+
+impl InstallControl {
+    fn pause() -> Self {
+        Self {
+            pause_requested: true,
+            cancel_requested: false,
+        }
+    }
+
+    fn cancel() -> Self {
+        Self {
+            pause_requested: false,
+            cancel_requested: true,
         }
     }
 }
@@ -458,6 +687,21 @@ fn write_install_state(path: &Path, state: &InstallState) -> Result<(), String> 
     fs::write(path, data).map_err(|e| e.to_string())
 }
 
+fn read_install_control(path: &Path) -> InstallControl {
+    let Ok(text) = fs::read_to_string(path) else {
+        return InstallControl::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_install_control(path: &Path, control: &InstallControl) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let data = serde_json::to_vec_pretty(control).map_err(|e| e.to_string())?;
+    fs::write(path, data).map_err(|e| e.to_string())
+}
+
 enum InstallSource {
     SourceDir(PathBuf),
     ManifestPath(PathBuf),
@@ -480,8 +724,8 @@ impl InstallSource {
                     .map(|u| Self::ManifestUrl(u.clone()))
             })
             .or_else(|| Self::from_environment(&req.id))
-            .or_else(|| Self::local_packaged(&req.id))
             .or_else(|| Self::default_official(&req.id))
+            .or_else(|| Self::local_packaged(&req.id))
     }
 
     fn from_environment(id: &str) -> Option<Self> {
@@ -589,31 +833,183 @@ fn parse_manifest_text(text: &str) -> Result<ComponentManifest, serde_json::Erro
     serde_json::from_str(text.trim_start_matches('\u{feff}').trim_start())
 }
 
-async fn load_component_file(
+struct DownloadProgress<'a> {
+    id: &'a str,
+    label: &'a str,
+    done: usize,
+    total: usize,
+    completed_bytes: u64,
+    total_bytes: u64,
+}
+
+enum DownloadOutcome {
+    Complete(u64),
+    Paused,
+    Cancelled,
+}
+
+async fn load_component_file_to_path(
     file: &ComponentFile,
     base_dir: Option<&Path>,
-) -> Result<Vec<u8>, String> {
+    target: &Path,
+    state_path: &Path,
+    control_path: &Path,
+    progress: DownloadProgress<'_>,
+) -> Result<DownloadOutcome, String> {
     if let Some(url) = &file.url {
         if url.starts_with("file://") {
             let path = file_url_to_path(url);
-            return fs::read(path).map_err(|e| format!("read component file failed: {e}"));
+            return copy_component_file_to_path(
+                &path,
+                target,
+                state_path,
+                control_path,
+                progress,
+                file.size_bytes.unwrap_or(0),
+            );
         }
-        return reqwest::get(url)
+        return download_component_url_to_path(file, url, target, state_path, control_path, progress)
             .await
-            .map_err(|e| format!("download component file failed: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("download component file failed: {e}"))?
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("read component file body failed: {e}"));
+            .map_err(|e| format!("download component file failed: {e}"));
     }
     let Some(base_dir) = base_dir else {
         return Err(format!("component file {} has no url", file.path));
     };
     let rel = safe_relative_path(&file.path)
         .ok_or_else(|| format!("unsafe model file path: {}", file.path))?;
-    fs::read(base_dir.join(rel)).map_err(|e| format!("read component file failed: {e}"))
+    copy_component_file_to_path(
+        &base_dir.join(rel),
+        target,
+        state_path,
+        control_path,
+        progress,
+        file.size_bytes.unwrap_or(0),
+    )
+}
+
+fn copy_component_file_to_path(
+    source: &Path,
+    target: &Path,
+    state_path: &Path,
+    control_path: &Path,
+    progress: DownloadProgress<'_>,
+    expected_size: u64,
+) -> Result<DownloadOutcome, String> {
+    let part = part_path(target);
+    let mut input = fs::File::open(source).map_err(|e| format!("read component file failed: {e}"))?;
+    let mut output =
+        fs::File::create(&part).map_err(|e| format!("create component temp file failed: {e}"))?;
+    let mut buffer = [0_u8; 1024 * 256];
+    let mut file_done = 0_u64;
+    loop {
+        let control = read_install_control(control_path);
+        if control.cancel_requested {
+            return Ok(DownloadOutcome::Cancelled);
+        }
+        if control.pause_requested {
+            return Ok(DownloadOutcome::Paused);
+        }
+        let n = input
+            .read(&mut buffer)
+            .map_err(|e| format!("read component file failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..n])
+            .map_err(|e| format!("write component temp file failed: {e}"))?;
+        file_done += n as u64;
+        write_install_state(
+            state_path,
+            &InstallState::running(progress.id, progress.label, progress.done, progress.total)
+                .with_total_bytes(progress.completed_bytes + file_done, progress.total_bytes)
+                .with_file_bytes(file_done, expected_size),
+        )?;
+    }
+    output
+        .flush()
+        .map_err(|e| format!("flush component temp file failed: {e}"))?;
+    fs::rename(&part, target).map_err(|e| format!("activate component file failed: {e}"))?;
+    Ok(DownloadOutcome::Complete(file_done))
+}
+
+async fn download_component_url_to_path(
+    file: &ComponentFile,
+    url: &str,
+    target: &Path,
+    state_path: &Path,
+    control_path: &Path,
+    progress: DownloadProgress<'_>,
+) -> Result<DownloadOutcome, String> {
+    let part = part_path(target);
+    let existing = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let client = reqwest::Client::new();
+    let mut request = client.get(url);
+    if existing > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("server returned error: {e}"))?;
+    let range_accepted = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let append = existing > 0 && range_accepted;
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&part)
+        .map_err(|e| format!("create component temp file failed: {e}"))?;
+    let mut file_done = if append { existing } else { 0 };
+    let file_total = file.size_bytes.unwrap_or_else(|| {
+        response
+            .content_length()
+            .map(|len| len + file_done)
+            .unwrap_or(0)
+    });
+    loop {
+        let control = read_install_control(control_path);
+        if control.cancel_requested {
+            return Ok(DownloadOutcome::Cancelled);
+        }
+        if control.pause_requested {
+            return Ok(DownloadOutcome::Paused);
+        }
+        let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("read response body failed: {e}"))?
+        else {
+            break;
+        };
+        output
+            .write_all(&chunk)
+            .map_err(|e| format!("write component temp file failed: {e}"))?;
+        file_done += chunk.len() as u64;
+        write_install_state(
+            state_path,
+            &InstallState::running(progress.id, progress.label, progress.done, progress.total)
+                .with_total_bytes(progress.completed_bytes + file_done, progress.total_bytes)
+                .with_file_bytes(file_done, file_total),
+        )?;
+    }
+    output
+        .flush()
+        .map_err(|e| format!("flush component temp file failed: {e}"))?;
+    fs::rename(&part, target).map_err(|e| format!("activate component file failed: {e}"))?;
+    Ok(DownloadOutcome::Complete(file_done))
+}
+
+fn part_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".part");
+    target.with_file_name(name)
 }
 
 fn file_url_to_path(url: &str) -> PathBuf {
@@ -820,7 +1216,38 @@ mod tests {
             .join("models")
             .join("dinov2-small.onnx")
             .exists());
+        let state = expert.install_state.as_ref().expect("install state");
+        assert_eq!(state.status, "done");
+        assert_eq!(state.bytes_done, model_bytes.len() as u64);
+        assert_eq!(state.bytes_total, model_bytes.len() as u64);
         assert!(manager.available_engines().contains(&"expert".to_string()));
+    }
+
+    #[test]
+    fn pause_and_cancel_update_running_install_state() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manager = ModelManager::new(temp.path().join("models"));
+        let install_dir = manager.cache_dir.join("expert");
+        fs::create_dir_all(&install_dir).expect("install dir");
+        write_install_state(
+            &install_dir.join(INSTALL_STATE_FILENAME),
+            &InstallState::running("expert", "models/dinov2-small.onnx", 0, 1)
+                .with_total_bytes(4, 10)
+                .with_file_bytes(4, 10),
+        )
+        .expect("running state");
+
+        let paused = manager.pause("expert").expect("pause");
+        let paused_state = paused.install_state.expect("paused state");
+        assert_eq!(paused_state.status, "pause_requested");
+        let control = read_install_control(&install_dir.join(INSTALL_CONTROL_FILENAME));
+        assert!(control.pause_requested);
+
+        let cancelled = manager.cancel("expert").expect("cancel");
+        let cancelled_state = cancelled.install_state.expect("cancel state");
+        assert_eq!(cancelled_state.status, "cancel_requested");
+        let control = read_install_control(&install_dir.join(INSTALL_CONTROL_FILENAME));
+        assert!(control.cancel_requested);
     }
 
     #[tokio::test]

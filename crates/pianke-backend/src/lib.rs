@@ -58,11 +58,11 @@ const RAW_EXTS: &[&str] = &[
 const HEIC_EXTS: &[&str] = &[".heic", ".heif"];
 const SIDECAR_EXTS: &[&str] = &[".xmp"];
 
-#[derive(Debug)]
 pub struct ServerOptions {
     pub port: u16,
     pub token: Option<String>,
     pub backend_dir: PathBuf,
+    pub folder_picker: Option<Arc<dyn Fn() -> Result<Option<PathBuf>, String> + Send + Sync>>,
 }
 
 #[derive(Debug)]
@@ -97,6 +97,7 @@ struct AppCtx {
     backend_dir: PathBuf,
     models: ModelManager,
     llm: LlmProviderManager,
+    folder_picker: Option<Arc<dyn Fn() -> Result<Option<PathBuf>, String> + Send + Sync>>,
 }
 
 #[derive(Debug, Default)]
@@ -370,6 +371,7 @@ pub fn start(options: ServerOptions) -> Result<ServerHandle, String> {
         models: ModelManager::new(options.backend_dir.join("model_components")),
         llm: LlmProviderManager::new(options.backend_dir.join("llm_provider")),
         backend_dir: options.backend_dir,
+        folder_picker: options.folder_picker,
     };
     let app = build_router(ctx);
     let (tx, rx) = oneshot::channel::<()>();
@@ -405,6 +407,18 @@ fn build_router(ctx: AppCtx) -> Router {
         .route(
             "/api/model_components/install",
             post(model_component_install),
+        )
+        .route(
+            "/api/model_components/delete",
+            post(model_component_delete),
+        )
+        .route(
+            "/api/model_components/pause",
+            post(model_component_pause),
+        )
+        .route(
+            "/api/model_components/cancel",
+            post(model_component_cancel),
         )
         .route(
             "/api/llm/provider",
@@ -690,6 +704,57 @@ async fn model_component_install(
 ) -> impl IntoResponse {
     match ctx.models.install(req).await {
         Ok((status, body)) | Err((status, body)) => (status, Json(body)),
+    }
+}
+
+async fn model_component_delete(
+    State(ctx): State<AppCtx>,
+    Json(req): Json<ComponentInstallRequest>,
+) -> impl IntoResponse {
+    match ctx.models.delete(&req.id) {
+        Ok(component) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "component": component,
+                "cache_dir": ctx.models.cache_dir().to_string_lossy()
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+async fn model_component_pause(
+    State(ctx): State<AppCtx>,
+    Json(req): Json<ComponentInstallRequest>,
+) -> impl IntoResponse {
+    match ctx.models.pause(&req.id) {
+        Ok(component) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "component": component,
+                "cache_dir": ctx.models.cache_dir().to_string_lossy()
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
+    }
+}
+
+async fn model_component_cancel(
+    State(ctx): State<AppCtx>,
+    Json(req): Json<ComponentInstallRequest>,
+) -> impl IntoResponse {
+    match ctx.models.cancel(&req.id) {
+        Ok(component) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "component": component,
+                "cache_dir": ctx.models.cache_dir().to_string_lossy()
+            })),
+        ),
+        Err((status, body)) => (status, Json(body)),
     }
 }
 
@@ -1007,25 +1072,25 @@ async fn watermark_open_out_dir(State(ctx): State<AppCtx>) -> impl IntoResponse 
     }
 }
 
-async fn browse_folder() -> impl IntoResponse {
-    match tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new()
-            .set_title("选择照片文件夹")
-            .pick_folder()
-    })
-    .await
-    {
-        Ok(Some(path)) => Json(json!({
-            "ok": true,
-            "folder": path.to_string_lossy(),
-        }))
-        .into_response(),
-        Ok(None) => Json(json!({"ok": true, "cancelled": true})).into_response(),
-        Err(err) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("打开选择对话框失败: {err}"),
-        ),
+async fn browse_folder(State(ctx): State<AppCtx>) -> impl IntoResponse {
+    if let Some(picker) = ctx.folder_picker.clone() {
+        return match (picker)() {
+            Ok(Some(path)) => Json(json!({
+                "ok": true,
+                "folder": path.to_string_lossy(),
+            }))
+            .into_response(),
+            Ok(None) => Json(json!({"ok": true, "cancelled": true})).into_response(),
+            Err(err) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("打开选择对话框失败: {err}"),
+            ),
+        };
     }
+    json_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "当前运行环境不支持系统选择对话框，请手动粘贴照片文件夹路径。",
+    )
 }
 
 async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> Response {

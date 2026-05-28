@@ -222,6 +222,7 @@ code {
   white-space: nowrap;
   transition: background .18s var(--ease), border-color .18s var(--ease), transform .18s var(--ease);
 }
+.app-update-btn.hidden { display: none; }
 .app-update-btn:hover {
   background: #f7d4c2;
   border-color: rgba(178, 92, 65, 0.54);
@@ -282,6 +283,25 @@ code {
   margin-top: 10px;
   color: var(--accent-deep);
   font-weight: 600;
+}
+.addon-manager-btn {
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,.5);
+  color: var(--ink-muted);
+  border-radius: 999px;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .18s var(--ease), border-color .18s var(--ease), color .18s var(--ease), transform .18s var(--ease);
+}
+.addon-manager-btn:hover {
+  background: var(--bg-card);
+  color: var(--ink);
+  border-color: var(--ink-faint);
+  transform: translateY(-1px);
 }
 
 .landing-main {
@@ -2038,6 +2058,98 @@ span.sc-item { color: var(--ink-faint); }
 .modal-actions {
   display: flex; justify-content: flex-end; gap: 12px;
 }
+
+.addon-modal.hidden { display: none; }
+.addon-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 155;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(20,17,13,.32);
+  backdrop-filter: blur(10px);
+}
+.addon-card {
+  width: min(760px, 100%);
+  max-height: min(720px, calc(100vh - 48px));
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-card);
+  box-shadow: var(--shadow-lg);
+  padding: 22px;
+}
+.addon-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 18px;
+}
+.addon-head h3 {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 24px;
+  font-weight: 500;
+}
+.addon-head p {
+  margin: 6px 0 0;
+  color: var(--ink-muted);
+  font-size: 13px;
+}
+.addon-list { display: grid; gap: 12px; }
+.addon-item {
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(255,255,255,.45);
+  padding: 15px;
+}
+.addon-item-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+.addon-item h4 { margin: 0; font-size: 15px; }
+.addon-meta { margin-top: 5px; color: var(--ink-muted); font-size: 12px; }
+.addon-status {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.addon-status.installed {
+  color: var(--good);
+  border-color: var(--good-soft);
+  background: rgba(207,217,200,.45);
+}
+.addon-progress { margin-top: 12px; }
+.addon-progress-bar {
+  height: 7px;
+  border-radius: 999px;
+  background: var(--line-faint);
+  overflow: hidden;
+}
+.addon-progress-fill {
+  width: 0%;
+  height: 100%;
+  background: var(--accent);
+  transition: width .2s var(--ease);
+}
+.addon-progress-text { margin-top: 6px; color: var(--ink-muted); font-size: 12px; }
+.addon-models { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.addon-models span {
+  border-radius: 999px;
+  background: var(--bg-warm);
+  color: var(--ink-muted);
+  padding: 3px 8px;
+  font-size: 11px;
+}
+.addon-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.addon-error { min-height: 18px; margin: 12px 0 0; color: var(--accent-deep); font-size: 13px; }
 
 /* =========================================================
    片刻 v3 增量样式
