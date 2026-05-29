@@ -3520,6 +3520,7 @@ dependencies = [
  "opencv",
  "ort",
  "pianke-core",
+ "rayon",
  "reqwest 0.12.28",
  "rfd",
  "rustfft",

@@ -17,6 +17,7 @@ nalgebra = "0.34"
 opencv = { version = "0.98.2", default-features = false, features = ["calib3d", "features2d", "imgproc", "clang-runtime"], optional = true }
 ort = "2.0.0-rc.12"
 pianke-core = { path = "../pianke-core" }
+rayon = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rfd = "0.15"
 rustfft = "6"

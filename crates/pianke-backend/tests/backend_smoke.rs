@@ -1291,6 +1291,44 @@ fn fast_main_flow_copies_winner_and_loser_without_moving_sources() {
 }
 
 #[test]
+fn cached_fast_start_finishes_with_done_equal_to_total() {
+    let token = "cache-progress-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let a = photos.path().join("CACHE_0001.jpg");
+    let b = photos.path().join("CACHE_0002.jpg");
+    let c = photos.path().join("CACHE_0003.jpg");
+    write_jpg(&a, 30);
+    fs::copy(&a, &b).expect("copy identical jpg");
+    write_jpg(&c, 160);
+
+    let client = Client::new();
+    for _ in 0..2 {
+        let start_resp = client
+            .post(format!("{base}/api/start"))
+            .header("X-Token", token)
+            .json(&json!({
+                "folder": photos.path(),
+                "mode": "copy",
+                "engine": "fast",
+                "prescreen_enabled": false
+            }))
+            .send()
+            .expect("start response");
+        assert!(start_resp.status().is_success());
+        let job = wait_for_done(&client, &base, token);
+        assert_eq!(
+            job["done"], job["total"],
+            "job progress should finish full: {job}"
+        );
+        assert!(
+            job["total"].as_u64().expect("job total") >= 2,
+            "expected scanned images: {job}"
+        );
+    }
+}
+
+#[test]
 fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
     let token = "watermark-token";
     let (_backend, _handle, base) = start_test_backend(token);
@@ -1516,6 +1554,97 @@ fn move_mode_moves_files_and_undo_restores_sources() {
             .exists(),
         "undo removes loser target"
     );
+}
+
+#[test]
+fn undo_failure_keeps_retry_state_until_revert_succeeds() {
+    let token = "undo-failure-token";
+    let (_backend, _handle, base) = start_test_backend(token);
+    let photos = tempfile::tempdir().expect("photos dir");
+    let a = photos.path().join("UNDO_FAIL_0001.jpg");
+    let b = photos.path().join("UNDO_FAIL_0002.jpg");
+    write_jpg(&a, 44);
+    fs::copy(&a, &b).expect("copy identical jpg");
+
+    let client = Client::new();
+    let start_resp = client
+        .post(format!("{base}/api/start"))
+        .header("X-Token", token)
+        .json(&json!({
+            "folder": photos.path(),
+            "mode": "copy",
+            "engine": "fast",
+            "prescreen_enabled": false
+        }))
+        .send()
+        .expect("start response");
+    assert!(start_resp.status().is_success());
+    wait_for_done(&client, &base, token);
+
+    let group_resp: Value = client
+        .get(format!("{base}/api/group"))
+        .header("X-Token", token)
+        .send()
+        .expect("group response")
+        .json()
+        .expect("group json");
+    let left = group_resp["group"]["left"]
+        .as_str()
+        .expect("left path")
+        .to_string();
+    let right = group_resp["group"]["right"]
+        .as_str()
+        .expect("right path")
+        .to_string();
+
+    let choose_resp = client
+        .post(format!("{base}/api/choose"))
+        .header("X-Token", token)
+        .json(&json!({"loser": "right"}))
+        .send()
+        .expect("choose response");
+    assert!(choose_resp.status().is_success());
+
+    let winner_target = photos.path().join("winners").join(file_name(&left));
+    let loser_target = photos.path().join("losers").join(file_name(&right));
+    assert!(winner_target.exists());
+    assert!(loser_target.exists());
+    fs::remove_file(&winner_target).expect("remove winner target");
+    fs::remove_file(&loser_target).expect("remove loser target");
+
+    let failed_undo = client
+        .post(format!("{base}/api/undo"))
+        .header("X-Token", token)
+        .send()
+        .expect("failed undo response");
+    assert_eq!(failed_undo.status(), 409);
+    let failed_json: Value = failed_undo.json().expect("failed undo json");
+    assert_eq!(
+        failed_json["failed"].as_array().expect("failed list").len(),
+        2
+    );
+
+    let retry_group: Value = client
+        .get(format!("{base}/api/group"))
+        .header("X-Token", token)
+        .send()
+        .expect("retry group response")
+        .json()
+        .expect("retry group json");
+    assert_eq!(retry_group["group"]["can_undo"], true);
+
+    fs::copy(&left, &winner_target).expect("restore winner target");
+    fs::copy(&right, &loser_target).expect("restore loser target");
+    let undo_resp: Value = client
+        .post(format!("{base}/api/undo"))
+        .header("X-Token", token)
+        .send()
+        .expect("retry undo response")
+        .json()
+        .expect("retry undo json");
+    assert_eq!(undo_resp["group"]["can_undo"], false);
+    assert!(!winner_target.exists(), "retry removes winner copy");
+    assert!(!loser_target.exists(), "retry removes loser copy");
 }
 
 #[test]

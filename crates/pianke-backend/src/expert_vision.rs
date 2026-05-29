@@ -2305,7 +2305,7 @@ mod tests {
                 .get("strength")
                 .and_then(|v| v.as_str())
                 .unwrap_or("standard");
-            crate::apply_expert_quality_scores(&mut record, actual, strength);
+            crate::job::apply_expert_quality_scores(&mut record, actual, strength);
             let q = record.info.quality.expect("quality");
             if let Some(expected_quality) = item.get("quality") {
                 assert_eq!(
@@ -2421,7 +2421,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let actual = crate::expert_cluster(infos);
+        let actual = crate::clustering::expert_cluster(infos);
         assert_eq!(actual, expected, "Expert/Tycoon grouping parity mismatch");
     }
 

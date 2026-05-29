@@ -34,6 +34,9 @@ impl FastQualityProfile {
                 horizon_severe_deg: 15.0,
                 score_adjust: 0.0,
                 score_floor: 35.0,
+                color_noise_high: 0.75,
+                color_cast_high: 28.0,
+                dynamic_range_low: 30.0,
             },
             Self::Advanced => Thresholds {
                 subject_sharp: 1100.0,
@@ -53,6 +56,9 @@ impl FastQualityProfile {
                 horizon_severe_deg: 12.0,
                 score_adjust: -6.0,
                 score_floor: 45.0,
+                color_noise_high: 0.60,
+                color_cast_high: 22.0,
+                dynamic_range_low: 40.0,
             },
         }
     }
@@ -77,6 +83,9 @@ struct Thresholds {
     horizon_severe_deg: f64,
     score_adjust: f64,
     score_floor: f64,
+    color_noise_high: f64,
+    color_cast_high: f64,
+    dynamic_range_low: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +109,9 @@ pub struct FastQualitySignals {
     pub composition: Option<f64>,
     pub worst_clip_dark: f64,
     pub worst_clip_bright: f64,
+    pub color_noise: Option<f64>,
+    pub color_cast: Option<f64>,
+    pub dynamic_range: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -180,6 +192,22 @@ pub fn analyze_from_signals(
         }
     }
 
+    if let Some(cn) = signals.color_noise {
+        if cn > p.color_noise_high {
+            flags.push("color_noise".to_string());
+        }
+    }
+    if let Some(cc) = signals.color_cast {
+        if cc > p.color_cast_high {
+            flags.push("color_cast".to_string());
+        }
+    }
+    if let Some(dr) = signals.dynamic_range {
+        if dr < p.dynamic_range_low {
+            flags.push("flat_tone".to_string());
+        }
+    }
+
     let quality_score = compute_score(
         signals.blur_combined,
         signals.brightness_mean,
@@ -233,6 +261,7 @@ fn compute_score(
             "very_blurry" | "motion_blur" | "underexposed" | "overexposed" | "low_information"
             | "horizon_severe" => score -= 22.0,
             "subject_blurry" | "low_contrast" | "horizon_tilt" => score -= 12.0,
+            "color_noise" | "color_cast" | "flat_tone" => score -= 8.0,
             "too_small" | "tiny_file" => score -= 6.0,
             _ => {}
         }
@@ -273,6 +302,9 @@ fn reason_for_fast(flags: &[String]) -> Option<String> {
         "tiny_file",
         "horizon_tilt",
         "low_contrast",
+        "color_noise",
+        "color_cast",
+        "flat_tone",
     ] {
         if flags.iter().any(|f| f == flag) {
             return Some(
@@ -288,6 +320,9 @@ fn reason_for_fast(flags: &[String]) -> Option<String> {
                     "tiny_file" => "文件异常小",
                     "horizon_tilt" => "地平线明显歪斜",
                     "low_contrast" => "反差不足",
+                    "color_noise" => "高 ISO 彩噪明显",
+                    "color_cast" => "白平衡偏色",
+                    "flat_tone" => "动态范围不足 · 画面发灰",
                     _ => flag,
                 }
                 .to_string(),
@@ -326,6 +361,9 @@ mod tests {
             composition: Some(0.7),
             worst_clip_dark: 0.0,
             worst_clip_bright: 0.0,
+            color_noise: Some(0.3),
+            color_cast: Some(10.0),
+            dynamic_range: Some(120.0),
         }
     }
 

@@ -33,6 +33,7 @@ pub struct FastClusterOptions {
     pub threshold: f64,
     pub max_group_size: usize,
     pub orb_inliers: HashMap<(usize, usize), usize>,
+    pub time_halflife: f64,
 }
 
 impl Default for FastClusterOptions {
@@ -41,6 +42,7 @@ impl Default for FastClusterOptions {
             threshold: CLUSTER_DISTANCE_THRESHOLD,
             max_group_size: MAX_GROUP_SIZE,
             orb_inliers: HashMap::new(),
+            time_halflife: TIME_HALFLIFE,
         }
     }
 }
@@ -169,7 +171,7 @@ fn pair_final_sim(
 ) -> f64 {
     let a = &infos[ia];
     let b = &infos[ib];
-    let base = pair_base_sim(a, b);
+    let base = pair_base_sim(a, b, options.time_halflife);
     let hash_sim = hash_combined_sim(a, b);
     if base < ORB_CANDIDATE_BASE && hash_sim < 0.65 {
         return base;
@@ -196,10 +198,10 @@ fn pair_final_sim(
     base
 }
 
-fn pair_base_sim(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
+fn pair_base_sim(a: &FastImageInfo, b: &FastImageInfo, time_halflife: f64) -> f64 {
     let sim_hash = hash_combined_sim(a, b);
     let (sim_color, has_color) = color_sim(a, b).map_or((0.0, false), |v| (v, true));
-    let sim_time = time_sim(time_for_info(a), time_for_info(b));
+    let sim_time = time_sim(time_for_info(a), time_for_info(b), time_halflife);
     let sim_exif = exif_sim(a.exif_summary.as_ref(), b.exif_summary.as_ref());
     let sim_name = name_sim(&file_name(&a.path), &file_name(&b.path));
     let (sim_gps, has_gps) = gps_sim(a.exif_summary.as_ref(), b.exif_summary.as_ref())
@@ -216,12 +218,35 @@ fn pair_base_sim(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
         w_gps = 0.0;
     }
 
-    w_hash * sim_hash
+    let base = w_hash * sim_hash
         + w_color * sim_color
         + w_time * sim_time
         + w_exif * sim_exif
         + w_name * sim_name
-        + w_gps * sim_gps
+        + w_gps * sim_gps;
+
+    let penalty = quality_penalty(a, b);
+    (base - penalty).max(0.0)
+}
+
+fn quality_penalty(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
+    let qa = a.quality.as_ref();
+    let qb = b.quality.as_ref();
+    let (Some(qa), Some(qb)) = (qa, qb) else {
+        return 0.0;
+    };
+    let reject_a = qa.auto_reject.unwrap_or(false);
+    let reject_b = qb.auto_reject.unwrap_or(false);
+    if reject_a != reject_b {
+        return 0.08;
+    }
+    if let (Some(sa), Some(sb)) = (qa.quality_score, qb.quality_score) {
+        let gap = (sa - sb).abs();
+        if gap > 25.0 {
+            return (gap - 25.0) * 0.002;
+        }
+    }
+    0.0
 }
 
 fn hash_combined_sim(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
@@ -266,9 +291,9 @@ fn color_sim(a: &FastImageInfo, b: &FastImageInfo) -> Option<f64> {
     Some(dot.clamp(0.0, 1.0))
 }
 
-fn time_sim(t1: Option<f64>, t2: Option<f64>) -> f64 {
+fn time_sim(t1: Option<f64>, t2: Option<f64>, halflife: f64) -> f64 {
     match (t1, t2) {
-        (Some(a), Some(b)) => (-(a - b).abs() / TIME_HALFLIFE).exp(),
+        (Some(a), Some(b)) => (-(a - b).abs() / halflife).exp(),
         _ => 0.0,
     }
 }
