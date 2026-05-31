@@ -5,7 +5,7 @@ use image::{
     DynamicImage, ImageBuffer, Rgba, RgbaImage,
 };
 use imageproc::{
-    drawing::{draw_filled_rect_mut, draw_text_mut},
+    drawing::{draw_filled_rect_mut, draw_hollow_rect_mut, draw_line_segment_mut, draw_text_mut},
     rect::Rect,
 };
 use once_cell::sync::OnceCell;
@@ -285,15 +285,7 @@ fn render_template(
             !template.ends_with("_clean"),
             false,
         ),
-        TemplateFamily::C => render_bottom_bar(
-            root_dir,
-            img,
-            exif,
-            0.12,
-            false,
-            !template.ends_with("_clean"),
-            true,
-        ),
+        TemplateFamily::C => render_glass_overlay(root_dir, img, exif, !template.ends_with("_clean")),
         TemplateFamily::D => render_framed(root_dir, img, exif, !template.ends_with("_clean")),
         TemplateFamily::F => render_magazine(root_dir, img, exif, !template.ends_with("_clean")),
         TemplateFamily::G => render_minimal(root_dir, img, exif),
@@ -473,37 +465,50 @@ fn render_magazine(
     show_params: bool,
 ) -> RgbaImage {
     let (w, h) = img.dimensions();
-    let side = ((w as f32) * 0.12).max(60.0) as u32;
-    let mut canvas = ImageBuffer::from_pixel(w + side, h + 32, Rgba([255, 255, 255, 255]));
+    let margin = ((w.min(h) as f32) * 0.075).clamp(46.0, 180.0) as u32;
+    let side = ((w as f32) * 0.20).clamp(150.0, 360.0) as u32;
+    let footer = ((h as f32) * 0.08).clamp(54.0, 140.0) as u32;
+    let mut canvas = ImageBuffer::from_pixel(
+        w + side + margin * 2,
+        h + footer + margin * 2,
+        Rgba([247, 244, 238, 255]),
+    );
+    let photo_x = margin;
+    let photo_y = margin;
     imageops::overlay(
         &mut canvas,
         &DynamicImage::ImageRgb8(img.clone()).to_rgba8(),
-        0,
-        0,
+        photo_x as i64,
+        photo_y as i64,
     );
+    let side_x = (photo_x + w + margin / 2) as i32;
     draw_filled_rect_mut(
         &mut canvas,
-        Rect::at(w as i32, 0).of_size(side, h),
-        Rgba([245, 245, 247, 255]),
+        Rect::at(side_x, photo_y as i32).of_size(side, h),
+        Rgba([38, 35, 31, 255]),
     );
     let font = load_font();
-    let scale_main = PxScale::from(((side as f32) * 0.28).clamp(16.0, 34.0));
-    let scale_sub = PxScale::from(((side as f32) * 0.16).clamp(12.0, 22.0));
-    let title = trim_value(&format!("{} {}", exif.make, exif.model));
-    let body = if show_params {
-        trim_value(&format!(
-            "{}  {}  {}",
-            exif.f_number, exif.exposure, exif.iso
-        ))
-    } else {
-        String::new()
-    };
+    let scale_kicker = PxScale::from(((side as f32) * 0.08).clamp(13.0, 22.0));
+    let scale_main = PxScale::from(((side as f32) * 0.17).clamp(24.0, 52.0));
+    let scale_sub = PxScale::from(((side as f32) * 0.095).clamp(14.0, 26.0));
+    let title = trim_value(&format!("{} {}", fallback(&exif.make, "CAMERA"), exif.model));
+    let lens = fallback(&exif.lens, "LENS DATA");
+    let body = param_line(exif);
     if let Some(font) = font.as_ref() {
         draw_text_mut(
             &mut canvas,
-            Rgba([29, 29, 31, 255]),
-            w as i32 + 16,
-            24,
+            Rgba([214, 177, 111, 255]),
+            side_x + 24,
+            photo_y as i32 + 28,
+            scale_kicker,
+            font,
+            "PIANKE PHOTO",
+        );
+        draw_text_mut(
+            &mut canvas,
+            Rgba([250, 247, 240, 255]),
+            side_x + 24,
+            photo_y as i32 + 72,
             scale_main,
             font,
             &title,
@@ -511,21 +516,47 @@ fn render_magazine(
         if !body.is_empty() {
             draw_text_mut(
                 &mut canvas,
-                Rgba([134, 134, 139, 255]),
-                w as i32 + 16,
-                72,
+                Rgba([210, 204, 192, 255]),
+                side_x + 24,
+                photo_y as i32 + 140,
                 scale_sub,
                 font,
                 &body,
             );
         }
+        if show_params {
+            draw_text_mut(
+                &mut canvas,
+                Rgba([158, 151, 140, 255]),
+                side_x + 24,
+                photo_y as i32 + 190,
+                scale_sub,
+                font,
+                &lens,
+            );
+        }
+        draw_text_mut(
+            &mut canvas,
+            Rgba([78, 72, 64, 255]),
+            margin as i32,
+            (photo_y + h + 22) as i32,
+            scale_sub,
+            font,
+            &trim_value(&format!("{}  {}", fallback(&exif.datetime, "PHOTO SERIES"), body)),
+        );
     }
-    if let Some(logo) = load_logo(root_dir, &exif.make, 36) {
+    draw_line_segment_mut(
+        &mut canvas,
+        (side_x as f32 + 24.0, (photo_y + h - 82) as f32),
+        ((side_x + side as i32 - 24) as f32, (photo_y + h - 82) as f32),
+        Rgba([104, 94, 80, 255]),
+    );
+    if let Some(logo) = load_logo(root_dir, &exif.make, 46) {
         imageops::overlay(
             &mut canvas,
             &logo,
-            (w + 14) as i64,
-            (h.saturating_sub(50)) as i64,
+            (side_x + 24) as i64,
+            (photo_y + h - 62) as i64,
         );
     }
     canvas
@@ -570,35 +601,200 @@ fn render_minimal(root_dir: &Path, img: &image::RgbImage, exif: &ExifInfo) -> Rg
 
 fn render_camera_replay(root_dir: &Path, img: &image::RgbImage, exif: &ExifInfo) -> RgbaImage {
     let (w, h) = img.dimensions();
-    let band = (h as f32 * 0.32).max(120.0) as u32;
-    let mut canvas = ImageBuffer::from_pixel(w, h + band, Rgba([20, 20, 20, 255]));
+    let pad = ((w.min(h) as f32) * 0.055).clamp(28.0, 96.0) as u32;
+    let band = (h as f32 * 0.18).max(120.0) as u32;
+    let mut canvas = ImageBuffer::from_pixel(w + pad * 2, h + band + pad * 2, Rgba([13, 14, 14, 255]));
+    let photo_x = pad;
+    let photo_y = pad;
     imageops::overlay(
         &mut canvas,
         &DynamicImage::ImageRgb8(img.clone()).to_rgba8(),
-        0,
-        0,
+        photo_x as i64,
+        photo_y as i64,
+    );
+    let frame = Rect::at(photo_x as i32, photo_y as i32).of_size(w, h);
+    draw_hollow_rect_mut(&mut canvas, frame, Rgba([235, 238, 230, 210]));
+    let corner = (w.min(h) as f32 * 0.07).clamp(28.0, 86.0);
+    let l = photo_x as f32;
+    let t = photo_y as f32;
+    let r = (photo_x + w) as f32;
+    let b = (photo_y + h) as f32;
+    let hud = Rgba([238, 242, 232, 230]);
+    for (x0, y0, x1, y1) in [
+        (l + 18.0, t + 18.0, l + 18.0 + corner, t + 18.0),
+        (l + 18.0, t + 18.0, l + 18.0, t + 18.0 + corner),
+        (r - 18.0 - corner, t + 18.0, r - 18.0, t + 18.0),
+        (r - 18.0, t + 18.0, r - 18.0, t + 18.0 + corner),
+        (l + 18.0, b - 18.0, l + 18.0 + corner, b - 18.0),
+        (l + 18.0, b - 18.0 - corner, l + 18.0, b - 18.0),
+        (r - 18.0 - corner, b - 18.0, r - 18.0, b - 18.0),
+        (r - 18.0, b - 18.0 - corner, r - 18.0, b - 18.0),
+    ] {
+        draw_line_segment_mut(&mut canvas, (x0, y0), (x1, y1), hud);
+    }
+    let center_x = photo_x + w / 2;
+    let center_y = photo_y + h / 2;
+    draw_line_segment_mut(
+        &mut canvas,
+        ((center_x - 28) as f32, center_y as f32),
+        ((center_x + 28) as f32, center_y as f32),
+        Rgba([238, 242, 232, 150]),
+    );
+    draw_line_segment_mut(
+        &mut canvas,
+        (center_x as f32, (center_y - 28) as f32),
+        (center_x as f32, (center_y + 28) as f32),
+        Rgba([238, 242, 232, 150]),
+    );
+    draw_filled_rect_mut(
+        &mut canvas,
+        Rect::at((photo_x + 28) as i32, (photo_y + 28) as i32).of_size(16, 16),
+        Rgba([224, 48, 40, 255]),
     );
     let font = load_font();
-    let scale = PxScale::from((band as f32 * 0.14).clamp(14.0, 28.0));
-    let text = trim_value(&format!("{} {}", exif.make, exif.model));
-    if !text.is_empty() {
-        if let Some(font) = font.as_ref() {
+    let scale_small = PxScale::from((band as f32 * 0.14).clamp(14.0, 24.0));
+    let scale_main = PxScale::from((band as f32 * 0.20).clamp(18.0, 34.0));
+    let text = trim_value(&format!("{} {}", fallback(&exif.make, "CAMERA"), exif.model));
+    if let Some(font) = font.as_ref() {
+        draw_text_mut(
+            &mut canvas,
+            Rgba([244, 244, 238, 255]),
+            (photo_x + 52) as i32,
+            (photo_y + 22) as i32,
+            scale_small,
+            font,
+            "REC",
+        );
+        draw_text_mut(
+            &mut canvas,
+            Rgba([244, 244, 238, 255]),
+            pad as i32,
+            (photo_y + h + 28) as i32,
+            scale_main,
+            font,
+            &text,
+        );
+        draw_text_mut(
+            &mut canvas,
+            Rgba([178, 184, 172, 255]),
+            pad as i32,
+            (photo_y + h + 74) as i32,
+            scale_small,
+            font,
+            &trim_value(&format!("{}   {}", param_line(exif), fallback(&exif.lens, ""))),
+        );
+        draw_text_mut(
+            &mut canvas,
+            Rgba([178, 184, 172, 255]),
+            (photo_x + w.saturating_sub(150)) as i32,
+            (photo_y + 22) as i32,
+            scale_small,
+            font,
+            "PLAY  100-0001",
+        );
+    }
+    if let Some(logo) = load_logo(root_dir, &exif.make, 44) {
+        let x = canvas.width().saturating_sub(logo.width() + pad) as i64;
+        imageops::overlay(&mut canvas, &logo, x, (photo_y + h + 28) as i64);
+    }
+    canvas
+}
+
+fn render_glass_overlay(
+    root_dir: &Path,
+    img: &image::RgbImage,
+    exif: &ExifInfo,
+    show_params: bool,
+) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    let mut canvas = DynamicImage::ImageRgb8(img.clone()).to_rgba8();
+    let panel_w = ((w as f32) * 0.48).clamp(260.0, 720.0) as u32;
+    let panel_h = if show_params {
+        ((h as f32) * 0.18).clamp(116.0, 210.0) as u32
+    } else {
+        ((h as f32) * 0.13).clamp(86.0, 160.0) as u32
+    };
+    let margin = ((w.min(h) as f32) * 0.055).clamp(24.0, 90.0) as u32;
+    let x = margin.min(w.saturating_sub(panel_w));
+    let y = h.saturating_sub(panel_h + margin);
+    let crop = imageops::crop_imm(&canvas, x, y, panel_w, panel_h).to_image();
+    let blurred = DynamicImage::ImageRgba8(crop).blur(12.0).to_rgba8();
+    imageops::overlay(&mut canvas, &blurred, x as i64, y as i64);
+    draw_filled_rect_mut(
+        &mut canvas,
+        Rect::at(x as i32, y as i32).of_size(panel_w, panel_h),
+        Rgba([255, 255, 255, 94]),
+    );
+    draw_hollow_rect_mut(
+        &mut canvas,
+        Rect::at(x as i32, y as i32).of_size(panel_w, panel_h),
+        Rgba([255, 255, 255, 150]),
+    );
+    let font = load_font();
+    let title = trim_value(&format!("{} {}", fallback(&exif.make, "CAMERA"), exif.model));
+    let scale_main = PxScale::from((panel_h as f32 * 0.20).clamp(16.0, 36.0));
+    let scale_sub = PxScale::from((panel_h as f32 * 0.13).clamp(12.0, 24.0));
+    if let Some(font) = font.as_ref() {
+        draw_text_mut(
+            &mut canvas,
+            Rgba([255, 255, 255, 245]),
+            (x + 24) as i32,
+            (y + 22) as i32,
+            scale_main,
+            font,
+            &title,
+        );
+        if show_params {
             draw_text_mut(
                 &mut canvas,
-                Rgba([255, 255, 255, 255]),
-                24,
-                (h + 18) as i32,
-                scale,
+                Rgba([240, 240, 236, 220]),
+                (x + 24) as i32,
+                (y + panel_h / 2) as i32,
+                scale_sub,
                 font,
-                &text,
+                &param_line(exif),
+            );
+            draw_text_mut(
+                &mut canvas,
+                Rgba([220, 224, 220, 205]),
+                (x + 24) as i32,
+                (y + panel_h / 2 + 32) as i32,
+                scale_sub,
+                font,
+                &fallback(&exif.lens, ""),
             );
         }
     }
-    if let Some(logo) = load_logo(root_dir, &exif.make, 44) {
-        let x = w.saturating_sub(logo.width() + 24) as i64;
-        imageops::overlay(&mut canvas, &logo, x, (h + 18) as i64);
+    if let Some(logo) = load_logo(root_dir, &exif.make, (panel_h as f32 * 0.34) as u32) {
+        let lx = x + panel_w.saturating_sub(logo.width() + 24);
+        let ly = y + (panel_h.saturating_sub(logo.height())) / 2;
+        imageops::overlay(&mut canvas, &logo, lx as i64, ly as i64);
     }
     canvas
+}
+
+fn fallback(value: &str, default: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        default.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn param_line(exif: &ExifInfo) -> String {
+    trim_value(
+        &[
+            exif.focal_length.clone(),
+            exif.f_number.clone(),
+            exif.exposure.clone(),
+            exif.iso.clone(),
+        ]
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("  "),
+    )
 }
 
 fn load_logo(root_dir: &Path, make: &str, target_h: u32) -> Option<RgbaImage> {

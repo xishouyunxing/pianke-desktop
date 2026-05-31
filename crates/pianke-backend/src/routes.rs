@@ -689,7 +689,7 @@ async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> 
     }
 
     let worker_ctx = ctx.clone();
-    thread::spawn(move || run_job(worker_ctx, req));
+    thread::spawn(move || run_job_guarded(worker_ctx, req));
     Json(json!({"started": true, "backend": "rust-fast"})).into_response()
 }
 

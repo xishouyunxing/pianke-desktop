@@ -13,6 +13,7 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
+    panic::{self, AssertUnwindSafe},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -31,6 +32,24 @@ use crate::{ANALYSIS_MAX_SIDE, HEIC_EXTS, IMAGE_EXTS, PIC_DIR, RAW_EXTS, SIDECAR
 
 pub(crate) fn max_group_size_from_threshold_far(threshold_far: i32) -> usize {
     (threshold_far.clamp(3, 12) as usize * 2 + 8).max(8).min(60)
+}
+
+pub(crate) fn run_job_guarded(ctx: AppCtx, req: StartRequest) {
+    let panic_ctx = ctx.clone();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| run_job(ctx, req)));
+    if let Err(payload) = result {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "未知内部错误".to_string());
+        let mut state = panic_ctx.inner.lock().expect("backend state lock");
+        state.job.status = "error".to_string();
+        state.job.error = Some(format!("整理分组时发生内部错误: {detail}"));
+        state.job.finished_at = now_secs();
+        state.grouping.status = "error".to_string();
+        state.grouping.error = state.job.error.clone();
+    }
 }
 
 pub(crate) fn run_job(ctx: AppCtx, req: StartRequest) {
@@ -1267,6 +1286,77 @@ pub(crate) fn compute_orb_inliers_for_records(
         features_from_rgb(&img.to_rgb8())
     }
 
+    fn hash_similarity(a: Option<&str>, b: Option<&str>) -> Option<f64> {
+        let a = u64::from_str_radix(a?, 16).ok()?;
+        let b = u64::from_str_radix(b?, 16).ok()?;
+        Some((1.0 - (a ^ b).count_ones() as f64 / 64.0).max(0.0))
+    }
+
+    fn combined_hash_similarity(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
+        let pairs = [
+            (0.40, hash_similarity(a.phash.as_deref(), b.phash.as_deref())),
+            (0.30, hash_similarity(a.dhash.as_deref(), b.dhash.as_deref())),
+            (0.20, hash_similarity(a.whash.as_deref(), b.whash.as_deref())),
+            (0.10, hash_similarity(a.ahash.as_deref(), b.ahash.as_deref())),
+        ];
+        let mut total_w = 0.0;
+        let mut total_s = 0.0;
+        for (weight, sim) in pairs {
+            if let Some(sim) = sim {
+                total_w += weight;
+                total_s += weight * sim;
+            }
+        }
+        if total_w < 1e-6 {
+            0.0
+        } else {
+            total_s / total_w
+        }
+    }
+
+    fn numbered_name_delta(a: &str, b: &str) -> Option<u64> {
+        let a_name = file_name(a);
+        let b_name = file_name(b);
+        let a_path = Path::new(&a_name);
+        let b_path = Path::new(&b_name);
+        let a_stem = a_path.file_stem().and_then(|s| s.to_str()).unwrap_or(&a_name);
+        let b_stem = b_path.file_stem().and_then(|s| s.to_str()).unwrap_or(&b_name);
+        let a_digits = a_stem
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        let b_digits = b_stem
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if a_digits.is_empty() || b_digits.is_empty() {
+            return None;
+        }
+        let a_prefix = a_stem.trim_end_matches(|ch: char| ch.is_ascii_digit());
+        let b_prefix = b_stem.trim_end_matches(|ch: char| ch.is_ascii_digit());
+        if a_prefix != b_prefix {
+            return None;
+        }
+        let a_num = a_digits.chars().rev().collect::<String>().parse::<u64>().ok()?;
+        let b_num = b_digits.chars().rev().collect::<String>().parse::<u64>().ok()?;
+        Some(a_num.abs_diff(b_num))
+    }
+
+    fn should_match_orb(a: &FastImageInfo, b: &FastImageInfo) -> bool {
+        let hash_sim = combined_hash_similarity(a, b);
+        if hash_sim >= 0.65 {
+            return true;
+        }
+        if let (Some(ta), Some(tb)) = (a.timestamp, b.timestamp) {
+            if (ta - tb).abs() <= 30.0 {
+                return true;
+            }
+        }
+        numbered_name_delta(&a.path, &b.path).is_some_and(|delta| delta <= 6)
+    }
+
     fn inliers(a: &OrbFeatures, b: &OrbFeatures) -> Result<usize, String> {
         let matcher = features2d::BFMatcher::create(NORM_HAMMING, true)
             .map_err(|e| format!("create BFMatcher failed: {e}"))?;
@@ -1305,23 +1395,40 @@ pub(crate) fn compute_orb_inliers_for_records(
         Ok(count.max(0) as usize)
     }
 
+    let mut candidate_pairs = Vec::new();
+    let mut needs_features = vec![false; records.len()];
+    for i in 0..records.len() {
+        for j in (i + 1)..records.len() {
+            if should_match_orb(&records[i].info, &records[j].info) {
+                candidate_pairs.push((i, j));
+                needs_features[i] = true;
+                needs_features[j] = true;
+            }
+        }
+    }
+
     let features = records
         .iter()
-        .map(|record| features(&record.info.path).ok().flatten())
+        .enumerate()
+        .map(|(idx, record)| {
+            if needs_features[idx] {
+                features(&record.info.path).ok().flatten()
+            } else {
+                None
+            }
+        })
         .collect::<Vec<_>>();
     let mut out = HashMap::new();
-    for i in 0..features.len() {
-        for j in (i + 1)..features.len() {
-            let Some(a) = features[i].as_ref() else {
-                continue;
-            };
-            let Some(b) = features[j].as_ref() else {
-                continue;
-            };
-            if let Ok(value) = inliers(a, b) {
-                if value > 0 {
-                    out.insert((i, j), value);
-                }
+    for (i, j) in candidate_pairs {
+        let Some(a) = features[i].as_ref() else {
+            continue;
+        };
+        let Some(b) = features[j].as_ref() else {
+            continue;
+        };
+        if let Ok(value) = inliers(a, b) {
+            if value > 0 {
+                out.insert((i, j), value);
             }
         }
     }

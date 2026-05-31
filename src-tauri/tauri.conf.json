@@ -34,9 +34,11 @@
       "opencv-runtime": "."
     },
     "windows": {
+      "allowDowngrades": false,
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "uninstallerIcon": "icons/icon.ico"
+        "uninstallerIcon": "icons/icon.ico",
+        "installMode": "currentUser"
       },
       "webviewInstallMode": {
         "type": "downloadBootstrapper"

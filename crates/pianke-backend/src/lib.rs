@@ -784,9 +784,9 @@ mod tests {
     #[test]
     fn opencv_orb_inliers_detect_repeated_scene_geometry() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let a_path = dir.path().join("scene_a.png");
-        let b_path = dir.path().join("scene_b.png");
-        let c_path = dir.path().join("scene_c.png");
+        let a_path = dir.path().join("scene_0001.png");
+        let b_path = dir.path().join("scene_0002.png");
+        let c_path = dir.path().join("other_0100.png");
 
         let mut a = image::RgbImage::from_pixel(420, 320, image::Rgb([8, 8, 8]));
         for i in 0..24u32 {

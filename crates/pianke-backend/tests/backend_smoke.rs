@@ -1400,20 +1400,29 @@ fn rust_watermark_preview_and_batch_export_work_after_fast_selection() {
         .expect("choose response");
     assert!(choose_resp.status().is_success());
 
-    let preview: Value = client
-        .post(format!("{base}/api/watermark/preview"))
-        .header("X-Token", token)
-        .json(&json!({"template": "A", "preview_index": 0}))
-        .send()
-        .expect("preview response")
-        .json()
-        .expect("preview json");
-    assert!(preview["image_b64"].as_str().expect("preview b64").len() > 100);
-    assert!(preview["size_kb"].as_f64().expect("preview size") > 0.0);
-    assert_eq!(preview["preview_index"], 0);
-    assert_eq!(preview["source_name"], file_name(&left));
-    assert_eq!(preview["total_winners"], 1);
-    assert!(preview["exif"].is_object());
+    for template in template_list {
+        let template_id = template["id"].as_str().expect("template id");
+        let preview: Value = client
+            .post(format!("{base}/api/watermark/preview"))
+            .header("X-Token", token)
+            .json(&json!({"template": template_id, "preview_index": 0}))
+            .send()
+            .expect("preview response")
+            .json()
+            .expect("preview json");
+        assert!(
+            preview["image_b64"].as_str().expect("preview b64").len() > 100,
+            "template {template_id} should render preview bytes"
+        );
+        assert!(
+            preview["size_kb"].as_f64().expect("preview size") > 0.0,
+            "template {template_id} should report preview size"
+        );
+        assert_eq!(preview["preview_index"], 0);
+        assert_eq!(preview["source_name"], file_name(&left));
+        assert_eq!(preview["total_winners"], 1);
+        assert!(preview["exif"].is_object());
+    }
 
     let export: Value = client
         .post(format!("{base}/api/watermark/start"))
