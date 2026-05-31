@@ -175,6 +175,11 @@ impl ExpertQualityModels {
             && component_dir.join(CLIPIQA_MODEL_PATH).exists()
     }
 
+    pub fn component_ready_for_live_scoring(component_dir: &Path) -> bool {
+        Self::component_files_ready(component_dir)
+            && quality_preprocessor_allows_parity(component_dir)
+    }
+
     pub fn from_component_dir(component_dir: &Path) -> Result<Self, String> {
         let musiq_path = component_dir.join(MUSIQ_MODEL_PATH);
         let clipiqa_path = component_dir.join(CLIPIQA_MODEL_PATH);
@@ -413,6 +418,12 @@ pub fn load_quality_preprocessor(
         .map_err(|e| format!("读取 Expert quality_preprocessor.json 失败: {e}"))?;
     serde_json::from_str(&text)
         .map_err(|e| format!("解析 Expert quality_preprocessor.json 失败: {e}"))
+}
+
+pub fn quality_preprocessor_allows_parity(component_dir: &Path) -> bool {
+    load_quality_preprocessor(component_dir)
+        .map(|cfg| cfg.musiq_input_width.is_none() && cfg.musiq_input_height.is_none())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]

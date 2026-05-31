@@ -61,6 +61,8 @@ impl ModelManager {
             .join("quality")
             .join("clipiqa_plus.onnx")
             .exists();
+        let quality_models =
+            musiq && clipiqa && crate::expert_vision::quality_preprocessor_allows_parity(&dir);
         ExpertComponentCapabilities {
             dinov2: dir.join("models").join("dinov2-small.onnx").exists(),
             insightface_detection: dir
@@ -80,7 +82,7 @@ impl ModelManager {
                 .exists(),
             musiq,
             clipiqa,
-            quality_models: musiq && clipiqa,
+            quality_models,
             nima_legacy: false,
             nima_legacy_unavailable: true,
         }
@@ -315,7 +317,11 @@ impl ModelManager {
             .map_err(|e| server_error(format!("create temp component dir failed: {e}")))?;
 
         let total = manifest.files.len().max(1);
-        let total_bytes: u64 = manifest.files.iter().filter_map(|file| file.size_bytes).sum();
+        let total_bytes: u64 = manifest
+            .files
+            .iter()
+            .filter_map(|file| file.size_bytes)
+            .sum();
         let mut completed_bytes = 0_u64;
         for (idx, file) in manifest.files.iter().enumerate() {
             let rel = safe_relative_path(&file.path)
@@ -328,7 +334,11 @@ impl ModelManager {
             let label = rel.to_string_lossy().to_string();
             if target.exists() {
                 let existing_len = fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
-                if file.size_bytes.map(|size| size == existing_len).unwrap_or(true) {
+                if file
+                    .size_bytes
+                    .map(|size| size == existing_len)
+                    .unwrap_or(true)
+                {
                     completed_bytes = completed_bytes.saturating_add(existing_len);
                     continue;
                 }
@@ -868,9 +878,16 @@ async fn load_component_file_to_path(
                 file.size_bytes.unwrap_or(0),
             );
         }
-        return download_component_url_to_path(file, url, target, state_path, control_path, progress)
-            .await
-            .map_err(|e| format!("download component file failed: {e}"));
+        return download_component_url_to_path(
+            file,
+            url,
+            target,
+            state_path,
+            control_path,
+            progress,
+        )
+        .await
+        .map_err(|e| format!("download component file failed: {e}"));
     }
     let Some(base_dir) = base_dir else {
         return Err(format!("component file {} has no url", file.path));
@@ -896,7 +913,8 @@ fn copy_component_file_to_path(
     expected_size: u64,
 ) -> Result<DownloadOutcome, String> {
     let part = part_path(target);
-    let mut input = fs::File::open(source).map_err(|e| format!("read component file failed: {e}"))?;
+    let mut input =
+        fs::File::open(source).map_err(|e| format!("read component file failed: {e}"))?;
     let mut output =
         fs::File::create(&part).map_err(|e| format!("create component temp file failed: {e}"))?;
     let mut buffer = [0_u8; 1024 * 256];
@@ -1140,6 +1158,40 @@ mod tests {
         assert!(caps.musiq);
         assert!(caps.clipiqa);
         assert!(caps.quality_models);
+    }
+
+    #[test]
+    fn fixed_shape_quality_models_do_not_claim_parity() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let install_dir = temp.path().join("models").join("expert");
+        fs::create_dir_all(install_dir.join("models").join("quality")).expect("quality dir");
+        fs::write(
+            install_dir
+                .join("models")
+                .join("quality")
+                .join("musiq.onnx"),
+            b"fake",
+        )
+        .expect("musiq");
+        fs::write(
+            install_dir
+                .join("models")
+                .join("quality")
+                .join("clipiqa_plus.onnx"),
+            b"fake",
+        )
+        .expect("clipiqa");
+        fs::write(
+            install_dir.join("quality_preprocessor.json"),
+            r#"{"musiq_input_width":256,"musiq_input_height":192,"clipiqa_input_width":256,"clipiqa_input_height":192}"#,
+        )
+        .expect("quality preprocessor");
+
+        let manager = ModelManager::new(temp.path().join("models"));
+        let caps = manager.expert_capabilities();
+        assert!(caps.musiq);
+        assert!(caps.clipiqa);
+        assert!(!caps.quality_models);
     }
 
     #[test]

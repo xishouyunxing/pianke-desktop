@@ -12,8 +12,8 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Cursor,
-    path::{Path, PathBuf},
     panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -120,7 +120,7 @@ pub(crate) fn run_job(ctx: AppCtx, req: StartRequest) {
     };
     let mut quality_model = if req.engine == "expert" {
         if let Some(dir) = &expert_dir {
-            if expert_vision::ExpertQualityModels::component_files_ready(dir) {
+            if expert_vision::ExpertQualityModels::component_ready_for_live_scoring(dir) {
                 match expert_vision::ExpertQualityModels::from_component_dir(dir) {
                     Ok(model) => Some(model),
                     Err(err) => {
@@ -1301,10 +1301,22 @@ pub(crate) fn compute_orb_inliers_for_records(
 
     fn combined_hash_similarity(a: &FastImageInfo, b: &FastImageInfo) -> f64 {
         let pairs = [
-            (0.40, hash_similarity(a.phash.as_deref(), b.phash.as_deref())),
-            (0.30, hash_similarity(a.dhash.as_deref(), b.dhash.as_deref())),
-            (0.20, hash_similarity(a.whash.as_deref(), b.whash.as_deref())),
-            (0.10, hash_similarity(a.ahash.as_deref(), b.ahash.as_deref())),
+            (
+                0.40,
+                hash_similarity(a.phash.as_deref(), b.phash.as_deref()),
+            ),
+            (
+                0.30,
+                hash_similarity(a.dhash.as_deref(), b.dhash.as_deref()),
+            ),
+            (
+                0.20,
+                hash_similarity(a.whash.as_deref(), b.whash.as_deref()),
+            ),
+            (
+                0.10,
+                hash_similarity(a.ahash.as_deref(), b.ahash.as_deref()),
+            ),
         ];
         let mut total_w = 0.0;
         let mut total_s = 0.0;
@@ -1326,8 +1338,14 @@ pub(crate) fn compute_orb_inliers_for_records(
         let b_name = file_name(b);
         let a_path = Path::new(&a_name);
         let b_path = Path::new(&b_name);
-        let a_stem = a_path.file_stem().and_then(|s| s.to_str()).unwrap_or(&a_name);
-        let b_stem = b_path.file_stem().and_then(|s| s.to_str()).unwrap_or(&b_name);
+        let a_stem = a_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&a_name);
+        let b_stem = b_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&b_name);
         let a_digits = a_stem
             .chars()
             .rev()
@@ -1346,8 +1364,18 @@ pub(crate) fn compute_orb_inliers_for_records(
         if a_prefix != b_prefix {
             return None;
         }
-        let a_num = a_digits.chars().rev().collect::<String>().parse::<u64>().ok()?;
-        let b_num = b_digits.chars().rev().collect::<String>().parse::<u64>().ok()?;
+        let a_num = a_digits
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()?;
+        let b_num = b_digits
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()?;
         Some(a_num.abs_diff(b_num))
     }
 

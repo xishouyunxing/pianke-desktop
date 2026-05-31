@@ -285,7 +285,9 @@ fn render_template(
             !template.ends_with("_clean"),
             false,
         ),
-        TemplateFamily::C => render_glass_overlay(root_dir, img, exif, !template.ends_with("_clean")),
+        TemplateFamily::C => {
+            render_glass_overlay(root_dir, img, exif, !template.ends_with("_clean"))
+        }
         TemplateFamily::D => render_framed(root_dir, img, exif, !template.ends_with("_clean")),
         TemplateFamily::F => render_magazine(root_dir, img, exif, !template.ends_with("_clean")),
         TemplateFamily::G => render_minimal(root_dir, img, exif),
@@ -501,7 +503,11 @@ fn render_magazine(
     let scale_kicker = PxScale::from(((side as f32) * 0.08).clamp(13.0, 22.0));
     let scale_main = PxScale::from(((side as f32) * 0.15).clamp(24.0, 48.0));
     let scale_sub = PxScale::from(((side as f32) * 0.095).clamp(14.0, 26.0));
-    let title = trim_value(&format!("{} {}", fallback(&exif.make, "CAMERA"), exif.model));
+    let title = trim_value(&format!(
+        "{} {}",
+        fallback(&exif.make, "CAMERA"),
+        exif.model
+    ));
     let lens = fallback(&exif.lens, "LENS DATA");
     let body = param_line(exif);
     if let Some(font) = font.as_ref() {
@@ -552,13 +558,20 @@ fn render_magazine(
             (photo_y + h + 22) as i32,
             scale_sub,
             font,
-            &trim_value(&format!("{}  {}", fallback(&exif.datetime, "PHOTO SERIES"), body)),
+            &trim_value(&format!(
+                "{}  {}",
+                fallback(&exif.datetime, "PHOTO SERIES"),
+                body
+            )),
         );
     }
     draw_line_segment_mut(
         &mut canvas,
         (side_x as f32 + 26.0, (photo_y + h - 92) as f32),
-        ((side_x + side as i32 - 26) as f32, (photo_y + h - 92) as f32),
+        (
+            (side_x + side as i32 - 26) as f32,
+            (photo_y + h - 92) as f32,
+        ),
         Rgba([116, 104, 84, 255]),
     );
     if let Some(logo) = load_logo(root_dir, &exif.make, 46) {
@@ -681,7 +694,11 @@ fn render_camera_replay(root_dir: &Path, img: &image::RgbImage, exif: &ExifInfo)
     let font = load_font();
     let scale_small = PxScale::from((band as f32 * 0.14).clamp(14.0, 24.0));
     let scale_main = PxScale::from((band as f32 * 0.20).clamp(18.0, 34.0));
-    let text = trim_value(&format!("{} {}", fallback(&exif.make, "CAMERA"), exif.model));
+    let text = trim_value(&format!(
+        "{} {}",
+        fallback(&exif.make, "CAMERA"),
+        exif.model
+    ));
     if let Some(font) = font.as_ref() {
         draw_text_mut(
             &mut canvas,
@@ -708,7 +725,11 @@ fn render_camera_replay(root_dir: &Path, img: &image::RgbImage, exif: &ExifInfo)
             (photo_y + h + 74) as i32,
             scale_small,
             font,
-            &trim_value(&format!("{}   {}", param_line(exif), fallback(&exif.lens, ""))),
+            &trim_value(&format!(
+                "{}   {}",
+                param_line(exif),
+                fallback(&exif.lens, "")
+            )),
         );
         draw_text_mut(
             &mut canvas,
@@ -776,7 +797,11 @@ fn render_glass_overlay(
         0.18,
     );
     let font = load_font();
-    let title = trim_value(&format!("{} {}", fallback(&exif.make, "CAMERA"), exif.model));
+    let title = trim_value(&format!(
+        "{} {}",
+        fallback(&exif.make, "CAMERA"),
+        exif.model
+    ));
     let lens = fallback(&exif.lens, "");
     let params = param_line(exif);
     let padding = ((w.min(h) as f32) * 0.045).clamp(22.0, 68.0) as u32;
@@ -827,7 +852,10 @@ fn render_glass_overlay(
     }
     draw_line_segment_mut(
         &mut canvas,
-        ((x + padding) as f32, (y + panel_h.saturating_sub(92)) as f32),
+        (
+            (x + padding) as f32,
+            (y + panel_h.saturating_sub(92)) as f32,
+        ),
         (
             (x + panel_w.saturating_sub(padding)) as f32,
             (y + panel_h.saturating_sub(92)) as f32,
