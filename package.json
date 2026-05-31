@@ -9,6 +9,7 @@
     "build": "powershell -ExecutionPolicy Bypass -File scripts/build_rust_release.ps1",
     "build:rust": "powershell -ExecutionPolicy Bypass -File scripts/build_rust_release.ps1",
     "build:ui": "vue-tsc --noEmit && vite build",
+    "check:versions": "powershell -ExecutionPolicy Bypass -File scripts/check_version_consistency.ps1",
     "check:no-python-bundle": "powershell -ExecutionPolicy Bypass -File scripts/check_no_python_bundle.ps1",
     "smoke:release-rust": "powershell -ExecutionPolicy Bypass -File scripts/smoke_release_rust_backend.ps1",
     "smoke:rc": "powershell -ExecutionPolicy Bypass -File scripts/smoke_rc.ps1",

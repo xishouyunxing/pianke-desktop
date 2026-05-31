@@ -28,6 +28,10 @@ Invoke-Step "Tauri cargo check" {
     cargo check --manifest-path src-tauri\Cargo.toml
 }
 
+Invoke-Step "Version consistency" {
+    npm run check:versions
+}
+
 Invoke-Step "UI build check" {
     npm run build:ui
 }
