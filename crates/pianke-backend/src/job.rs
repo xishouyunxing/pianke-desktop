@@ -159,7 +159,14 @@ pub(crate) fn run_job(ctx: AppCtx, req: StartRequest) {
 
     let folder = PathBuf::from(&req.folder);
     let pairs = scan_folder(&folder);
-    let cached = load_info_cache(&req.folder).unwrap_or_default();
+    // Fast cache does not guarantee local-model features such as DINOv2 or
+    // face signals. Reusing it in Expert/Tycoon can make clustering reach
+    // records without embeddings, so model modes always rebuild their records.
+    let cached = if req.engine == "fast" {
+        load_info_cache(&req.folder).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let (mut infos, pairs) = if cached.is_empty() {
         (Vec::new(), pairs)
     } else {

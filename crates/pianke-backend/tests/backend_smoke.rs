@@ -103,9 +103,10 @@ fn write_jpg(path: &Path, seed: u8) {
 fn app_update_reports_available_for_newer_manifest() {
     let _env = env_lock();
     let token = "update-newer-token";
-    let update_url = start_mock_json_server(
-        r#"{"version":"0.2.1","url":"https://pianke.moeuu.cn/pianke/desktop/片刻桌面版_0.2.1_x64-setup.exe","notes":"测试更新","published_at":"2026-05-27"}"#,
-    );
+    let latest_version = "999.0.0";
+    let update_url = start_mock_json_server(format!(
+        r#"{{"version":"{latest_version}","url":"https://pianke.moeuu.cn/pianke/desktop/pianke_{latest_version}_x64-setup.exe","notes":"测试更新","published_at":"2026-05-27"}}"#
+    ));
     std::env::set_var("PIANKE_APP_UPDATE_URL", update_url);
     let (_backend, _handle, base) = start_test_backend(token);
     let client = Client::new();
@@ -119,13 +120,13 @@ fn app_update_reports_available_for_newer_manifest() {
     std::env::remove_var("PIANKE_APP_UPDATE_URL");
 
     assert_eq!(update["current_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(update["latest_version"], "0.2.1");
+    assert_eq!(update["latest_version"], latest_version);
     assert_eq!(update["update_available"], true);
     assert_eq!(update["notes"], "测试更新");
     assert!(update["url"]
         .as_str()
         .expect("update url")
-        .contains("0.2.1"));
+        .contains(latest_version));
 }
 
 #[test]

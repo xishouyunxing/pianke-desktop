@@ -1,6 +1,6 @@
 [package]
 name = "pianke-desktop"
-version = "0.2.0"
+version = "0.2.1"
 description = "片刻桌面版"
 authors = ["Pianke"]
 edition = "2021"

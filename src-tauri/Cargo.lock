@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "pianke-backend"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ab_glyph",
  "axum",
@@ -3544,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "pianke-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pianke-backend",
  "rfd",
