@@ -211,6 +211,15 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         && expert_caps.insightface_recognition
         && expert_caps.insightface_landmark;
     let quality_models = expert_installed && expert_caps.quality_models;
+    let quality_models_reason = if quality_models {
+        "available"
+    } else if !expert_installed {
+        "expert_component_not_installed"
+    } else if expert_caps.musiq && expert_caps.clipiqa {
+        "quality_models_fixed_shape_not_parity_verified"
+    } else {
+        "quality_models_not_installed"
+    };
     let llm_status = ctx.llm.provider_status();
     let tycoon_ready = llm_status.configured;
     let mut engines = ctx.models.available_engines();
@@ -226,6 +235,7 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "expert_installed": expert_installed,
         "expert_capabilities": expert_caps,
         "quality_models": quality_models,
+        "quality_models_reason": quality_models_reason,
         "nima_legacy_unavailable": true,
         "opencv_orb": opencv_orb_available(),
         "formats": format_capabilities(),

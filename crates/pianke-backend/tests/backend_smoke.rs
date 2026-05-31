@@ -436,6 +436,10 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["python_required"], false);
     assert_eq!(capabilities["quality_models"], false);
+    assert_eq!(
+        capabilities["quality_models_reason"],
+        "expert_component_not_installed"
+    );
     assert_eq!(capabilities["nima_legacy_unavailable"], true);
     assert_eq!(capabilities["formats"]["raw_thumbnail"], true);
     assert_eq!(capabilities["formats"]["raw_strategy"], "embedded_jpeg");
@@ -908,6 +912,10 @@ fn installed_model_manifest_updates_capabilities() {
     );
     assert_eq!(capabilities["face_aware"], false);
     assert_eq!(capabilities["quality_models"], false);
+    assert_eq!(
+        capabilities["quality_models_reason"],
+        "quality_models_not_installed"
+    );
     assert_eq!(capabilities["expert_capabilities"]["dinov2"], true);
     assert_eq!(
         capabilities["expert_capabilities"]["insightface_detection"],

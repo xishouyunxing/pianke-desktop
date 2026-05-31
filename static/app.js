@@ -2263,7 +2263,7 @@ function describeDiff(leftMeta, rightMeta) {
     if (rEyes < 0.45 && lEyes >= 0.65) return { text: "看起来右图主体在闭眼", weak: false };
   }
 
-  // 1.5 美学分差距（NIMA / Schuhmann predictor）
+  // 1.5 美学分差距（仅在后端提供 aesthetic_score 时启用）
   if (L.aesthetic_score != null && R.aesthetic_score != null) {
     const da = L.aesthetic_score - R.aesthetic_score;
     if (Math.abs(da) > 0.45) {
