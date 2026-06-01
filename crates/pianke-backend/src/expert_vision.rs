@@ -2,7 +2,7 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView, GrayImage, Rgb
 use imageproc::geometric_transformations::Projection;
 #[cfg(not(feature = "opencv-orb"))]
 use imageproc::geometric_transformations::{warp_into, Interpolation};
-use ndarray::Array4;
+use ndarray::{Array3, Array4};
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
     value::TensorRef,
@@ -25,6 +25,10 @@ const FACE_MAX_DIM: u32 = 1024;
 const DET_SCORE_THRESHOLD: f32 = 0.5;
 const DET_NMS_THRESHOLD: f32 = 0.4;
 const PILLOW_PRECISION_BITS: i32 = 32 - 8 - 2;
+const MUSIQ_PATCH_SIZE: usize = 32;
+const MUSIQ_PATCH_STRIDE: usize = 32;
+const MUSIQ_HSE_GRID_SIZE: usize = 10;
+const MUSIQ_LONGER_SIDE_LENGTHS: [usize; 2] = [224, 384];
 const ARC_FACE_TEMPLATE: [[f32; 2]; 5] = [
     [38.2946, 51.6963],
     [73.5318, 51.5014],
@@ -81,10 +85,26 @@ pub struct ExpertQualityPreprocessor {
     pub musiq_input_width: Option<u32>,
     #[serde(default)]
     pub musiq_input_height: Option<u32>,
-    #[serde(default = "default_quality_clip_input_size")]
-    pub clipiqa_input_width: u32,
-    #[serde(default = "default_quality_clip_input_size")]
-    pub clipiqa_input_height: u32,
+    #[serde(default)]
+    pub musiq_input_kind: Option<String>,
+    #[serde(default = "default_musiq_patch_size")]
+    pub musiq_patch_size: usize,
+    #[serde(default = "default_musiq_patch_stride")]
+    pub musiq_patch_stride: usize,
+    #[serde(default = "default_musiq_hse_grid_size")]
+    pub musiq_hse_grid_size: usize,
+    #[serde(default = "default_musiq_longer_side_lengths")]
+    pub musiq_longer_side_lengths: Vec<usize>,
+    #[serde(default = "default_musiq_original_seq_len")]
+    pub musiq_max_seq_len_from_original_res: i32,
+    #[serde(default = "default_quality_clip_input_width")]
+    pub clipiqa_input_width: Option<u32>,
+    #[serde(default = "default_quality_clip_input_height")]
+    pub clipiqa_input_height: Option<u32>,
+    #[serde(default)]
+    pub resize_filter: Option<String>,
+    #[serde(default)]
+    pub resize_rounding: Option<String>,
     #[serde(default)]
     pub mean: Option<[f32; 3]>,
     #[serde(default)]
@@ -107,8 +127,16 @@ impl Default for ExpertQualityPreprocessor {
             max_side: default_quality_max_side(),
             musiq_input_width: None,
             musiq_input_height: None,
-            clipiqa_input_width: default_quality_clip_input_size(),
-            clipiqa_input_height: default_quality_clip_input_size(),
+            musiq_input_kind: None,
+            musiq_patch_size: default_musiq_patch_size(),
+            musiq_patch_stride: default_musiq_patch_stride(),
+            musiq_hse_grid_size: default_musiq_hse_grid_size(),
+            musiq_longer_side_lengths: default_musiq_longer_side_lengths(),
+            musiq_max_seq_len_from_original_res: default_musiq_original_seq_len(),
+            clipiqa_input_width: default_quality_clip_input_width(),
+            clipiqa_input_height: default_quality_clip_input_height(),
+            resize_filter: None,
+            resize_rounding: None,
             mean: None,
             std: None,
             scale_255: false,
@@ -199,27 +227,40 @@ impl ExpertQualityModels {
     }
 
     pub fn analyze(&mut self, img: &DynamicImage) -> Result<ExpertQualityScores, String> {
-        let musiq_input = preprocess_quality_nchw(
-            img,
-            self.preprocessor.musiq_input_width,
-            self.preprocessor.musiq_input_height,
-            self.preprocessor.max_side,
-            &self.preprocessor,
-        )?;
+        let musiq_is_patch_core =
+            self.preprocessor.musiq_input_kind.as_deref() == Some("pyiqa_multiscale_patches");
         let clipiqa_input = preprocess_quality_nchw(
             img,
-            Some(self.preprocessor.clipiqa_input_width),
-            Some(self.preprocessor.clipiqa_input_height),
+            self.preprocessor.clipiqa_input_width,
+            self.preprocessor.clipiqa_input_height,
             self.preprocessor.max_side,
             &self.preprocessor,
         )?;
-        let musiq_score = run_scalar_model(
-            &mut self.musiq,
-            musiq_input,
-            self.preprocessor.musiq_input_name.as_deref(),
-            self.preprocessor.musiq_output_name.as_deref(),
-            "MUSIQ",
-        )?;
+        let musiq_score = if musiq_is_patch_core {
+            let patches = preprocess_musiq_patches(img, &self.preprocessor)?;
+            run_scalar_model3(
+                &mut self.musiq,
+                patches,
+                self.preprocessor.musiq_input_name.as_deref(),
+                self.preprocessor.musiq_output_name.as_deref(),
+                "MUSIQ",
+            )?
+        } else {
+            let musiq_input = preprocess_quality_nchw(
+                img,
+                self.preprocessor.musiq_input_width,
+                self.preprocessor.musiq_input_height,
+                self.preprocessor.max_side,
+                &self.preprocessor,
+            )?;
+            run_scalar_model(
+                &mut self.musiq,
+                musiq_input,
+                self.preprocessor.musiq_input_name.as_deref(),
+                self.preprocessor.musiq_output_name.as_deref(),
+                "MUSIQ",
+            )?
+        };
         let clipiqa_score = run_scalar_model(
             &mut self.clipiqa,
             clipiqa_input,
@@ -421,8 +462,25 @@ pub fn load_quality_preprocessor(
 }
 
 pub fn quality_preprocessor_allows_parity(component_dir: &Path) -> bool {
+    if !component_dir.join(QUALITY_PREPROCESSOR_PATH).exists() {
+        return false;
+    }
     load_quality_preprocessor(component_dir)
-        .map(|cfg| cfg.musiq_input_width.is_none() && cfg.musiq_input_height.is_none())
+        .map(|cfg| {
+            cfg.max_side == default_quality_max_side()
+                && cfg.musiq_input_width.is_none()
+                && cfg.musiq_input_height.is_none()
+                && cfg.musiq_input_kind.as_deref() == Some("pyiqa_multiscale_patches")
+                && cfg.musiq_patch_size == MUSIQ_PATCH_SIZE
+                && cfg.musiq_patch_stride == MUSIQ_PATCH_STRIDE
+                && cfg.musiq_hse_grid_size == MUSIQ_HSE_GRID_SIZE
+                && cfg.musiq_longer_side_lengths == MUSIQ_LONGER_SIDE_LENGTHS
+                && cfg.musiq_max_seq_len_from_original_res < 0
+                && cfg.clipiqa_input_width.is_none()
+                && cfg.clipiqa_input_height.is_none()
+                && cfg.resize_filter.as_deref().unwrap_or("pillow_lanczos") == "pillow_lanczos"
+                && cfg.resize_rounding.as_deref().unwrap_or("floor") == "floor"
+        })
         .unwrap_or(false)
 }
 
@@ -1062,6 +1120,43 @@ fn run_scalar_model(
     Ok((*score as f64 * 10000.0).round() / 10000.0)
 }
 
+fn run_scalar_model3(
+    session: &mut Session,
+    input: Array3<f32>,
+    input_name: Option<&str>,
+    output_name: Option<&str>,
+    label: &str,
+) -> Result<f64, String> {
+    let input_view = TensorRef::from_array_view(&input)
+        .map_err(|e| format!("create {label} input failed: {e}"))?;
+    let outputs = if let Some(name) = input_name {
+        session
+            .run(ort::inputs![name => input_view])
+            .map_err(|e| format!("run {label} failed: {e}"))?
+    } else {
+        session
+            .run(ort::inputs![input_view])
+            .map_err(|e| format!("run {label} failed: {e}"))?
+    };
+    if outputs.len() == 0 {
+        return Err(format!("{label} produced no outputs"));
+    }
+    let output = if let Some(name) = output_name {
+        outputs
+            .get(name)
+            .ok_or_else(|| format!("{label} output missing field: {name}"))?
+    } else {
+        &outputs[0]
+    };
+    let tensor = output
+        .try_extract_array::<f32>()
+        .map_err(|e| format!("read {label} output failed: {e}"))?;
+    let Some(score) = tensor.iter().next() else {
+        return Err(format!("{label} output is empty"));
+    };
+    Ok((*score as f64 * 10000.0).round() / 10000.0)
+}
+
 fn run_landmark(
     session: &mut Session,
     img: &RgbImage,
@@ -1146,15 +1241,15 @@ fn preprocess_quality_nchw(
             return Err("Expert quality fixed input size must not be zero".to_string());
         }
         if width != w || height != h {
-            rgb = image::imageops::resize(&rgb, w, h, FilterType::Triangle);
+            rgb = pillow_lanczos_resize_rgb(&rgb, w, h);
             width = w;
             height = h;
         }
     } else if max_side > 0 && width.max(height) > max_side {
         let scale = max_side as f32 / width.max(height) as f32;
-        width = ((width as f32 * scale).round() as u32).max(1);
-        height = ((height as f32 * scale).round() as u32).max(1);
-        rgb = image::imageops::resize(&rgb, width, height, FilterType::Triangle);
+        width = ((width as f32 * scale) as u32).max(1);
+        height = ((height as f32 * scale) as u32).max(1);
+        rgb = pillow_lanczos_resize_rgb(&rgb, width, height);
     }
 
     let mean = cfg.mean.unwrap_or([0.0, 0.0, 0.0]);
@@ -1180,6 +1275,251 @@ fn preprocess_quality_nchw(
     }
     Array4::from_shape_vec((1, 3, height as usize, width as usize), data)
         .map_err(|e| format!("create Expert quality NCHW input failed: {e}"))
+}
+
+fn preprocess_musiq_patches(
+    img: &DynamicImage,
+    cfg: &ExpertQualityPreprocessor,
+) -> Result<Array3<f32>, String> {
+    if cfg.musiq_patch_size != MUSIQ_PATCH_SIZE || cfg.musiq_patch_stride != MUSIQ_PATCH_STRIDE {
+        return Err("Expert MUSIQ preprocessor patch config is not supported".to_string());
+    }
+    let rgb = quality_resized_rgb(img, cfg.max_side)?;
+    let (width, height) = rgb.dimensions();
+    let chw = rgb_to_chw_vec(&rgb, 0.5, 0.5)?;
+    let mut rows = Vec::<Vec<f32>>::new();
+    let mut scales = cfg.musiq_longer_side_lengths.clone();
+    scales.sort_unstable();
+    for (scale_id, longer_side) in scales.iter().copied().enumerate() {
+        let ratio = longer_side as f64 / width.max(height) as f64;
+        let resized_h = python_round(height as f64 * ratio).max(1) as usize;
+        let resized_w = python_round(width as f64 * ratio).max(1) as usize;
+        let resized = bicubic_resize_chw_align_corners_false(
+            &chw,
+            height as usize,
+            width as usize,
+            resized_h,
+            resized_w,
+        );
+        let max_seq_len = (longer_side.div_ceil(cfg.musiq_patch_stride)
+            * longer_side.div_ceil(cfg.musiq_patch_stride)) as isize;
+        append_musiq_patch_rows(
+            &mut rows,
+            &resized,
+            resized_h,
+            resized_w,
+            scale_id,
+            max_seq_len,
+            cfg,
+        );
+    }
+    if cfg.musiq_max_seq_len_from_original_res != 0 {
+        append_musiq_patch_rows(
+            &mut rows,
+            &chw,
+            height as usize,
+            width as usize,
+            scales.len(),
+            cfg.musiq_max_seq_len_from_original_res as isize,
+            cfg,
+        );
+    }
+    let seq_len = rows.len();
+    let dim = MUSIQ_PATCH_SIZE * MUSIQ_PATCH_SIZE * 3 + 3;
+    let mut data = Vec::with_capacity(seq_len * dim);
+    for row in rows {
+        data.extend(row);
+    }
+    Array3::from_shape_vec((1, seq_len, dim), data)
+        .map_err(|e| format!("create Expert MUSIQ patch input failed: {e}"))
+}
+
+fn quality_resized_rgb(img: &DynamicImage, max_side: u32) -> Result<RgbImage, String> {
+    let rgb = img.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    if width == 0 || height == 0 {
+        return Err("Expert quality input image is empty".to_string());
+    }
+    if max_side > 0 && width.max(height) > max_side {
+        let scale = max_side as f32 / width.max(height) as f32;
+        let w = ((width as f32 * scale) as u32).max(1);
+        let h = ((height as f32 * scale) as u32).max(1);
+        Ok(pillow_lanczos_resize_rgb(&rgb, w, h))
+    } else {
+        Ok(rgb)
+    }
+}
+
+fn rgb_to_chw_vec(img: &RgbImage, mean: f32, std: f32) -> Result<Vec<f32>, String> {
+    if std.abs() < 1e-8 {
+        return Err("Expert quality std must not be zero".to_string());
+    }
+    let (width, height) = img.dimensions();
+    let plane = (width * height) as usize;
+    let mut data = vec![0.0f32; plane * 3];
+    for y in 0..height {
+        for x in 0..width {
+            let p = img.get_pixel(x, y).0;
+            let idx = (y * width + x) as usize;
+            data[idx] = (p[0] as f32 / 255.0 - mean) / std;
+            data[plane + idx] = (p[1] as f32 / 255.0 - mean) / std;
+            data[plane * 2 + idx] = (p[2] as f32 / 255.0 - mean) / std;
+        }
+    }
+    Ok(data)
+}
+
+fn append_musiq_patch_rows(
+    rows: &mut Vec<Vec<f32>>,
+    chw: &[f32],
+    height: usize,
+    width: usize,
+    scale_id: usize,
+    max_seq_len: isize,
+    cfg: &ExpertQualityPreprocessor,
+) {
+    let count_h = height.div_ceil(cfg.musiq_patch_stride);
+    let count_w = width.div_ceil(cfg.musiq_patch_stride);
+    let patch_count = count_h * count_w;
+    let target_count = if max_seq_len >= 0 {
+        max_seq_len as usize
+    } else {
+        patch_count
+    };
+    let spatial = musiq_hashed_spatial_positions(cfg.musiq_hse_grid_size, count_h, count_w);
+    let dim = cfg.musiq_patch_size * cfg.musiq_patch_size * 3 + 3;
+    let pad_row = (count_h.saturating_sub(1)) * cfg.musiq_patch_stride + cfg.musiq_patch_size - height;
+    let pad_col = (count_w.saturating_sub(1)) * cfg.musiq_patch_stride + cfg.musiq_patch_size - width;
+    let pad_top = pad_row / 2;
+    let pad_left = pad_col / 2;
+    for patch_idx in 0..target_count {
+        let mut row = vec![0.0f32; dim];
+        if patch_idx < patch_count {
+            let patch_y = patch_idx / count_w;
+            let patch_x = patch_idx % count_w;
+            let mut out_idx = 0;
+            for c in 0..3 {
+                let channel_offset = c * height * width;
+                for ky in 0..cfg.musiq_patch_size {
+                    let src_y = patch_y * cfg.musiq_patch_stride + ky;
+                    let in_y = src_y as isize - pad_top as isize;
+                    for kx in 0..cfg.musiq_patch_size {
+                        let src_x = patch_x * cfg.musiq_patch_stride + kx;
+                        let in_x = src_x as isize - pad_left as isize;
+                        row[out_idx] = if in_y >= 0
+                            && in_y < height as isize
+                            && in_x >= 0
+                            && in_x < width as isize
+                        {
+                            chw[channel_offset + in_y as usize * width + in_x as usize]
+                        } else {
+                            0.0
+                        };
+                        out_idx += 1;
+                    }
+                }
+            }
+            row[dim - 3] = spatial[patch_idx] as f32;
+            row[dim - 2] = scale_id as f32;
+            row[dim - 1] = 1.0;
+        }
+        rows.push(row);
+    }
+}
+
+fn musiq_hashed_spatial_positions(grid_size: usize, count_h: usize, count_w: usize) -> Vec<usize> {
+    let h_hash = nearest_interpolate_arange(grid_size, count_h);
+    let w_hash = nearest_interpolate_arange(grid_size, count_w);
+    let mut out = Vec::with_capacity(count_h * count_w);
+    for h in h_hash {
+        for w in &w_hash {
+            out.push(h * grid_size + *w);
+        }
+    }
+    out
+}
+
+fn nearest_interpolate_arange(input: usize, output: usize) -> Vec<usize> {
+    if input == 0 || output == 0 {
+        return Vec::new();
+    }
+    (0..output).map(|i| (i * input / output).min(input - 1)).collect()
+}
+
+fn bicubic_resize_chw_align_corners_false(
+    src: &[f32],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<f32> {
+    if in_h == out_h && in_w == out_w {
+        return src.to_vec();
+    }
+    let mut out = vec![0.0f32; 3 * out_h * out_w];
+    let scale_y = in_h as f32 / out_h as f32;
+    let scale_x = in_w as f32 / out_w as f32;
+    for c in 0..3 {
+        let in_channel = c * in_h * in_w;
+        let out_channel = c * out_h * out_w;
+        for oy in 0..out_h {
+            let y = (oy as f32 + 0.5) * scale_y - 0.5;
+            let y0 = y.floor() as isize;
+            let wy = [
+                cubic_convolution1(y - (y0 - 1) as f32),
+                cubic_convolution1(y - y0 as f32),
+                cubic_convolution1(y - (y0 + 1) as f32),
+                cubic_convolution1(y - (y0 + 2) as f32),
+            ];
+            for ox in 0..out_w {
+                let x = (ox as f32 + 0.5) * scale_x - 0.5;
+                let x0 = x.floor() as isize;
+                let wx = [
+                    cubic_convolution1(x - (x0 - 1) as f32),
+                    cubic_convolution1(x - x0 as f32),
+                    cubic_convolution1(x - (x0 + 1) as f32),
+                    cubic_convolution1(x - (x0 + 2) as f32),
+                ];
+                let mut value = 0.0f32;
+                for ky in 0..4 {
+                    let sy = clamp_isize(y0 + ky as isize - 1, 0, in_h as isize - 1) as usize;
+                    for kx in 0..4 {
+                        let sx = clamp_isize(x0 + kx as isize - 1, 0, in_w as isize - 1) as usize;
+                        value += src[in_channel + sy * in_w + sx] * wy[ky] * wx[kx];
+                    }
+                }
+                out[out_channel + oy * out_w + ox] = value;
+            }
+        }
+    }
+    out
+}
+
+fn cubic_convolution1(x: f32) -> f32 {
+    const A: f32 = -0.75;
+    let x = x.abs();
+    if x <= 1.0 {
+        ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A
+    } else {
+        0.0
+    }
+}
+
+fn clamp_isize(v: isize, lo: isize, hi: isize) -> isize {
+    v.max(lo).min(hi)
+}
+
+fn python_round(v: f64) -> i64 {
+    let floor = v.floor();
+    let frac = v - floor;
+    if (frac - 0.5).abs() < 1e-12 {
+        let n = floor as i64;
+        if n % 2 == 0 { n } else { n + 1 }
+    } else {
+        v.round() as i64
+    }
 }
 
 fn rgb_to_chw(img: &RgbImage, mean: f32, std: f32) -> Result<Array4<f32>, String> {
@@ -1779,8 +2119,32 @@ fn default_quality_max_side() -> u32 {
     1024
 }
 
-fn default_quality_clip_input_size() -> u32 {
-    224
+fn default_quality_clip_input_width() -> Option<u32> {
+    Some(224)
+}
+
+fn default_quality_clip_input_height() -> Option<u32> {
+    Some(224)
+}
+
+fn default_musiq_patch_size() -> usize {
+    MUSIQ_PATCH_SIZE
+}
+
+fn default_musiq_patch_stride() -> usize {
+    MUSIQ_PATCH_STRIDE
+}
+
+fn default_musiq_hse_grid_size() -> usize {
+    MUSIQ_HSE_GRID_SIZE
+}
+
+fn default_musiq_longer_side_lengths() -> Vec<usize> {
+    MUSIQ_LONGER_SIDE_LENGTHS.to_vec()
+}
+
+fn default_musiq_original_seq_len() -> i32 {
+    -1
 }
 
 #[cfg(test)]
@@ -1943,8 +2307,8 @@ mod tests {
     fn quality_preprocess_respects_fixed_clip_input_shape() {
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(32, 24, Rgb([128, 64, 32])));
         let cfg = ExpertQualityPreprocessor {
-            clipiqa_input_width: 16,
-            clipiqa_input_height: 12,
+            clipiqa_input_width: Some(16),
+            clipiqa_input_height: Some(12),
             ..ExpertQualityPreprocessor::default()
         };
         let arr = preprocess_quality_nchw(&img, Some(16), Some(12), cfg.max_side, &cfg)
@@ -2355,8 +2719,11 @@ mod tests {
             let Ok((w, h)) = image::image_dimensions(&path) else {
                 return false;
             };
-            (w, h) != (musiq_w, musiq_h)
-                || (w, h) != (cfg.clipiqa_input_width, cfg.clipiqa_input_height)
+            let clip_fixed = match (cfg.clipiqa_input_width, cfg.clipiqa_input_height) {
+                (Some(clip_w), Some(clip_h)) => (w, h) != (clip_w, clip_h),
+                _ => false,
+            };
+            (w, h) != (musiq_w, musiq_h) || clip_fixed
         })
     }
 

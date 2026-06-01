@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_quality_models_update_expert_capabilities() {
+    fn optional_quality_models_without_parity_preprocessor_do_not_claim_parity() {
         let temp = tempfile::tempdir().expect("temp dir");
         let install_dir = temp.path().join("models").join("expert");
         fs::create_dir_all(install_dir.join("models").join("quality")).expect("quality dir");
@@ -1152,6 +1152,40 @@ mod tests {
             b"fake",
         )
         .expect("clipiqa");
+
+        let manager = ModelManager::new(temp.path().join("models"));
+        let caps = manager.expert_capabilities();
+        assert!(caps.musiq);
+        assert!(caps.clipiqa);
+        assert!(!caps.quality_models);
+    }
+
+    #[test]
+    fn optional_quality_models_update_expert_capabilities_with_parity_preprocessor() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let install_dir = temp.path().join("models").join("expert");
+        fs::create_dir_all(install_dir.join("models").join("quality")).expect("quality dir");
+        fs::write(
+            install_dir
+                .join("models")
+                .join("quality")
+                .join("musiq.onnx"),
+            b"fake",
+        )
+        .expect("musiq");
+        fs::write(
+            install_dir
+                .join("models")
+                .join("quality")
+                .join("clipiqa_plus.onnx"),
+            b"fake",
+        )
+        .expect("clipiqa");
+        fs::write(
+            install_dir.join("quality_preprocessor.json"),
+            r#"{"max_side":1024,"musiq_input_kind":"pyiqa_multiscale_patches","clipiqa_input_width":null,"clipiqa_input_height":null,"resize_filter":"pillow_lanczos","resize_rounding":"floor"}"#,
+        )
+        .expect("quality preprocessor");
 
         let manager = ModelManager::new(temp.path().join("models"));
         let caps = manager.expert_capabilities();
