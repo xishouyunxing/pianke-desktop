@@ -62,6 +62,8 @@ impl ModelManager {
             .join("clipiqa_plus.onnx")
             .exists();
         let nima = crate::expert_vision::ExpertQualityModels::nima_component_file_ready(&dir);
+        let nima_extra =
+            crate::expert_vision::ExpertQualityModels::extra_nima_component_files_ready(&dir);
         let quality_models =
             musiq && clipiqa && crate::expert_vision::quality_preprocessor_allows_parity(&dir);
         ExpertComponentCapabilities {
@@ -84,6 +86,7 @@ impl ModelManager {
             musiq,
             clipiqa,
             nima,
+            nima_extra,
             quality_models,
             nima_legacy: false,
             nima_legacy_unavailable: !nima,
@@ -648,6 +651,7 @@ pub struct ExpertComponentCapabilities {
     pub musiq: bool,
     pub clipiqa: bool,
     pub nima: bool,
+    pub nima_extra: bool,
     pub quality_models: bool,
     pub nima_legacy: bool,
     pub nima_legacy_unavailable: bool,
@@ -1131,8 +1135,20 @@ mod tests {
                 b"fake-nima".to_vec(),
             ),
             (
+                "models/quality/nima_inception_ava.onnx".to_string(),
+                b"fake-nima-inception".to_vec(),
+            ),
+            (
+                "models/quality/nima_koniq.onnx".to_string(),
+                b"fake-nima-koniq".to_vec(),
+            ),
+            (
+                "models/quality/nima_spaq.onnx".to_string(),
+                b"fake-nima-spaq".to_vec(),
+            ),
+            (
                 "quality_preprocessor.json".to_string(),
-                br#"{"max_side":1024,"musiq_input_width":null,"musiq_input_height":null,"musiq_input_kind":"pyiqa_multiscale_patches","musiq_patch_size":32,"musiq_patch_stride":32,"musiq_hse_grid_size":10,"musiq_longer_side_lengths":[224,384],"musiq_max_seq_len_from_original_res":-1,"clipiqa_input_width":null,"clipiqa_input_height":null,"resize_filter":"pillow_lanczos","resize_rounding":"floor","nima_model":"pyiqa-nima-vgg16-ava","nima_input_width":224,"nima_input_height":224,"nima_resize_shorter":224,"nima_mean":[0.485,0.456,0.406],"nima_std":[0.229,0.224,0.225],"nima_input_name":"input","nima_output_name":"score"}"#.to_vec(),
+                br#"{"max_side":1024,"musiq_input_width":null,"musiq_input_height":null,"musiq_input_kind":"pyiqa_multiscale_patches","musiq_patch_size":32,"musiq_patch_stride":32,"musiq_hse_grid_size":10,"musiq_longer_side_lengths":[224,384],"musiq_max_seq_len_from_original_res":-1,"clipiqa_input_width":null,"clipiqa_input_height":null,"resize_filter":"pillow_lanczos","resize_rounding":"floor","nima_model":"pyiqa-nima-vgg16-ava","nima_input_width":224,"nima_input_height":224,"nima_resize_shorter":224,"nima_mean":[0.485,0.456,0.406],"nima_std":[0.229,0.224,0.225],"nima_input_name":"input","nima_output_name":"score","nima_extra_models":[{"field":"nima_inception_ava_score","path":"models/quality/nima_inception_ava.onnx","input_width":299,"input_height":299,"resize_shorter":299,"mean":[0.5,0.5,0.5],"std":[0.5,0.5,0.5],"input_name":"input","output_name":"score"},{"field":"nima_koniq_score","path":"models/quality/nima_koniq.onnx","input_width":299,"input_height":299,"resize_shorter":299,"mean":[0.5,0.5,0.5],"std":[0.5,0.5,0.5],"input_name":"input","output_name":"score"},{"field":"nima_spaq_score","path":"models/quality/nima_spaq.onnx","input_width":299,"input_height":299,"resize_shorter":299,"mean":[0.5,0.5,0.5],"std":[0.5,0.5,0.5],"input_name":"input","output_name":"score"}]}"#.to_vec(),
             ),
         ];
         for (rel, bytes) in &files {
@@ -1167,7 +1183,10 @@ mod tests {
                 "insightface-1k3d68",
                 "quality-musiq",
                 "quality-clipiqa-plus",
-                "quality-nima-vgg16-ava"
+                "quality-nima-vgg16-ava",
+                "quality-nima-inception-ava",
+                "quality-nima-koniq",
+                "quality-nima-spaq"
             ],
             "files": manifest_files,
             "checksum_status": "verified"
@@ -1210,6 +1229,7 @@ mod tests {
         assert!(caps.insightface_landmark);
         assert!(caps.quality_models);
         assert!(caps.nima);
+        assert!(caps.nima_extra);
         assert!(!caps.nima_legacy);
         assert!(!caps.nima_legacy_unavailable);
     }

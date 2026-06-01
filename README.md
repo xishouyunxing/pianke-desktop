@@ -134,7 +134,7 @@ https://pianke.moeuu.cn/pianke/desktop/latest.json
 
 ### 能力边界
 
-- NIMA legacy classifier 不复刻旧版随机初始化行为；当前只在安装真实 `nima_vgg16_ava.onnx` 权重后启用 NIMA 分数。
+- NIMA legacy classifier 不复刻旧版随机初始化行为；当前只在安装真实 NIMA ONNX 权重后启用 NIMA 分数，其中 `nima_vgg16_ava.onnx` 作为 `aesthetic_score`，Inception-AVA/KonIQ/SPAQ 作为附加质量信号。
 - MUSIQ/CLIP-IQA+ 只有在 ONNX 与 Python golden parity 通过时才声明可用。
 - Expert 组件和 ONNX 模型不进入 Git，也不内置在基础安装包中。
 - Tycoon 的真实远程调用由用户自行配置 API，仓库默认使用 mock 验收本地流程。

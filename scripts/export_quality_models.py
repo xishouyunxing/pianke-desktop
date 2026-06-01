@@ -160,10 +160,30 @@ def export_musiq_core(paths: list[Path], out_path: Path, max_side: int) -> None:
     )
 
 
-def export_nima_core(out_path: Path) -> None:
+NIMA_EXPORTS = {
+    "nima-vgg16-ava": {
+        "path": "models/quality/nima_vgg16_ava.onnx",
+        "input_size": 224,
+    },
+    "nima": {
+        "path": "models/quality/nima_inception_ava.onnx",
+        "input_size": 299,
+    },
+    "nima-koniq": {
+        "path": "models/quality/nima_koniq.onnx",
+        "input_size": 299,
+    },
+    "nima-spaq": {
+        "path": "models/quality/nima_spaq.onnx",
+        "input_size": 299,
+    },
+}
+
+
+def export_nima_core(model_name: str, out_path: Path, input_size: int) -> None:
     import torch
 
-    metric = load_metric("nima-vgg16-ava")
+    metric = load_metric(model_name)
     net = metric.net.eval()
 
     class NimaCoreWrapper(torch.nn.Module):
@@ -175,10 +195,12 @@ def export_nima_core(out_path: Path) -> None:
             x = self.net.base_model(x)[-1]
             x = self.net.global_pool(x)
             dist = self.net.classifier(x)
-            scores = torch.arange(1, 11, dtype=dist.dtype, device=dist.device)
+            if self.net.num_classes == 1:
+                return dist.reshape(dist.shape[0], 1)
+            scores = torch.arange(1, self.net.num_classes + 1, dtype=dist.dtype, device=dist.device)
             return torch.sum(dist * scores, dim=1, keepdim=True)
 
-    dummy = torch.zeros(1, 3, 224, 224, dtype=torch.float32)
+    dummy = torch.zeros(1, 3, input_size, input_size, dtype=torch.float32)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         NimaCoreWrapper(net).eval(),
@@ -218,6 +240,38 @@ def write_preprocessor(path: Path, max_side: int) -> None:
         "nima_std": [0.229, 0.224, 0.225],
         "nima_input_name": "input",
         "nima_output_name": "score",
+        "nima_extra_models": [
+            {
+                "name": "pyiqa-nima-inception-ava",
+                "field": "nima_inception_ava_score",
+                "path": "models/quality/nima_inception_ava.onnx",
+                "input_width": 299,
+                "input_height": 299,
+                "resize_shorter": 299,
+                "input_name": "input",
+                "output_name": "score",
+            },
+            {
+                "name": "pyiqa-nima-koniq",
+                "field": "nima_koniq_score",
+                "path": "models/quality/nima_koniq.onnx",
+                "input_width": 299,
+                "input_height": 299,
+                "resize_shorter": 299,
+                "input_name": "input",
+                "output_name": "score",
+            },
+            {
+                "name": "pyiqa-nima-spaq",
+                "field": "nima_spaq_score",
+                "path": "models/quality/nima_spaq.onnx",
+                "input_width": 299,
+                "input_height": 299,
+                "resize_shorter": 299,
+                "input_name": "input",
+                "output_name": "score",
+            },
+        ],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -233,6 +287,7 @@ def main() -> None:
     parser.add_argument("--export-clipiqa", action="store_true")
     parser.add_argument("--export-musiq-core", action="store_true")
     parser.add_argument("--export-nima-core", action="store_true")
+    parser.add_argument("--export-nima-variants", action="store_true")
     args = parser.parse_args()
 
     paths = iter_images(args.folder, args.limit)
@@ -260,8 +315,13 @@ def main() -> None:
         if args.export_musiq_core:
             export_musiq_core(paths, args.export_dir / "models/quality/musiq.onnx", args.max_side)
         if args.export_nima_core:
-            export_nima_core(args.export_dir / "models/quality/nima_vgg16_ava.onnx")
-        if args.export_clipiqa or args.export_musiq_core or args.export_nima_core:
+            spec = NIMA_EXPORTS["nima-vgg16-ava"]
+            export_nima_core("nima-vgg16-ava", args.export_dir / spec["path"], spec["input_size"])
+        if args.export_nima_variants:
+            for model_name in ["nima", "nima-koniq", "nima-spaq"]:
+                spec = NIMA_EXPORTS[model_name]
+                export_nima_core(model_name, args.export_dir / spec["path"], spec["input_size"])
+        if args.export_clipiqa or args.export_musiq_core or args.export_nima_core or args.export_nima_variants:
             write_preprocessor(args.export_dir / "quality_preprocessor.json", args.max_side)
 
 

@@ -18,7 +18,7 @@ This checklist is the release gate for the Rust-only desktop package. It records
 - HEIC/HEIF support uses Windows WIC and depends on the system codec. Missing codec should produce a clear skipped reason, not a job crash.
 - Expert requires the Pianke official ONNX component package. DINOv2 and InsightFace are validated through gated local parity tests when the component and private fixtures are configured.
 - MUSIQ and CLIP-IQA+ are Expert quality models and should only be presented as available when ONNX parity is passing.
-- The Python legacy random NIMA classifier is intentionally not replicated. Rust can use the real `nima_vgg16_ava.onnx` AVA weight exported from pyiqa/IQA-PyTorch for free open-source use; without that ONNX file it reports `nima_legacy_unavailable=true` and keeps `aesthetic_score=null`.
+- The Python legacy random NIMA classifier is intentionally not replicated. Rust can use the real `nima_vgg16_ava.onnx` AVA weight exported from pyiqa/IQA-PyTorch for free open-source use; without that ONNX file it reports `nima_legacy_unavailable=true` and keeps `aesthetic_score=null`. Optional Inception-AVA, KonIQ, and SPAQ NIMA exports are reported as extra quality signals, not as replacements for `aesthetic_score`.
 - Tycoon supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages compatible providers. Mock E2E is automated; real provider calls require user-supplied credentials and are not part of the default RC gate.
 - Software update checking is prompt-only. The app reads `https://pianke.moeuu.cn/pianke/desktop/latest.json`, shows a small "有新版本" button when the remote version is newer, and opens the download URL when clicked. It does not perform silent auto-update.
 
@@ -54,7 +54,12 @@ Upload the full Expert component package to:
 /pianke/components/expert/onnx-v1/models/quality/musiq.onnx
 /pianke/components/expert/onnx-v1/models/quality/clipiqa_plus.onnx
 /pianke/components/expert/onnx-v1/models/quality/nima_vgg16_ava.onnx
+/pianke/components/expert/onnx-v1/models/quality/nima_inception_ava.onnx
+/pianke/components/expert/onnx-v1/models/quality/nima_koniq.onnx
+/pianke/components/expert/onnx-v1/models/quality/nima_spaq.onnx
 ```
+
+The current full Expert upload manifest is about 1.55 GB when all NIMA variants are included.
 
 The desktop app installs Expert from `https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json` by default. Development builds can still override this with `PIANKE_EXPERT_MANIFEST_URL`, `PIANKE_EXPERT_MANIFEST_PATH`, or `PIANKE_EXPERT_SOURCE_DIR`.
 

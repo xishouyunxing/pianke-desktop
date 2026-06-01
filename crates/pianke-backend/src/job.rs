@@ -742,6 +742,9 @@ pub(crate) fn apply_expert_quality_scores(
             .extra
             .insert("aesthetic_score".to_string(), serde_json::Value::Null);
     }
+    for (field, value) in scores.extra_nima_scores {
+        quality.extra.insert(field, json!(value));
+    }
     apply_expert_aesthetic_rule(&mut quality, strength);
     record.info.quality = Some(quality);
 }

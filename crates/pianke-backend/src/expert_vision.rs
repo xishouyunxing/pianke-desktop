@@ -30,6 +30,11 @@ const MUSIQ_PATCH_SIZE: usize = 32;
 const MUSIQ_PATCH_STRIDE: usize = 32;
 const MUSIQ_HSE_GRID_SIZE: usize = 10;
 const MUSIQ_LONGER_SIDE_LENGTHS: [usize; 2] = [224, 384];
+const NIMA_EXTRA_MODELS: &[(&str, &str)] = &[
+    ("nima_inception_ava_score", "models/quality/nima_inception_ava.onnx"),
+    ("nima_koniq_score", "models/quality/nima_koniq.onnx"),
+    ("nima_spaq_score", "models/quality/nima_spaq.onnx"),
+];
 const ARC_FACE_TEMPLATE: [[f32; 2]; 5] = [
     [38.2946, 51.6963],
     [73.5318, 51.5014],
@@ -136,6 +141,30 @@ pub struct ExpertQualityPreprocessor {
     pub nima_input_name: Option<String>,
     #[serde(default)]
     pub nima_output_name: Option<String>,
+    #[serde(default)]
+    pub nima_extra_models: Vec<NimaExtraPreprocessor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NimaExtraPreprocessor {
+    pub field: String,
+    pub path: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_nima_input_size")]
+    pub input_width: u32,
+    #[serde(default = "default_nima_input_size")]
+    pub input_height: u32,
+    #[serde(default = "default_nima_resize_shorter")]
+    pub resize_shorter: u32,
+    #[serde(default = "default_mean")]
+    pub mean: [f32; 3],
+    #[serde(default = "default_std")]
+    pub std: [f32; 3],
+    #[serde(default)]
+    pub input_name: Option<String>,
+    #[serde(default)]
+    pub output_name: Option<String>,
 }
 
 impl Default for ExpertQualityPreprocessor {
@@ -169,6 +198,7 @@ impl Default for ExpertQualityPreprocessor {
             nima_std: default_std(),
             nima_input_name: None,
             nima_output_name: None,
+            nima_extra_models: Vec::new(),
         }
     }
 }
@@ -178,12 +208,14 @@ pub struct ExpertQualityScores {
     pub musiq_score: Option<f64>,
     pub clipiqa_score: Option<f64>,
     pub nima_score: Option<f64>,
+    pub extra_nima_scores: Vec<(String, f64)>,
 }
 
 pub struct ExpertQualityModels {
     musiq: Session,
     clipiqa: Session,
     nima: Option<Session>,
+    extra_nima: Vec<(NimaExtraPreprocessor, Session)>,
     preprocessor: ExpertQualityPreprocessor,
 }
 
@@ -234,6 +266,12 @@ impl ExpertQualityModels {
         component_dir.join(NIMA_MODEL_PATH).exists()
     }
 
+    pub fn extra_nima_component_files_ready(component_dir: &Path) -> bool {
+        NIMA_EXTRA_MODELS
+            .iter()
+            .all(|(_, rel)| component_dir.join(rel).exists())
+    }
+
     pub fn component_ready_for_live_scoring(component_dir: &Path) -> bool {
         Self::component_files_ready(component_dir)
             && quality_preprocessor_allows_parity(component_dir)
@@ -250,6 +288,14 @@ impl ExpertQualityModels {
                 ));
             }
         }
+        let preprocessor = load_quality_preprocessor(component_dir)?;
+        let mut extra_nima = Vec::new();
+        for cfg in &preprocessor.nima_extra_models {
+            let path = component_dir.join(&cfg.path);
+            if path.exists() {
+                extra_nima.push((cfg.clone(), load_session(&path, &cfg.field)?));
+            }
+        }
         Ok(Self {
             musiq: load_session(&musiq_path, "MUSIQ")?,
             clipiqa: load_session(&clipiqa_path, "CLIP-IQA+")?,
@@ -258,7 +304,8 @@ impl ExpertQualityModels {
             } else {
                 None
             },
-            preprocessor: load_quality_preprocessor(component_dir)?,
+            extra_nima,
+            preprocessor,
         })
     }
 
@@ -305,7 +352,14 @@ impl ExpertQualityModels {
             "CLIP-IQA+",
         )?;
         let nima_score = if let Some(nima) = self.nima.as_mut() {
-            let input = preprocess_nima_nchw(img, &self.preprocessor)?;
+            let input = preprocess_nima_nchw(
+                img,
+                self.preprocessor.nima_input_width,
+                self.preprocessor.nima_input_height,
+                self.preprocessor.nima_resize_shorter,
+                self.preprocessor.nima_mean,
+                self.preprocessor.nima_std,
+            )?;
             Some(run_scalar_model(
                 nima,
                 input,
@@ -316,10 +370,30 @@ impl ExpertQualityModels {
         } else {
             None
         };
+        let mut extra_nima_scores = Vec::new();
+        for (cfg, session) in &mut self.extra_nima {
+            let input = preprocess_nima_nchw(
+                img,
+                cfg.input_width,
+                cfg.input_height,
+                cfg.resize_shorter,
+                cfg.mean,
+                cfg.std,
+            )?;
+            let score = run_scalar_model(
+                session,
+                input,
+                cfg.input_name.as_deref(),
+                cfg.output_name.as_deref(),
+                &cfg.field,
+            )?;
+            extra_nima_scores.push((cfg.field.clone(), score));
+        }
         Ok(ExpertQualityScores {
             musiq_score: Some(musiq_score),
             clipiqa_score: Some(clipiqa_score),
             nima_score,
+            extra_nima_scores,
         })
     }
 }
@@ -1328,9 +1402,13 @@ fn preprocess_quality_nchw(
 
 fn preprocess_nima_nchw(
     img: &DynamicImage,
-    cfg: &ExpertQualityPreprocessor,
+    input_width: u32,
+    input_height: u32,
+    resize_shorter: u32,
+    mean: [f32; 3],
+    std: [f32; 3],
 ) -> Result<Array4<f32>, String> {
-    if cfg.nima_input_width == 0 || cfg.nima_input_height == 0 || cfg.nima_resize_shorter == 0 {
+    if input_width == 0 || input_height == 0 || resize_shorter == 0 {
         return Err("NIMA input size must not be zero".to_string());
     }
     let rgb = img.to_rgb8();
@@ -1339,7 +1417,7 @@ fn preprocess_nima_nchw(
         return Err("NIMA input image is empty".to_string());
     }
     let shorter = width.min(height);
-    let scale = cfg.nima_resize_shorter as f32 / shorter as f32;
+    let scale = resize_shorter as f32 / shorter as f32;
     let resized_width = ((width as f32 * scale).round() as u32).max(1);
     let resized_height = ((height as f32 * scale).round() as u32).max(1);
     let resized = if resized_width == width && resized_height == height {
@@ -1347,28 +1425,20 @@ fn preprocess_nima_nchw(
     } else {
         pillow_lanczos_resize_rgb(&rgb, resized_width, resized_height)
     };
-    if resized.width() < cfg.nima_input_width || resized.height() < cfg.nima_input_height {
+    if resized.width() < input_width || resized.height() < input_height {
         return Err("NIMA resized image is smaller than crop size".to_string());
     }
-    let left = (resized.width() - cfg.nima_input_width) / 2;
-    let top = (resized.height() - cfg.nima_input_height) / 2;
-    let cropped = image::imageops::crop_imm(
-        &resized,
-        left,
-        top,
-        cfg.nima_input_width,
-        cfg.nima_input_height,
-    )
-    .to_image();
-    let plane = (cfg.nima_input_width * cfg.nima_input_height) as usize;
+    let left = (resized.width() - input_width) / 2;
+    let top = (resized.height() - input_height) / 2;
+    let cropped = image::imageops::crop_imm(&resized, left, top, input_width, input_height).to_image();
+    let plane = (input_width * input_height) as usize;
     let mut data = vec![0.0f32; plane * 3];
-    for y in 0..cfg.nima_input_height {
-        for x in 0..cfg.nima_input_width {
+    for y in 0..input_height {
+        for x in 0..input_width {
             let pixel = cropped.get_pixel(x, y).0;
-            let idx = (y * cfg.nima_input_width + x) as usize;
+            let idx = (y * input_width + x) as usize;
             for c in 0..3 {
-                data[c * plane + idx] =
-                    (pixel[c] as f32 / 255.0 - cfg.nima_mean[c]) / cfg.nima_std[c];
+                data[c * plane + idx] = (pixel[c] as f32 / 255.0 - mean[c]) / std[c];
             }
         }
     }
@@ -1376,8 +1446,8 @@ fn preprocess_nima_nchw(
         (
             1,
             3,
-            cfg.nima_input_height as usize,
-            cfg.nima_input_width as usize,
+            input_height as usize,
+            input_width as usize,
         ),
         data,
     )
