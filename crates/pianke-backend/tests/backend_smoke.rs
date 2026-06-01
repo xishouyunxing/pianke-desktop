@@ -99,6 +99,77 @@ fn write_jpg(path: &Path, seed: u8) {
     img.save(path).expect("save jpg");
 }
 
+fn write_fake_full_expert_component(root: &Path) -> Vec<(String, usize)> {
+    let files = vec![
+        (
+            "models/dinov2-small.onnx".to_string(),
+            b"fake-dinov2".to_vec(),
+        ),
+        (
+            "models/insightface/det_10g.onnx".to_string(),
+            b"fake-det".to_vec(),
+        ),
+        (
+            "models/insightface/w600k_r50.onnx".to_string(),
+            b"fake-rec".to_vec(),
+        ),
+        (
+            "models/insightface/1k3d68.onnx".to_string(),
+            b"fake-landmark".to_vec(),
+        ),
+        (
+            "models/quality/musiq.onnx".to_string(),
+            b"fake-musiq".to_vec(),
+        ),
+        (
+            "models/quality/clipiqa_plus.onnx".to_string(),
+            b"fake-clipiqa".to_vec(),
+        ),
+        (
+            "quality_preprocessor.json".to_string(),
+            br#"{"max_side":1024,"musiq_input_width":null,"musiq_input_height":null,"musiq_input_kind":"pyiqa_multiscale_patches","musiq_patch_size":32,"musiq_patch_stride":32,"musiq_hse_grid_size":10,"musiq_longer_side_lengths":[224,384],"musiq_max_seq_len_from_original_res":-1,"clipiqa_input_width":null,"clipiqa_input_height":null,"resize_filter":"pillow_lanczos","resize_rounding":"floor"}"#.to_vec(),
+        ),
+    ];
+    let mut manifest_files = Vec::new();
+    for (rel, bytes) in &files {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fake expert component parent");
+        }
+        fs::write(path, bytes).expect("fake expert component file");
+        manifest_files.push((rel.clone(), bytes.len()));
+    }
+    manifest_files
+}
+
+fn fake_full_expert_manifest(files: &[(String, usize)]) -> String {
+    let manifest_files = files
+        .iter()
+        .map(|(path, size)| {
+            json!({
+                "path": path,
+                "size_bytes": size
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&json!({
+        "id": "expert",
+        "version": "onnx-v1",
+        "runtime": "onnxruntime",
+        "models": [
+            "dinov2-small",
+            "insightface-det_10g",
+            "insightface-w600k_r50",
+            "insightface-1k3d68",
+            "quality-musiq",
+            "quality-clipiqa-plus"
+        ],
+        "files": manifest_files,
+        "checksum_status": "verified"
+    }))
+    .expect("fake full expert manifest")
+}
+
 #[test]
 fn app_update_reports_available_for_newer_manifest() {
     let _env = env_lock();
@@ -176,6 +247,24 @@ fn app_update_hides_equal_or_broken_manifest() {
     std::env::remove_var("PIANKE_APP_UPDATE_URL");
     assert_eq!(broken["update_available"], false);
     assert!(broken["error"].as_str().unwrap_or("").contains("软件更新"));
+
+    let invalid_download_url = start_mock_json_server(
+        r#"{"version":"999.0.0","url":"","notes":"bad url","published_at":"2026-05-27"}"#,
+    );
+    std::env::set_var("PIANKE_APP_UPDATE_URL", invalid_download_url);
+    let invalid_url_update: Value = client
+        .get(format!("{base}/api/app_update"))
+        .header("X-Token", token)
+        .send()
+        .expect("invalid url app update response")
+        .json()
+        .expect("invalid url app update json");
+    std::env::remove_var("PIANKE_APP_UPDATE_URL");
+    assert_eq!(invalid_url_update["update_available"], false);
+    assert!(invalid_url_update["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("软件更新"));
 
     let closed_port = reserve_port();
     std::env::set_var(
@@ -643,7 +732,7 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         .expect("tycoon capabilities response")
         .json()
         .expect("tycoon capabilities json");
-    assert_eq!(tycoon_capabilities["tycoon_ready"], true);
+    assert_eq!(tycoon_capabilities["tycoon_ready"], false);
 
     let tycoon_start = client
         .post(format!("{base}/api/start"))
@@ -656,26 +745,9 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         }))
         .send()
         .expect("tycoon start response");
-    assert!(tycoon_start.status().is_success());
-    let job: Value = client
-        .get(format!("{base}/api/job"))
-        .header("X-Token", token)
-        .send()
-        .expect("tycoon job response")
-        .json()
-        .expect("tycoon job json");
-    if job["status"] != "error" {
-        wait_for_done(&client, &base, token);
-    }
-    let job: Value = client
-        .get(format!("{base}/api/job"))
-        .header("X-Token", token)
-        .send()
-        .expect("tycoon job response")
-        .json()
-        .expect("tycoon job json");
-    assert_eq!(job["status"], "error");
-    assert!(job["error"]
+    assert_eq!(tycoon_start.status(), reqwest::StatusCode::PRECONDITION_REQUIRED);
+    let start_error: Value = tycoon_start.json().expect("tycoon start error json");
+    assert!(start_error["error"]
         .as_str()
         .expect("tycoon missing component error")
         .contains("Expert"));
@@ -889,12 +961,10 @@ fn installed_model_manifest_updates_capabilities() {
     let token = "models-token";
     let (backend, _handle, base) = start_test_backend(token);
     let expert_dir = backend.path().join("model_components").join("expert");
-    fs::create_dir_all(expert_dir.join("models")).expect("expert component dir");
-    fs::write(expert_dir.join("models").join("dinov2-small.onnx"), b"fake")
-        .expect("expert model marker");
+    let files = write_fake_full_expert_component(&expert_dir);
     fs::write(
         expert_dir.join("component.json"),
-        r#"{"id":"expert","version":"onnx-v1","runtime":"onnxruntime","models":["dinov2-small"],"checksum_status":"verified"}"#,
+        fake_full_expert_manifest(&files),
     )
     .expect("expert manifest");
 
@@ -910,20 +980,20 @@ fn installed_model_manifest_updates_capabilities() {
         capabilities["expert_installed"], true,
         "expected materialized Expert component to be installed: {capabilities}"
     );
-    assert_eq!(capabilities["face_aware"], false);
-    assert_eq!(capabilities["quality_models"], false);
+    assert_eq!(capabilities["face_aware"], true);
+    assert_eq!(capabilities["quality_models"], true);
     assert_eq!(
         capabilities["quality_models_reason"],
-        "quality_models_not_installed"
+        "available"
     );
     assert_eq!(capabilities["expert_capabilities"]["dinov2"], true);
     assert_eq!(
         capabilities["expert_capabilities"]["insightface_detection"],
-        false
+        true
     );
-    assert_eq!(capabilities["expert_capabilities"]["musiq"], false);
-    assert_eq!(capabilities["expert_capabilities"]["clipiqa"], false);
-    assert_eq!(capabilities["expert_capabilities"]["quality_models"], false);
+    assert_eq!(capabilities["expert_capabilities"]["musiq"], true);
+    assert_eq!(capabilities["expert_capabilities"]["clipiqa"], true);
+    assert_eq!(capabilities["expert_capabilities"]["quality_models"], true);
     assert_eq!(capabilities["expert_capabilities"]["nima_legacy"], false);
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
@@ -1143,18 +1213,10 @@ fn model_component_install_from_source_dir_updates_capabilities() {
     let token = "model-install-token";
     let (_backend, _handle, base) = start_test_backend(token);
     let source = tempfile::tempdir().expect("source component dir");
-    fs::create_dir_all(source.path().join("models")).expect("models dir");
-    let model_path = source.path().join("models").join("dinov2-small.onnx");
-    fs::write(&model_path, b"fake onnx bytes").expect("model bytes");
+    let files = write_fake_full_expert_component(source.path());
     fs::write(
         source.path().join("component.json"),
-        r#"{
-            "id":"expert",
-            "version":"onnx-v1",
-            "runtime":"onnxruntime",
-            "models":["dinov2-small"],
-            "files":[{"path":"models/dinov2-small.onnx","size_bytes":15}]
-        }"#,
+        fake_full_expert_manifest(&files),
     )
     .expect("component manifest");
 
@@ -1194,6 +1256,8 @@ fn model_component_install_from_source_dir_updates_capabilities() {
         .json()
         .expect("capabilities json");
     assert_eq!(capabilities["expert_installed"], true);
+    assert_eq!(capabilities["face_aware"], true);
+    assert_eq!(capabilities["quality_models"], true);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
 
     let delete: Value = client

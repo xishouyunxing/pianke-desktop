@@ -133,8 +133,16 @@ async function fetchJSON(url, opts = {}) {
 async function pickFolderFromDesktopShell() {
   const invoke = window.__TAURI__?.core?.invoke;
   if (IS_DESKTOP_SHELL) {
-    const r = await fetchJSON("/api/browse_folder", { method: "POST" });
-    return { available: true, cancelled: !!r.cancelled, folder: r.folder || "" };
+    try {
+      const r = await fetchJSON("/api/browse_folder", { method: "POST" });
+      return { available: true, cancelled: !!r.cancelled, folder: r.folder || "" };
+    } catch (err) {
+      if (typeof invoke === "function") {
+        const folder = await invoke("pick_folder");
+        return { available: true, cancelled: !folder, folder: folder || "" };
+      }
+      throw err;
+    }
   }
   if (typeof invoke !== "function") {
     if (window.parent === window) {
@@ -165,9 +173,6 @@ async function pickFolderFromDesktopShell() {
       window.parent.postMessage({ type: "pianke:pick-folder", requestId }, "*");
     });
   }
-
-  const folder = await invoke("pick_folder");
-  return { available: true, cancelled: !folder, folder: folder || "" };
 }
 
 async function openExternalUrl(url) {
@@ -867,22 +872,22 @@ function applyBackendCapabilities(cap) {
           action.className = "model-install-chip";
           action.role = "button";
           action.tabIndex = 0;
-          action.textContent = engine === "expert" ? "安装完整 Expert 组件" : "安装增强组件";
+          action.textContent = "安装完整 Expert 组件";
           action.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
-            requestModelComponentInstall(engine);
+            requestModelComponentInstall("expert");
           });
           action.addEventListener("keydown", (event) => {
             if (event.key !== "Enter" && event.key !== " ") return;
             event.preventDefault();
             event.stopPropagation();
-            requestModelComponentInstall(engine);
+            requestModelComponentInstall("expert");
           });
           el.appendChild(action);
         }
-        action.textContent = engine === "expert" ? "安装完整 Expert 组件" : "安装增强组件";
-        action.dataset.component = engine;
+        action.textContent = "安装完整 Expert 组件";
+        action.dataset.component = "expert";
       } else if (action) {
         action.remove();
       }

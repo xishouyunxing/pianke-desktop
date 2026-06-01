@@ -158,7 +158,9 @@ async fn app_update() -> impl IntoResponse {
 
     match fetch_app_update_manifest(&manifest_url).await {
         Ok(manifest) => {
-            let update_available = compare_versions(&manifest.version, &current_version).is_gt();
+            let valid_url = manifest.url.starts_with("https://") || manifest.url.starts_with("http://");
+            let update_available =
+                valid_url && compare_versions(&manifest.version, &current_version).is_gt();
             Json(json!({
                 "current_version": current_version,
                 "latest_version": manifest.version,
@@ -197,7 +199,9 @@ async fn fetch_app_update_manifest(url: &str) -> Result<AppUpdateManifest, Strin
         .map_err(|e| format!("读取软件更新清单失败：{e}"))?;
     let manifest: AppUpdateManifest = serde_json::from_str(manifest.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("解析软件更新清单失败：{e}"))?;
-    if manifest.version.trim().is_empty() {
+    if manifest.version.trim().is_empty()
+        || !(manifest.url.starts_with("https://") || manifest.url.starts_with("http://"))
+    {
         return Err("软件更新清单缺少 version 或 url".to_string());
     }
     Ok(manifest)
@@ -221,7 +225,12 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "quality_models_not_installed"
     };
     let llm_status = ctx.llm.provider_status();
-    let tycoon_ready = llm_status.configured;
+    let tycoon_ready = llm_status.configured
+        && expert_installed
+        && expert_caps.dinov2
+        && expert_caps.insightface_detection
+        && expert_caps.insightface_recognition
+        && expert_caps.insightface_landmark;
     let mut engines = ctx.models.available_engines();
     engines.push("tycoon".to_string());
     engines.sort();
@@ -661,6 +670,28 @@ async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> 
             StatusCode::PRECONDITION_REQUIRED,
             "Expert 模型组件尚未安装，请先安装增强组件",
         );
+    }
+    if req.engine == "tycoon" {
+        if !ctx.models.is_installed("expert") {
+            return json_error(
+                StatusCode::PRECONDITION_REQUIRED,
+                "Tycoon 模式需要先安装完整 Expert 组件",
+            );
+        }
+        let expert_caps = ctx.models.expert_capabilities();
+        if !expert_caps.dinov2
+            || !expert_caps.insightface_detection
+            || !expert_caps.insightface_recognition
+            || !expert_caps.insightface_landmark
+        {
+            return json_error(
+                StatusCode::PRECONDITION_REQUIRED,
+                "Tycoon 模式需要完整 Expert 组件：DINOv2 + InsightFace 三个 ONNX 模型",
+            );
+        }
+        if let Err(err) = ctx.llm.require_tycoon_ready(req.llm_model.as_deref()) {
+            return json_error(err.status, &err.message);
+        }
     }
     if req.mode != "copy" && req.mode != "move" {
         return json_error(

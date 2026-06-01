@@ -21,7 +21,7 @@ const status = ref<BackendStatus>({
   token: null,
   port: null,
   python: null,
-  backend_kind: "python",
+  backend_kind: "rust-fast",
   backend_dir: null,
   message: "正在启动片刻引擎...",
 });
@@ -175,9 +175,6 @@ onUnmounted(() => {
       </section>
 
       <div class="actions">
-        <button class="primary" :disabled="!status.healthy" @click="chooseFolder">
-          选择照片文件夹
-        </button>
         <button class="secondary" :disabled="busy" @click="restartBackend">
           {{ busy ? "重启中..." : "重启引擎" }}
         </button>
@@ -196,7 +193,7 @@ onUnmounted(() => {
       />
       <div v-else class="empty">
         <h2>引擎未启动</h2>
-        <p>请确认已安装 Python 3.10，或在打包版本中放入内置 Python。</p>
+        <p>请尝试重启引擎；正式安装包会启动内置 Rust 后端，不需要 Python。</p>
       </div>
     </section>
   </main>

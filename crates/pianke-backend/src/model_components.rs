@@ -671,10 +671,16 @@ fn component_catalog() -> Vec<ComponentDef> {
 
 fn component_files_ready(id: &str, install_dir: &Path) -> bool {
     match id {
-        "expert" => install_dir
-            .join("models")
-            .join("dinov2-small.onnx")
-            .exists(),
+        "expert" => {
+            install_dir
+                .join("models")
+                .join("dinov2-small.onnx")
+                .exists()
+                && crate::expert_vision::InsightFaceModels::component_files_ready(install_dir)
+                && crate::expert_vision::ExpertQualityModels::component_ready_for_live_scoring(
+                    install_dir,
+                )
+        }
         _ => true,
     }
 }
@@ -1091,6 +1097,76 @@ fn chrono_like_timestamp() -> String {
 mod tests {
     use super::*;
 
+    fn write_fake_full_expert_component(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let files = vec![
+            (
+                "models/dinov2-small.onnx".to_string(),
+                b"fake-dinov2".to_vec(),
+            ),
+            (
+                "models/insightface/det_10g.onnx".to_string(),
+                b"fake-det".to_vec(),
+            ),
+            (
+                "models/insightface/w600k_r50.onnx".to_string(),
+                b"fake-rec".to_vec(),
+            ),
+            (
+                "models/insightface/1k3d68.onnx".to_string(),
+                b"fake-landmark".to_vec(),
+            ),
+            (
+                "models/quality/musiq.onnx".to_string(),
+                b"fake-musiq".to_vec(),
+            ),
+            (
+                "models/quality/clipiqa_plus.onnx".to_string(),
+                b"fake-clipiqa".to_vec(),
+            ),
+            (
+                "quality_preprocessor.json".to_string(),
+                br#"{"max_side":1024,"musiq_input_width":null,"musiq_input_height":null,"musiq_input_kind":"pyiqa_multiscale_patches","musiq_patch_size":32,"musiq_patch_stride":32,"musiq_hse_grid_size":10,"musiq_longer_side_lengths":[224,384],"musiq_max_seq_len_from_original_res":-1,"clipiqa_input_width":null,"clipiqa_input_height":null,"resize_filter":"pillow_lanczos","resize_rounding":"floor"}"#.to_vec(),
+            ),
+        ];
+        for (rel, bytes) in &files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("fake component parent");
+            }
+            fs::write(path, bytes).expect("fake component file");
+        }
+        files
+    }
+
+    fn fake_full_expert_manifest(files: &[(String, Vec<u8>)]) -> String {
+        let manifest_files = files
+            .iter()
+            .map(|(path, bytes)| {
+                json!({
+                    "path": path,
+                    "sha256": sha256_hex(bytes),
+                    "size_bytes": bytes.len()
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string_pretty(&json!({
+            "id": "expert",
+            "version": "onnx-v1",
+            "runtime": "onnxruntime",
+            "models": [
+                "dinov2-small",
+                "insightface-det_10g",
+                "insightface-w600k_r50",
+                "insightface-1k3d68",
+                "quality-musiq",
+                "quality-clipiqa-plus"
+            ],
+            "files": manifest_files,
+            "checksum_status": "verified"
+        }))
+        .expect("fake full expert manifest")
+    }
+
     #[test]
     fn lists_not_installed_components_without_cache_dir() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1102,6 +1178,35 @@ mod tests {
 
     #[test]
     fn installed_manifest_marks_component_installed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let install_dir = temp.path().join("models").join("expert");
+        let files = write_fake_full_expert_component(&install_dir);
+        fs::write(
+            install_dir.join(MANIFEST_FILENAME),
+            fake_full_expert_manifest(&files),
+        )
+        .expect("manifest");
+
+        let manager = ModelManager::new(temp.path().join("models"));
+        let expert = manager
+            .list()
+            .into_iter()
+            .find(|c| c.id == "expert")
+            .expect("expert component");
+        assert_eq!(expert.status, "installed");
+        assert!(!expert.download_required);
+        let caps = manager.expert_capabilities();
+        assert!(caps.dinov2);
+        assert!(caps.insightface_detection);
+        assert!(caps.insightface_recognition);
+        assert!(caps.insightface_landmark);
+        assert!(caps.quality_models);
+        assert!(!caps.nima_legacy);
+        assert!(caps.nima_legacy_unavailable);
+    }
+
+    #[test]
+    fn dinov2_only_manifest_is_unverified_not_installed() {
         let temp = tempfile::tempdir().expect("temp dir");
         let install_dir = temp.path().join("models").join("expert");
         fs::create_dir_all(install_dir.join("models")).expect("install dir");
@@ -1122,13 +1227,10 @@ mod tests {
             .into_iter()
             .find(|c| c.id == "expert")
             .expect("expert component");
-        assert_eq!(expert.status, "installed");
-        assert!(!expert.download_required);
-        let caps = manager.expert_capabilities();
-        assert!(caps.dinov2);
-        assert!(!caps.quality_models);
-        assert!(!caps.nima_legacy);
-        assert!(caps.nima_legacy_unavailable);
+        assert_eq!(expert.status, "unverified");
+        assert!(expert.download_required);
+        assert!(!manager.available_engines().contains(&"expert".to_string()));
+        assert!(manager.expert_capabilities().dinov2);
     }
 
     #[test]
@@ -1256,23 +1358,11 @@ mod tests {
     async fn installs_component_from_source_dir_and_verifies_files() {
         let temp = tempfile::tempdir().expect("temp dir");
         let source = temp.path().join("source");
-        fs::create_dir_all(source.join("models")).expect("source models dir");
-        let model_bytes = b"tiny fake onnx model";
-        fs::write(source.join("models").join("dinov2-small.onnx"), model_bytes)
-            .expect("model file");
+        let files = write_fake_full_expert_component(&source);
+        let total_bytes: usize = files.iter().map(|(_, bytes)| bytes.len()).sum();
         fs::write(
             source.join(MANIFEST_FILENAME),
-            format!(
-                r#"{{
-                    "id":"expert",
-                    "version":"onnx-v1",
-                    "runtime":"onnxruntime",
-                    "models":["dinov2-small"],
-                    "files":[{{"path":"models/dinov2-small.onnx","sha256":"{}","size_bytes":{}}}]
-                }}"#,
-                sha256_hex(model_bytes),
-                model_bytes.len()
-            ),
+            fake_full_expert_manifest(&files),
         )
         .expect("manifest");
 
@@ -1304,8 +1394,8 @@ mod tests {
             .exists());
         let state = expert.install_state.as_ref().expect("install state");
         assert_eq!(state.status, "done");
-        assert_eq!(state.bytes_done, model_bytes.len() as u64);
-        assert_eq!(state.bytes_total, model_bytes.len() as u64);
+        assert_eq!(state.bytes_done, total_bytes as u64);
+        assert_eq!(state.bytes_total, total_bytes as u64);
         assert!(manager.available_engines().contains(&"expert".to_string()));
     }
 

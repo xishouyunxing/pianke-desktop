@@ -118,7 +118,7 @@ pub(crate) fn run_job(ctx: AppCtx, req: StartRequest) {
     } else {
         None
     };
-    let mut quality_model = if req.engine == "expert" {
+    let mut quality_model = if req.engine == "expert" || req.engine == "tycoon" {
         if let Some(dir) = &expert_dir {
             if expert_vision::ExpertQualityModels::component_ready_for_live_scoring(dir) {
                 match expert_vision::ExpertQualityModels::from_component_dir(dir) {
@@ -323,7 +323,7 @@ pub(crate) fn run_job(ctx: AppCtx, req: StartRequest) {
                             }
                         }
                     }
-                    if req.engine == "expert" {
+                    if req.engine == "expert" || req.engine == "tycoon" {
                         apply_expert_quality_availability(
                             &mut record,
                             quality_model.is_some(),
