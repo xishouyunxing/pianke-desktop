@@ -17,8 +17,8 @@ This checklist is the release gate for the Rust-only desktop package. It records
 - RAW support means embedded JPEG preview extraction; it does not promise LibRaw demosaic.
 - HEIC/HEIF support uses Windows WIC and depends on the system codec. Missing codec should produce a clear skipped reason, not a job crash.
 - Expert requires the Pianke official ONNX component package. DINOv2 and InsightFace are validated through gated local parity tests when the component and private fixtures are configured.
-- MUSIQ and CLIP-IQA+ are optional Expert quality models and should only be presented as available when ONNX parity is passing.
-- NIMA is intentionally unavailable in Rust because the Python legacy path replaces the MobileNetV2 classifier without loading a verifiable NIMA-trained head. Rust reports `nima_legacy_unavailable=true` and keeps `aesthetic_score=null`.
+- MUSIQ and CLIP-IQA+ are Expert quality models and should only be presented as available when ONNX parity is passing.
+- The Python legacy random NIMA classifier is intentionally not replicated. Rust can use the real `nima_vgg16_ava.onnx` AVA weight exported from pyiqa/IQA-PyTorch for free open-source use; without that ONNX file it reports `nima_legacy_unavailable=true` and keeps `aesthetic_score=null`.
 - Tycoon supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages compatible providers. Mock E2E is automated; real provider calls require user-supplied credentials and are not part of the default RC gate.
 - Software update checking is prompt-only. The app reads `https://pianke.moeuu.cn/pianke/desktop/latest.json`, shows a small "有新版本" button when the remote version is newer, and opens the download URL when clicked. It does not perform silent auto-update.
 
@@ -52,8 +52,8 @@ Upload the full Expert component package to:
 /pianke/components/expert/onnx-v1/models/insightface/w600k_r50.onnx
 /pianke/components/expert/onnx-v1/models/insightface/1k3d68.onnx
 /pianke/components/expert/onnx-v1/models/quality/musiq.onnx
-/pianke/components/expert/onnx-v1/models/quality/musiq.onnx.data
 /pianke/components/expert/onnx-v1/models/quality/clipiqa_plus.onnx
+/pianke/components/expert/onnx-v1/models/quality/nima_vgg16_ava.onnx
 ```
 
 The desktop app installs Expert from `https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json` by default. Development builds can still override this with `PIANKE_EXPERT_MANIFEST_URL`, `PIANKE_EXPERT_MANIFEST_PATH`, or `PIANKE_EXPERT_SOURCE_DIR`.

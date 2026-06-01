@@ -724,15 +724,23 @@ pub(crate) fn apply_expert_quality_scores(
         .insert("quality_models".to_string(), json!(true));
     quality
         .extra
-        .insert("nima_legacy_unavailable".to_string(), json!(true));
-    quality
-        .extra
-        .insert("aesthetic_score".to_string(), serde_json::Value::Null);
+        .insert(
+            "nima_legacy_unavailable".to_string(),
+            json!(scores.nima_score.is_none()),
+        );
     if let Some(v) = scores.musiq_score {
         quality.extra.insert("musiq_score".to_string(), json!(v));
     }
     if let Some(v) = scores.clipiqa_score {
         quality.extra.insert("clipiqa_score".to_string(), json!(v));
+    }
+    if let Some(v) = scores.nima_score {
+        quality.extra.insert("nima_score".to_string(), json!(v));
+        quality.extra.insert("aesthetic_score".to_string(), json!(v));
+    } else {
+        quality
+            .extra
+            .insert("aesthetic_score".to_string(), serde_json::Value::Null);
     }
     apply_expert_aesthetic_rule(&mut quality, strength);
     record.info.quality = Some(quality);

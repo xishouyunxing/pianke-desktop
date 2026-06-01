@@ -53,6 +53,7 @@ def score_images(paths: Iterable[Path], max_side: int) -> list[dict]:
 
     musiq = load_metric("musiq")
     clipiqa = load_metric("clipiqa+")
+    nima = load_metric("nima-vgg16-ava")
     rows = []
     with torch.no_grad():
         for path in paths:
@@ -60,6 +61,7 @@ def score_images(paths: Iterable[Path], max_side: int) -> list[dict]:
             resized = resize_for_pyiqa(img, max_side=max_side)
             musiq_score = float(musiq(resized).item())
             clipiqa_score = float(clipiqa(resized).item())
+            nima_score = float(nima(resized).item())
             rows.append(
                 {
                     "path": path.as_posix(),
@@ -67,6 +69,7 @@ def score_images(paths: Iterable[Path], max_side: int) -> list[dict]:
                     "resized_height": resized.height,
                     "musiq_score": round(musiq_score, 4),
                     "clipiqa_score": round(clipiqa_score, 6),
+                    "nima_score": round(nima_score, 4),
                 }
             )
     return rows
@@ -157,6 +160,38 @@ def export_musiq_core(paths: list[Path], out_path: Path, max_side: int) -> None:
     )
 
 
+def export_nima_core(out_path: Path) -> None:
+    import torch
+
+    metric = load_metric("nima-vgg16-ava")
+    net = metric.net.eval()
+
+    class NimaCoreWrapper(torch.nn.Module):
+        def __init__(self, net):
+            super().__init__()
+            self.net = net
+
+        def forward(self, x):
+            x = self.net.base_model(x)[-1]
+            x = self.net.global_pool(x)
+            dist = self.net.classifier(x)
+            scores = torch.arange(1, 11, dtype=dist.dtype, device=dist.device)
+            return torch.sum(dist * scores, dim=1, keepdim=True)
+
+    dummy = torch.zeros(1, 3, 224, 224, dtype=torch.float32)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        NimaCoreWrapper(net).eval(),
+        dummy,
+        str(out_path),
+        input_names=["input"],
+        output_names=["score"],
+        opset_version=17,
+        dynamo=False,
+        dynamic_axes={"input": {0: "batch"}, "score": {0: "batch"}},
+    )
+
+
 def write_preprocessor(path: Path, max_side: int) -> None:
     payload = {
         "max_side": max_side,
@@ -175,6 +210,14 @@ def write_preprocessor(path: Path, max_side: int) -> None:
         "clipiqa_input_height": None,
         "clipiqa_input_name": "input",
         "clipiqa_output_name": "score",
+        "nima_model": "pyiqa-nima-vgg16-ava",
+        "nima_input_width": 224,
+        "nima_input_height": 224,
+        "nima_resize_shorter": 224,
+        "nima_mean": [0.485, 0.456, 0.406],
+        "nima_std": [0.229, 0.224, 0.225],
+        "nima_input_name": "input",
+        "nima_output_name": "score",
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -189,6 +232,7 @@ def main() -> None:
     parser.add_argument("--export-dir", type=Path)
     parser.add_argument("--export-clipiqa", action="store_true")
     parser.add_argument("--export-musiq-core", action="store_true")
+    parser.add_argument("--export-nima-core", action="store_true")
     args = parser.parse_args()
 
     paths = iter_images(args.folder, args.limit)
@@ -215,7 +259,9 @@ def main() -> None:
             export_clipiqa(paths, args.export_dir / "models/quality/clipiqa_plus.onnx", args.max_side)
         if args.export_musiq_core:
             export_musiq_core(paths, args.export_dir / "models/quality/musiq.onnx", args.max_side)
-        if args.export_clipiqa or args.export_musiq_core:
+        if args.export_nima_core:
+            export_nima_core(args.export_dir / "models/quality/nima_vgg16_ava.onnx")
+        if args.export_clipiqa or args.export_musiq_core or args.export_nima_core:
             write_preprocessor(args.export_dir / "quality_preprocessor.json", args.max_side)
 
 

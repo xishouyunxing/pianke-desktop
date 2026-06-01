@@ -126,8 +126,12 @@ fn write_fake_full_expert_component(root: &Path) -> Vec<(String, usize)> {
             b"fake-clipiqa".to_vec(),
         ),
         (
+            "models/quality/nima_vgg16_ava.onnx".to_string(),
+            b"fake-nima".to_vec(),
+        ),
+        (
             "quality_preprocessor.json".to_string(),
-            br#"{"max_side":1024,"musiq_input_width":null,"musiq_input_height":null,"musiq_input_kind":"pyiqa_multiscale_patches","musiq_patch_size":32,"musiq_patch_stride":32,"musiq_hse_grid_size":10,"musiq_longer_side_lengths":[224,384],"musiq_max_seq_len_from_original_res":-1,"clipiqa_input_width":null,"clipiqa_input_height":null,"resize_filter":"pillow_lanczos","resize_rounding":"floor"}"#.to_vec(),
+            br#"{"max_side":1024,"musiq_input_width":null,"musiq_input_height":null,"musiq_input_kind":"pyiqa_multiscale_patches","musiq_patch_size":32,"musiq_patch_stride":32,"musiq_hse_grid_size":10,"musiq_longer_side_lengths":[224,384],"musiq_max_seq_len_from_original_res":-1,"clipiqa_input_width":null,"clipiqa_input_height":null,"resize_filter":"pillow_lanczos","resize_rounding":"floor","nima_model":"pyiqa-nima-vgg16-ava","nima_input_width":224,"nima_input_height":224,"nima_resize_shorter":224,"nima_mean":[0.485,0.456,0.406],"nima_std":[0.229,0.224,0.225],"nima_input_name":"input","nima_output_name":"score"}"#.to_vec(),
         ),
     ];
     let mut manifest_files = Vec::new();
@@ -162,7 +166,8 @@ fn fake_full_expert_manifest(files: &[(String, usize)]) -> String {
             "insightface-w600k_r50",
             "insightface-1k3d68",
             "quality-musiq",
-            "quality-clipiqa-plus"
+            "quality-clipiqa-plus",
+            "quality-nima-vgg16-ava"
         ],
         "files": manifest_files,
         "checksum_status": "verified"
@@ -993,6 +998,7 @@ fn installed_model_manifest_updates_capabilities() {
     );
     assert_eq!(capabilities["expert_capabilities"]["musiq"], true);
     assert_eq!(capabilities["expert_capabilities"]["clipiqa"], true);
+    assert_eq!(capabilities["expert_capabilities"]["nima"], true);
     assert_eq!(capabilities["expert_capabilities"]["quality_models"], true);
     assert_eq!(capabilities["expert_capabilities"]["nima_legacy"], false);
     assert_eq!(capabilities["tycoon_ready"], false);

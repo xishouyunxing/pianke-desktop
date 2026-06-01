@@ -128,13 +128,13 @@ https://pianke.moeuu.cn/pianke/desktop/latest.json
 | OpenCV ORB | ORB keypoints/descriptors、BFMatcher、RANSAC homography inliers，用于增强相似图分组 |
 | RAW/HEIC | RAW 读取 embedded JPEG preview；HEIC/HEIF 在 Windows 下优先走系统 WIC codec |
 | 水印模块 | Rust 接管 `templates / preview / start / status / cancel / open_out_dir` |
-| Expert 本地组件 | 官方 ONNX 组件包安装 DINOv2、InsightFace/ArcFace、68 点 landmark 等模型 |
+| Expert 本地组件 | 官方 ONNX 组件包安装 DINOv2、InsightFace/ArcFace、68 点 landmark、MUSIQ、CLIP-IQA+、NIMA 等模型 |
 | Tycoon provider | 支持 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 三类兼容协议 |
 | 打包守卫 | 构建和 smoke 脚本检查发布包不包含 Python runtime、Flask worker、旧 Python package 或缺失 native runtime |
 
 ### 能力边界
 
-- NIMA legacy classifier 不复刻旧版随机初始化行为，能力中明确标记不可用。
+- NIMA legacy classifier 不复刻旧版随机初始化行为；当前只在安装真实 `nima_vgg16_ava.onnx` 权重后启用 NIMA 分数。
 - MUSIQ/CLIP-IQA+ 只有在 ONNX 与 Python golden parity 通过时才声明可用。
 - Expert 组件和 ONNX 模型不进入 Git，也不内置在基础安装包中。
 - Tycoon 的真实远程调用由用户自行配置 API，仓库默认使用 mock 验收本地流程。

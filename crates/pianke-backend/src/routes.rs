@@ -245,7 +245,7 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "expert_capabilities": expert_caps,
         "quality_models": quality_models,
         "quality_models_reason": quality_models_reason,
-        "nima_legacy_unavailable": true,
+        "nima_legacy_unavailable": expert_caps.nima_legacy_unavailable,
         "opencv_orb": opencv_orb_available(),
         "formats": format_capabilities(),
         "tycoon_ready": tycoon_ready,
