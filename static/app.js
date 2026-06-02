@@ -674,6 +674,24 @@ function formatBytes(bytes) {
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+function addonComponentDescription(id) {
+  if (id === "expert") {
+    return "标准组件：启用 Expert/Tycoon 本地 DINOv2 语义分组和 InsightFace 人脸分组，体积更小。";
+  }
+  if (id === "expert-quality") {
+    return "可选扩展：追加 MUSIQ、CLIP-IQA+、NIMA 审美/质量分数，体积较大，不影响标准分组使用。";
+  }
+  return "可选本地模型组件。";
+}
+
+function addonInstallLabel(component, installed, paused) {
+  if (installed) return "重新安装";
+  if (paused) return "继续下载";
+  if (component?.id === "expert") return "安装 Expert 标准组件";
+  if (component?.id === "expert-quality") return "安装质量模型扩展";
+  return "安装组件";
+}
+
 function renderAddonManager(data) {
   const list = $("addon-list");
   if (!list) return;
@@ -692,11 +710,14 @@ function renderAddonManager(data) {
     const current = state.current ? `当前：${escapeHtml(state.current)}` : installed ? "组件已安装完成" : "等待安装";
     const byteText = state.bytes_total ? ` · ${formatBytes(state.bytes_done)}/${formatBytes(state.bytes_total)}` : "";
     const models = (component.models || []).map((m) => `<span>${escapeHtml(m)}</span>`).join("");
+    const description = component.description || addonComponentDescription(component.id);
+    const installLabel = addonInstallLabel(component, installed, paused);
     return `
       <section class="addon-item" data-component="${escapeHtml(component.id)}">
         <div class="addon-item-top">
           <div>
             <h4>${escapeHtml(component.label || component.id)}</h4>
+            <p class="addon-desc">${escapeHtml(description)}</p>
             <div class="addon-meta">版本 ${escapeHtml(component.version || "-")} · 约 ${component.estimated_size_mb || "-"} MB · ${escapeHtml(component.runtime || "")}</div>
           </div>
           <span class="addon-status ${installed ? "installed" : ""}">${addonStatusLabel(effectiveStatus)}</span>
@@ -707,7 +728,7 @@ function renderAddonManager(data) {
         </div>
         <div class="addon-models">${models}</div>
         <div class="addon-actions">
-          <button class="btn btn-primary small addon-install" data-id="${escapeHtml(component.id)}" ${running ? "disabled" : ""}>${installed ? "重新安装" : paused ? "继续下载" : "安装完整组件"}</button>
+          <button class="btn btn-primary small addon-install" data-id="${escapeHtml(component.id)}" ${running ? "disabled" : ""}>${escapeHtml(installLabel)}</button>
           <button class="btn-ghost addon-pause" data-id="${escapeHtml(component.id)}" ${state.status === "running" ? "" : "disabled"}>暂停</button>
           <button class="btn-ghost addon-cancel" data-id="${escapeHtml(component.id)}" ${running || paused ? "" : "disabled"}>取消</button>
           <button class="btn-ghost addon-refresh" data-id="${escapeHtml(component.id)}">刷新</button>
@@ -748,8 +769,9 @@ function closeAddonManager() {
 async function requestModelComponentInstall(componentId) {
   if (!componentId) return;
   const isExpert = componentId === "expert";
+  const isQuality = componentId === "expert-quality";
   openAddonManager();
-  setStatus(isExpert ? "正在安装完整 Expert 组件" : "正在检查增强组件", "busy");
+  setStatus(isExpert ? "正在安装 Expert 标准组件" : isQuality ? "正在安装质量模型扩展" : "正在检查增强组件", "busy");
   try {
     const installResult = await fetchJSON("/api/model_components/install", {
       method: "POST",
@@ -770,11 +792,11 @@ async function requestModelComponentInstall(componentId) {
     }
     const cap = await fetchJSON("/api/capabilities");
     applyBackendCapabilities(cap);
-    toast(isExpert ? "完整 Expert 组件已安装" : "增强组件已安装");
-    setStatus(isExpert ? "完整 Expert 组件已安装" : "增强组件已安装", "done");
+    toast(isExpert ? "Expert 标准组件已安装" : isQuality ? "质量模型扩展已安装" : "增强组件已安装");
+    setStatus(isExpert ? "Expert 标准组件已安装" : isQuality ? "质量模型扩展已安装" : "增强组件已安装", "done");
   } catch (err) {
     toast(err.message || "增强组件安装器尚未完成");
-    setStatus(isExpert ? "完整 Expert 组件暂不可安装" : "增强组件暂不可安装", "error");
+    setStatus(isExpert ? "Expert 标准组件暂不可安装" : isQuality ? "质量模型扩展暂不可安装" : "增强组件暂不可安装", "error");
   }
   refreshAddonManager();
 }
@@ -872,7 +894,7 @@ function applyBackendCapabilities(cap) {
           action.className = "model-install-chip";
           action.role = "button";
           action.tabIndex = 0;
-          action.textContent = "安装完整 Expert 组件";
+          action.textContent = "安装 Expert 标准组件";
           action.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -886,7 +908,7 @@ function applyBackendCapabilities(cap) {
           });
           el.appendChild(action);
         }
-        action.textContent = "安装完整 Expert 组件";
+        action.textContent = "安装 Expert 标准组件";
         action.dataset.component = "expert";
       } else if (action) {
         action.remove();

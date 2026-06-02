@@ -99,7 +99,20 @@ fn write_jpg(path: &Path, seed: u8) {
     img.save(path).expect("save jpg");
 }
 
-fn write_fake_full_expert_component(root: &Path) -> Vec<(String, usize)> {
+fn write_fake_component_files(root: &Path, files: Vec<(String, Vec<u8>)>) -> Vec<(String, usize)> {
+    let mut manifest_files = Vec::new();
+    for (rel, bytes) in &files {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fake component parent");
+        }
+        fs::write(path, bytes).expect("fake component file");
+        manifest_files.push((rel.clone(), bytes.len()));
+    }
+    manifest_files
+}
+
+fn write_fake_expert_component(root: &Path) -> Vec<(String, usize)> {
     let files = vec![
         (
             "models/dinov2-small.onnx".to_string(),
@@ -117,6 +130,12 @@ fn write_fake_full_expert_component(root: &Path) -> Vec<(String, usize)> {
             "models/insightface/1k3d68.onnx".to_string(),
             b"fake-landmark".to_vec(),
         ),
+    ];
+    write_fake_component_files(root, files)
+}
+
+fn write_fake_expert_quality_component(root: &Path) -> Vec<(String, usize)> {
+    let files = vec![
         (
             "models/quality/musiq.onnx".to_string(),
             b"fake-musiq".to_vec(),
@@ -146,19 +165,10 @@ fn write_fake_full_expert_component(root: &Path) -> Vec<(String, usize)> {
             br#"{"max_side":1024,"musiq_input_width":null,"musiq_input_height":null,"musiq_input_kind":"pyiqa_multiscale_patches","musiq_patch_size":32,"musiq_patch_stride":32,"musiq_hse_grid_size":10,"musiq_longer_side_lengths":[224,384],"musiq_max_seq_len_from_original_res":-1,"clipiqa_input_width":null,"clipiqa_input_height":null,"resize_filter":"pillow_lanczos","resize_rounding":"floor","nima_model":"pyiqa-nima-vgg16-ava","nima_input_width":224,"nima_input_height":224,"nima_resize_shorter":224,"nima_mean":[0.485,0.456,0.406],"nima_std":[0.229,0.224,0.225],"nima_input_name":"input","nima_output_name":"score","nima_extra_models":[{"field":"nima_inception_ava_score","path":"models/quality/nima_inception_ava.onnx","input_width":299,"input_height":299,"resize_shorter":299,"mean":[0.5,0.5,0.5],"std":[0.5,0.5,0.5],"input_name":"input","output_name":"score"},{"field":"nima_koniq_score","path":"models/quality/nima_koniq.onnx","input_width":299,"input_height":299,"resize_shorter":299,"mean":[0.5,0.5,0.5],"std":[0.5,0.5,0.5],"input_name":"input","output_name":"score"},{"field":"nima_spaq_score","path":"models/quality/nima_spaq.onnx","input_width":299,"input_height":299,"resize_shorter":299,"mean":[0.5,0.5,0.5],"std":[0.5,0.5,0.5],"input_name":"input","output_name":"score"}]}"#.to_vec(),
         ),
     ];
-    let mut manifest_files = Vec::new();
-    for (rel, bytes) in &files {
-        let path = root.join(rel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("fake expert component parent");
-        }
-        fs::write(path, bytes).expect("fake expert component file");
-        manifest_files.push((rel.clone(), bytes.len()));
-    }
-    manifest_files
+    write_fake_component_files(root, files)
 }
 
-fn fake_full_expert_manifest(files: &[(String, usize)]) -> String {
+fn fake_expert_manifest(files: &[(String, usize)]) -> String {
     let manifest_files = files
         .iter()
         .map(|(path, size)| {
@@ -169,17 +179,39 @@ fn fake_full_expert_manifest(files: &[(String, usize)]) -> String {
         })
         .collect::<Vec<_>>();
     serde_json::to_string_pretty(&json!({
-        "id": "expert",
-        "version": "onnx-v1",
+    "id": "expert",
+    "version": "onnx-v1",
         "runtime": "onnxruntime",
         "models": [
             "dinov2-small",
             "insightface-det_10g",
             "insightface-w600k_r50",
-            "insightface-1k3d68",
-            "quality-musiq",
-            "quality-clipiqa-plus",
-            "quality-nima-vgg16-ava",
+            "insightface-1k3d68"
+        ],
+        "files": manifest_files,
+        "checksum_status": "verified"
+    }))
+    .expect("fake expert manifest")
+}
+
+fn fake_expert_quality_manifest(files: &[(String, usize)]) -> String {
+    let manifest_files = files
+        .iter()
+        .map(|(path, size)| {
+            json!({
+                "path": path,
+                "size_bytes": size
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&json!({
+        "id": "expert-quality",
+        "version": "onnx-v1",
+        "runtime": "onnxruntime",
+        "models": [
+                "quality-musiq",
+                "quality-clipiqa-plus",
+                "quality-nima-vgg16-ava",
             "quality-nima-inception-ava",
             "quality-nima-koniq",
             "quality-nima-spaq"
@@ -187,7 +219,7 @@ fn fake_full_expert_manifest(files: &[(String, usize)]) -> String {
         "files": manifest_files,
         "checksum_status": "verified"
     }))
-    .expect("fake full expert manifest")
+    .expect("fake expert quality manifest")
 }
 
 #[test]
@@ -593,10 +625,13 @@ fn frontend_compat_endpoints_keep_expected_shape() {
     let components_list = components["components"]
         .as_array()
         .expect("components list");
-    assert_eq!(components_list.len(), 1);
+    assert_eq!(components_list.len(), 2);
     assert!(components_list
         .iter()
         .any(|c| c["id"] == "expert" && c["status"] == "not_installed"));
+    assert!(components_list
+        .iter()
+        .any(|c| c["id"] == "expert-quality" && c["status"] == "not_installed"));
     assert!(components_list.iter().all(|c| c["id"] != "tycoon"));
     assert!(components["cache_dir"]
         .as_str()
@@ -765,7 +800,10 @@ fn frontend_compat_endpoints_keep_expected_shape() {
         }))
         .send()
         .expect("tycoon start response");
-    assert_eq!(tycoon_start.status(), reqwest::StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(
+        tycoon_start.status(),
+        reqwest::StatusCode::PRECONDITION_REQUIRED
+    );
     let start_error: Value = tycoon_start.json().expect("tycoon start error json");
     assert!(start_error["error"]
         .as_str()
@@ -981,12 +1019,22 @@ fn installed_model_manifest_updates_capabilities() {
     let token = "models-token";
     let (backend, _handle, base) = start_test_backend(token);
     let expert_dir = backend.path().join("model_components").join("expert");
-    let files = write_fake_full_expert_component(&expert_dir);
+    let files = write_fake_expert_component(&expert_dir);
     fs::write(
         expert_dir.join("component.json"),
-        fake_full_expert_manifest(&files),
+        fake_expert_manifest(&files),
     )
     .expect("expert manifest");
+    let quality_dir = backend
+        .path()
+        .join("model_components")
+        .join("expert-quality");
+    let quality_files = write_fake_expert_quality_component(&quality_dir);
+    fs::write(
+        quality_dir.join("component.json"),
+        fake_expert_quality_manifest(&quality_files),
+    )
+    .expect("expert quality manifest");
 
     let client = Client::new();
     let capabilities: Value = client
@@ -1002,10 +1050,7 @@ fn installed_model_manifest_updates_capabilities() {
     );
     assert_eq!(capabilities["face_aware"], true);
     assert_eq!(capabilities["quality_models"], true);
-    assert_eq!(
-        capabilities["quality_models_reason"],
-        "available"
-    );
+    assert_eq!(capabilities["quality_models_reason"], "available");
     assert_eq!(capabilities["expert_capabilities"]["dinov2"], true);
     assert_eq!(
         capabilities["expert_capabilities"]["insightface_detection"],
@@ -1019,6 +1064,10 @@ fn installed_model_manifest_updates_capabilities() {
     assert_eq!(capabilities["expert_capabilities"]["nima_legacy"], false);
     assert_eq!(capabilities["tycoon_ready"], false);
     assert_eq!(capabilities["model_components"]["expert"], "installed");
+    assert_eq!(
+        capabilities["model_components"]["expert-quality"],
+        "installed"
+    );
     assert_eq!(capabilities["engines"], json!(["expert", "fast", "tycoon"]));
 }
 
@@ -1235,12 +1284,19 @@ fn model_component_install_from_source_dir_updates_capabilities() {
     let token = "model-install-token";
     let (_backend, _handle, base) = start_test_backend(token);
     let source = tempfile::tempdir().expect("source component dir");
-    let files = write_fake_full_expert_component(source.path());
+    let files = write_fake_expert_component(source.path());
     fs::write(
         source.path().join("component.json"),
-        fake_full_expert_manifest(&files),
+        fake_expert_manifest(&files),
     )
     .expect("component manifest");
+    let quality_source = tempfile::tempdir().expect("source quality component dir");
+    let quality_files = write_fake_expert_quality_component(quality_source.path());
+    fs::write(
+        quality_source.path().join("component.json"),
+        fake_expert_quality_manifest(&quality_files),
+    )
+    .expect("quality component manifest");
 
     let client = Client::new();
     let install: Value = client
@@ -1279,8 +1335,38 @@ fn model_component_install_from_source_dir_updates_capabilities() {
         .expect("capabilities json");
     assert_eq!(capabilities["expert_installed"], true);
     assert_eq!(capabilities["face_aware"], true);
-    assert_eq!(capabilities["quality_models"], true);
+    assert_eq!(capabilities["quality_models"], false);
+    assert_eq!(
+        capabilities["quality_models_reason"],
+        "expert_quality_component_not_installed"
+    );
     assert_eq!(capabilities["model_components"]["expert"], "installed");
+
+    let quality_install: Value = client
+        .post(format!("{base}/api/model_components/install"))
+        .header("X-Token", token)
+        .json(&json!({
+            "id": "expert-quality",
+            "source_dir": quality_source.path()
+        }))
+        .send()
+        .expect("quality install response")
+        .json()
+        .expect("quality install json");
+    assert_eq!(quality_install["ok"], true);
+    assert_eq!(quality_install["component"]["status"], "installed");
+    let capabilities_with_quality: Value = client
+        .get(format!("{base}/api/capabilities"))
+        .header("X-Token", token)
+        .send()
+        .expect("capabilities with quality response")
+        .json()
+        .expect("capabilities with quality json");
+    assert_eq!(capabilities_with_quality["quality_models"], true);
+    assert_eq!(
+        capabilities_with_quality["model_components"]["expert-quality"],
+        "installed"
+    );
 
     let delete: Value = client
         .post(format!("{base}/api/model_components/delete"))

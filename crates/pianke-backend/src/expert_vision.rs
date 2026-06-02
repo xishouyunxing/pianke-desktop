@@ -31,7 +31,10 @@ const MUSIQ_PATCH_STRIDE: usize = 32;
 const MUSIQ_HSE_GRID_SIZE: usize = 10;
 const MUSIQ_LONGER_SIDE_LENGTHS: [usize; 2] = [224, 384];
 const NIMA_EXTRA_MODELS: &[(&str, &str)] = &[
-    ("nima_inception_ava_score", "models/quality/nima_inception_ava.onnx"),
+    (
+        "nima_inception_ava_score",
+        "models/quality/nima_inception_ava.onnx",
+    ),
     ("nima_koniq_score", "models/quality/nima_koniq.onnx"),
     ("nima_spaq_score", "models/quality/nima_spaq.onnx"),
 ];
@@ -1430,7 +1433,8 @@ fn preprocess_nima_nchw(
     }
     let left = (resized.width() - input_width) / 2;
     let top = (resized.height() - input_height) / 2;
-    let cropped = image::imageops::crop_imm(&resized, left, top, input_width, input_height).to_image();
+    let cropped =
+        image::imageops::crop_imm(&resized, left, top, input_width, input_height).to_image();
     let plane = (input_width * input_height) as usize;
     let mut data = vec![0.0f32; plane * 3];
     for y in 0..input_height {
@@ -1442,16 +1446,8 @@ fn preprocess_nima_nchw(
             }
         }
     }
-    Array4::from_shape_vec(
-        (
-            1,
-            3,
-            input_height as usize,
-            input_width as usize,
-        ),
-        data,
-    )
-    .map_err(|e| format!("create NIMA NCHW input failed: {e}"))
+    Array4::from_shape_vec((1, 3, input_height as usize, input_width as usize), data)
+        .map_err(|e| format!("create NIMA NCHW input failed: {e}"))
 }
 
 fn preprocess_musiq_patches(
@@ -1565,8 +1561,10 @@ fn append_musiq_patch_rows(
     };
     let spatial = musiq_hashed_spatial_positions(cfg.musiq_hse_grid_size, count_h, count_w);
     let dim = cfg.musiq_patch_size * cfg.musiq_patch_size * 3 + 3;
-    let pad_row = (count_h.saturating_sub(1)) * cfg.musiq_patch_stride + cfg.musiq_patch_size - height;
-    let pad_col = (count_w.saturating_sub(1)) * cfg.musiq_patch_stride + cfg.musiq_patch_size - width;
+    let pad_row =
+        (count_h.saturating_sub(1)) * cfg.musiq_patch_stride + cfg.musiq_patch_size - height;
+    let pad_col =
+        (count_w.saturating_sub(1)) * cfg.musiq_patch_stride + cfg.musiq_patch_size - width;
     let pad_top = pad_row / 2;
     let pad_left = pad_col / 2;
     for patch_idx in 0..target_count {
@@ -1620,7 +1618,9 @@ fn nearest_interpolate_arange(input: usize, output: usize) -> Vec<usize> {
     if input == 0 || output == 0 {
         return Vec::new();
     }
-    (0..output).map(|i| (i * input / output).min(input - 1)).collect()
+    (0..output)
+        .map(|i| (i * input / output).min(input - 1))
+        .collect()
 }
 
 fn bicubic_resize_chw_align_corners_false(
@@ -1693,7 +1693,11 @@ fn python_round(v: f64) -> i64 {
     let frac = v - floor;
     if (frac - 0.5).abs() < 1e-12 {
         let n = floor as i64;
-        if n % 2 == 0 { n } else { n + 1 }
+        if n % 2 == 0 {
+            n
+        } else {
+            n + 1
+        }
     } else {
         v.round() as i64
     }
@@ -2336,6 +2340,7 @@ fn default_musiq_original_seq_len() -> i32 {
 mod tests {
     use super::*;
     use image::{Rgb, RgbImage};
+    use std::path::PathBuf;
 
     #[test]
     fn preprocess_outputs_nchw_normalized_tensor() {
@@ -2791,10 +2796,26 @@ mod tests {
 
     #[test]
     fn quality_golden_fixture_matches_when_configured() {
-        let Ok(component_dir) = std::env::var("PIANKE_EXPERT_COMPONENT_DIR") else {
+        let component_dir = std::env::var("PIANKE_EXPERT_QUALITY_COMPONENT_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("PIANKE_EXPERT_COMPONENT_DIR")
+                    .ok()
+                    .map(PathBuf::from)
+                    .and_then(|dir| {
+                        let sibling = dir.parent()?.join("expert-quality");
+                        if ExpertQualityModels::component_files_ready(&sibling) {
+                            Some(sibling)
+                        } else {
+                            Some(dir)
+                        }
+                    })
+            });
+        let Some(component_dir) = component_dir else {
             return;
         };
-        let component_dir = Path::new(&component_dir);
+        let component_dir = component_dir.as_path();
         if !ExpertQualityModels::component_files_ready(component_dir) {
             return;
         }

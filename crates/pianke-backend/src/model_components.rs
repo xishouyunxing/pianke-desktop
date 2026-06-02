@@ -13,6 +13,8 @@ const INSTALL_STATE_FILENAME: &str = "install_state.json";
 const INSTALL_CONTROL_FILENAME: &str = "install_control.json";
 pub const DEFAULT_EXPERT_MANIFEST_URL: &str =
     "https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json";
+pub const DEFAULT_EXPERT_QUALITY_MANIFEST_URL: &str =
+    "https://pianke.moeuu.cn/pianke/components/expert-quality/onnx-v1/component.json";
 
 #[derive(Debug, Clone)]
 pub struct ModelManager {
@@ -51,21 +53,28 @@ impl ModelManager {
 
     pub fn expert_capabilities(&self) -> ExpertComponentCapabilities {
         let dir = self.cache_dir.join("expert");
-        let musiq = dir
+        let quality_dir = self
+            .expert_quality_component_dir()
+            .unwrap_or_else(|| self.cache_dir.join("expert-quality"));
+        let musiq = quality_dir
             .join("models")
             .join("quality")
             .join("musiq.onnx")
             .exists();
-        let clipiqa = dir
+        let clipiqa = quality_dir
             .join("models")
             .join("quality")
             .join("clipiqa_plus.onnx")
             .exists();
-        let nima = crate::expert_vision::ExpertQualityModels::nima_component_file_ready(&dir);
+        let nima =
+            crate::expert_vision::ExpertQualityModels::nima_component_file_ready(&quality_dir);
         let nima_extra =
-            crate::expert_vision::ExpertQualityModels::extra_nima_component_files_ready(&dir);
-        let quality_models =
-            musiq && clipiqa && crate::expert_vision::quality_preprocessor_allows_parity(&dir);
+            crate::expert_vision::ExpertQualityModels::extra_nima_component_files_ready(
+                &quality_dir,
+            );
+        let quality_models = musiq
+            && clipiqa
+            && crate::expert_vision::quality_preprocessor_allows_parity(&quality_dir);
         ExpertComponentCapabilities {
             dinov2: dir.join("models").join("dinov2-small.onnx").exists(),
             insightface_detection: dir
@@ -91,6 +100,31 @@ impl ModelManager {
             nima_legacy: false,
             nima_legacy_unavailable: !nima,
         }
+    }
+
+    pub fn expert_quality_dir(&self) -> Option<PathBuf> {
+        let split_dir = self.cache_dir.join("expert-quality");
+        if crate::expert_vision::ExpertQualityModels::component_ready_for_live_scoring(&split_dir) {
+            return Some(split_dir);
+        }
+        let legacy_dir = self.cache_dir.join("expert");
+        if crate::expert_vision::ExpertQualityModels::component_ready_for_live_scoring(&legacy_dir)
+        {
+            return Some(legacy_dir);
+        }
+        None
+    }
+
+    fn expert_quality_component_dir(&self) -> Option<PathBuf> {
+        let split_dir = self.cache_dir.join("expert-quality");
+        if quality_component_has_any_models(&split_dir) {
+            return Some(split_dir);
+        }
+        let legacy_dir = self.cache_dir.join("expert");
+        if quality_component_has_any_models(&legacy_dir) {
+            return Some(legacy_dir);
+        }
+        None
     }
 
     pub fn installed_dir(&self, id: &str) -> Result<PathBuf, String> {
@@ -242,6 +276,7 @@ impl ModelManager {
         ComponentView {
             id: def.id.to_string(),
             label: def.label.to_string(),
+            description: def.description.to_string(),
             status: status.to_string(),
             version: def.version.to_string(),
             estimated_size_mb: def.estimated_size_mb,
@@ -474,6 +509,7 @@ pub struct ComponentInstallRequest {
 struct ComponentDef {
     id: &'static str,
     label: &'static str,
+    description: &'static str,
     version: &'static str,
     estimated_size_mb: u64,
     engines: &'static [&'static str],
@@ -628,6 +664,7 @@ impl InstallControl {
 pub struct ComponentView {
     pub id: String,
     pub label: String,
+    pub description: String,
     pub status: String,
     pub version: String,
     pub estimated_size_mb: u64,
@@ -658,22 +695,40 @@ pub struct ExpertComponentCapabilities {
 }
 
 fn component_catalog() -> Vec<ComponentDef> {
-    vec![ComponentDef {
-        id: "expert",
-        label: "Expert local models",
-        version: "onnx-v1",
-        estimated_size_mb: 850,
-        engines: &["expert"],
-        models: &[
-            "dinov2-small",
-            "insightface-det_10g",
-            "insightface-w600k_r50",
-            "insightface-1k3d68",
-            "quality-musiq-optional",
-            "quality-clipiqa-plus-optional",
-        ],
-        runtime: "onnxruntime",
-    }]
+    vec![
+        ComponentDef {
+            id: "expert",
+            label: "Expert 标准组件",
+            description: "约 423 MB，启用 Expert/Tycoon 的本地 DINOv2 语义分组与 InsightFace 人脸分组。",
+            version: "onnx-v1",
+            estimated_size_mb: 423,
+            engines: &["expert"],
+            models: &[
+                "dinov2-small",
+                "insightface-det_10g",
+                "insightface-w600k_r50",
+                "insightface-1k3d68",
+            ],
+            runtime: "onnxruntime",
+        },
+        ComponentDef {
+            id: "expert-quality",
+            label: "Expert 质量模型扩展",
+            description: "约 1.1 GB，可选追加 MUSIQ、CLIP-IQA+ 与 NIMA 审美/质量评分；不影响标准 Expert 分组使用。",
+            version: "onnx-v1",
+            estimated_size_mb: 1075,
+            engines: &[],
+            models: &[
+                "quality-musiq",
+                "quality-clipiqa-plus",
+                "quality-nima-vgg16-ava",
+                "quality-nima-inception-ava",
+                "quality-nima-koniq",
+                "quality-nima-spaq",
+            ],
+            runtime: "onnxruntime",
+        },
+    ]
 }
 
 fn component_files_ready(id: &str, install_dir: &Path) -> bool {
@@ -684,12 +739,23 @@ fn component_files_ready(id: &str, install_dir: &Path) -> bool {
                 .join("dinov2-small.onnx")
                 .exists()
                 && crate::expert_vision::InsightFaceModels::component_files_ready(install_dir)
-                && crate::expert_vision::ExpertQualityModels::component_ready_for_live_scoring(
+        }
+        "expert-quality" => {
+            crate::expert_vision::ExpertQualityModels::component_ready_for_live_scoring(install_dir)
+                && crate::expert_vision::ExpertQualityModels::nima_component_file_ready(install_dir)
+                && crate::expert_vision::ExpertQualityModels::extra_nima_component_files_ready(
                     install_dir,
                 )
         }
         _ => true,
     }
+}
+
+fn quality_component_has_any_models(dir: &Path) -> bool {
+    crate::expert_vision::ExpertQualityModels::component_files_ready(dir)
+        || crate::expert_vision::ExpertQualityModels::nima_component_file_ready(dir)
+        || crate::expert_vision::ExpertQualityModels::extra_nima_component_files_ready(dir)
+        || dir.join("quality_preprocessor.json").exists()
 }
 
 fn read_manifest(path: &Path) -> Option<ComponentManifest> {
@@ -774,12 +840,15 @@ impl InstallSource {
     fn default_official(id: &str) -> Option<Self> {
         match id {
             "expert" => Some(Self::ManifestUrl(DEFAULT_EXPERT_MANIFEST_URL.to_string())),
+            "expert-quality" => Some(Self::ManifestUrl(
+                DEFAULT_EXPERT_QUALITY_MANIFEST_URL.to_string(),
+            )),
             _ => None,
         }
     }
 
     fn local_packaged(id: &str) -> Option<Self> {
-        if id != "expert" {
+        if id != "expert" && id != "expert-quality" {
             return None;
         }
         let candidates = [
@@ -1199,7 +1268,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let manager = ModelManager::new(temp.path().join("models"));
         let components = manager.list();
-        assert_eq!(components.len(), 1);
+        assert_eq!(components.len(), 2);
         assert!(components.iter().all(|c| c.status == "not_installed"));
     }
 
@@ -1265,7 +1334,7 @@ mod tests {
     #[test]
     fn optional_quality_models_without_parity_preprocessor_do_not_claim_parity() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let install_dir = temp.path().join("models").join("expert");
+        let install_dir = temp.path().join("models").join("expert-quality");
         fs::create_dir_all(install_dir.join("models").join("quality")).expect("quality dir");
         fs::write(
             install_dir
@@ -1294,7 +1363,7 @@ mod tests {
     #[test]
     fn optional_quality_models_update_expert_capabilities_with_parity_preprocessor() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let install_dir = temp.path().join("models").join("expert");
+        let install_dir = temp.path().join("models").join("expert-quality");
         fs::create_dir_all(install_dir.join("models").join("quality")).expect("quality dir");
         fs::write(
             install_dir
@@ -1328,7 +1397,7 @@ mod tests {
     #[test]
     fn fixed_shape_quality_models_do_not_claim_parity() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let install_dir = temp.path().join("models").join("expert");
+        let install_dir = temp.path().join("models").join("expert-quality");
         fs::create_dir_all(install_dir.join("models").join("quality")).expect("quality dir");
         fs::write(
             install_dir

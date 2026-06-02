@@ -119,9 +119,9 @@ pub(crate) fn run_job(ctx: AppCtx, req: StartRequest) {
         None
     };
     let mut quality_model = if req.engine == "expert" || req.engine == "tycoon" {
-        if let Some(dir) = &expert_dir {
-            if expert_vision::ExpertQualityModels::component_ready_for_live_scoring(dir) {
-                match expert_vision::ExpertQualityModels::from_component_dir(dir) {
+        if let Some(dir) = ctx.models.expert_quality_dir() {
+            if expert_vision::ExpertQualityModels::component_ready_for_live_scoring(&dir) {
+                match expert_vision::ExpertQualityModels::from_component_dir(&dir) {
                     Ok(model) => Some(model),
                     Err(err) => {
                         let mut state = ctx.inner.lock().expect("backend state lock");
@@ -722,12 +722,10 @@ pub(crate) fn apply_expert_quality_scores(
     quality
         .extra
         .insert("quality_models".to_string(), json!(true));
-    quality
-        .extra
-        .insert(
-            "nima_legacy_unavailable".to_string(),
-            json!(scores.nima_score.is_none()),
-        );
+    quality.extra.insert(
+        "nima_legacy_unavailable".to_string(),
+        json!(scores.nima_score.is_none()),
+    );
     if let Some(v) = scores.musiq_score {
         quality.extra.insert("musiq_score".to_string(), json!(v));
     }
@@ -736,7 +734,9 @@ pub(crate) fn apply_expert_quality_scores(
     }
     if let Some(v) = scores.nima_score {
         quality.extra.insert("nima_score".to_string(), json!(v));
-        quality.extra.insert("aesthetic_score".to_string(), json!(v));
+        quality
+            .extra
+            .insert("aesthetic_score".to_string(), json!(v));
     } else {
         quality
             .extra

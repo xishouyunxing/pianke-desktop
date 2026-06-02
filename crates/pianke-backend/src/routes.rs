@@ -158,7 +158,8 @@ async fn app_update() -> impl IntoResponse {
 
     match fetch_app_update_manifest(&manifest_url).await {
         Ok(manifest) => {
-            let valid_url = manifest.url.starts_with("https://") || manifest.url.starts_with("http://");
+            let valid_url =
+                manifest.url.starts_with("https://") || manifest.url.starts_with("http://");
             let update_available =
                 valid_url && compare_versions(&manifest.version, &current_version).is_gt();
             Json(json!({
@@ -219,6 +220,8 @@ async fn capabilities(State(ctx): State<AppCtx>) -> impl IntoResponse {
         "available"
     } else if !expert_installed {
         "expert_component_not_installed"
+    } else if !ctx.models.is_installed("expert-quality") {
+        "expert_quality_component_not_installed"
     } else if expert_caps.musiq && expert_caps.clipiqa {
         "quality_models_fixed_shape_not_parity_verified"
     } else {
@@ -675,7 +678,7 @@ async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> 
         if !ctx.models.is_installed("expert") {
             return json_error(
                 StatusCode::PRECONDITION_REQUIRED,
-                "Tycoon 模式需要先安装完整 Expert 组件",
+                "Tycoon 模式需要先安装 Expert 标准组件",
             );
         }
         let expert_caps = ctx.models.expert_capabilities();
@@ -686,7 +689,7 @@ async fn start_job(State(ctx): State<AppCtx>, Json(req): Json<StartRequest>) -> 
         {
             return json_error(
                 StatusCode::PRECONDITION_REQUIRED,
-                "Tycoon 模式需要完整 Expert 组件：DINOv2 + InsightFace 三个 ONNX 模型",
+                "Tycoon 模式需要 Expert 标准组件：DINOv2 + InsightFace 三个 ONNX 模型",
             );
         }
         if let Err(err) = ctx.llm.require_tycoon_ready(req.llm_model.as_deref()) {

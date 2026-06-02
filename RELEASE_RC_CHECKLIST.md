@@ -42,26 +42,32 @@ Upload the desktop software update manifest and installer to:
 }
 ```
 
-Upload the full Expert component package to:
+Upload the Expert standard component package to:
 
 ```text
 /pianke/components/expert/onnx-v1/component.json
-/pianke/components/expert/onnx-v1/quality_preprocessor.json
 /pianke/components/expert/onnx-v1/models/dinov2-small.onnx
 /pianke/components/expert/onnx-v1/models/insightface/det_10g.onnx
 /pianke/components/expert/onnx-v1/models/insightface/w600k_r50.onnx
 /pianke/components/expert/onnx-v1/models/insightface/1k3d68.onnx
-/pianke/components/expert/onnx-v1/models/quality/musiq.onnx
-/pianke/components/expert/onnx-v1/models/quality/clipiqa_plus.onnx
-/pianke/components/expert/onnx-v1/models/quality/nima_vgg16_ava.onnx
-/pianke/components/expert/onnx-v1/models/quality/nima_inception_ava.onnx
-/pianke/components/expert/onnx-v1/models/quality/nima_koniq.onnx
-/pianke/components/expert/onnx-v1/models/quality/nima_spaq.onnx
 ```
 
-The current full Expert upload manifest is about 1.55 GB when all NIMA variants are included.
+Upload the optional Expert quality extension package to:
 
-The desktop app installs Expert from `https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json` by default. Development builds can still override this with `PIANKE_EXPERT_MANIFEST_URL`, `PIANKE_EXPERT_MANIFEST_PATH`, or `PIANKE_EXPERT_SOURCE_DIR`.
+```text
+/pianke/components/expert-quality/onnx-v1/component.json
+/pianke/components/expert-quality/onnx-v1/quality_preprocessor.json
+/pianke/components/expert-quality/onnx-v1/models/quality/musiq.onnx
+/pianke/components/expert-quality/onnx-v1/models/quality/clipiqa_plus.onnx
+/pianke/components/expert-quality/onnx-v1/models/quality/nima_vgg16_ava.onnx
+/pianke/components/expert-quality/onnx-v1/models/quality/nima_inception_ava.onnx
+/pianke/components/expert-quality/onnx-v1/models/quality/nima_koniq.onnx
+/pianke/components/expert-quality/onnx-v1/models/quality/nima_spaq.onnx
+```
+
+The standard Expert package is about 423 MB. The optional quality extension is about 1.1 GB when all NIMA variants are included.
+
+The desktop app installs Expert standard models from `https://pianke.moeuu.cn/pianke/components/expert/onnx-v1/component.json` by default. The optional quality extension uses `https://pianke.moeuu.cn/pianke/components/expert-quality/onnx-v1/component.json`. Development builds can still override these with `PIANKE_EXPERT_*` and `PIANKE_EXPERT_QUALITY_*` environment variables.
 
 ## Gated Local Checks
 
@@ -70,6 +76,7 @@ Run these only on a machine that has the local private Expert component and fixt
 ```powershell
 $env:PIANKE_TYCOON_E2E='1'
 $env:PIANKE_EXPERT_COMPONENT_DIR='C:\Users\ero29\Desktop\pianke\.tmp_backend\model_components\expert'
+$env:PIANKE_EXPERT_QUALITY_COMPONENT_DIR='C:\Users\ero29\Desktop\pianke\.tmp_backend\model_components\expert-quality'
 cargo test --release --manifest-path crates\pianke-backend\Cargo.toml tycoon_mock_e2e_runs_with_complete_expert_component_when_configured -- --nocapture
 ```
 

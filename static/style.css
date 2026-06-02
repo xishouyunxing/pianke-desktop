@@ -2112,6 +2112,13 @@ span.sc-item { color: var(--ink-faint); }
   align-items: flex-start;
 }
 .addon-item h4 { margin: 0; font-size: 15px; }
+.addon-desc {
+  max-width: 560px;
+  margin: 6px 0 0;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
 .addon-meta { margin-top: 5px; color: var(--ink-muted); font-size: 12px; }
 .addon-status {
   border: 1px solid var(--line);
