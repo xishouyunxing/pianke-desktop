@@ -9,6 +9,10 @@ This checklist is the release gate for the Rust-only desktop package. It records
 - `npm run smoke:release-rust` verifies the release executable starts without launching a Python backend child process.
 - `npm run check:no-python-bundle` fails if release outputs contain Python runtime, Flask worker resources, Python package resources, or missing OpenCV runtime DLLs.
 
+## 0.3.0 Update Note
+
+0.3.0 focuses on the Rust-only complete-capability release candidate: Expert is split into a standard local model package and an optional quality-model extension, the add-on manager now shows clearer package size and capability status, and the Fast, watermark, Expert local model, component install, and software update flows continue to be tightened for public release.
+
 ## Current Rust-only Capability Boundary
 
 - Fast is installed-in-package and runs without system Python.
@@ -35,10 +39,10 @@ Upload the desktop software update manifest and installer to:
 
 ```json
 {
-  "version": "0.1.1",
-  "url": "https://pianke.moeuu.cn/pianke/desktop/片刻桌面版_0.1.1_x64-setup.exe",
-  "notes": "更新说明",
-  "published_at": "2026-05-27"
+  "version": "0.3.0",
+  "url": "https://pianke.moeuu.cn/pianke/desktop/片刻桌面版_0.3.0_x64-setup.exe",
+  "notes": "Expert 拆分为标准组件与可选质量模型扩展，降低首次下载体积；附加组件管理增加包体说明和能力状态；继续完善 Rust-only Fast、水印、Expert 本地模型与更新检测体验。",
+  "published_at": "2026-06-02"
 }
 ```
 
