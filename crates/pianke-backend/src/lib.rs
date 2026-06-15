@@ -122,6 +122,45 @@ mod tests {
     }
 
     #[test]
+    fn scan_pairs_skips_raw_only_without_jpg() {
+        // 只有 ARW，没有同名 JPG 时整组跳过——ARW 不应该单独被分析。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("DSC00001.ARW");
+        fs::write(&raw, b"raw").expect("write arw");
+        let pairs = scan_folder(dir.path());
+        assert!(
+            pairs.is_empty(),
+            "raw-only group should be skipped, got {:?}",
+            pairs
+        );
+
+        // 加上同名 JPG 后，应当正确入组，ARW 跟随 JPG
+        let jpg = dir.path().join("DSC00001.JPG");
+        fs::write(&jpg, b"jpg").expect("write jpg");
+        let pairs = scan_folder(dir.path());
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].primary, raw);
+        assert_eq!(pairs[0].analysis.as_ref(), Some(&jpg));
+        assert_eq!(pairs[0].companions, vec![jpg]);
+    }
+
+    #[test]
+    fn scan_pairs_raw_with_same_stem_heic_uses_heic_for_analysis() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("DSC00002.ARW");
+        let heic = dir.path().join("DSC00002.HEIC");
+        fs::write(&raw, b"raw").expect("write arw");
+        fs::write(&heic, b"heic").expect("write heic");
+
+        let pairs = scan_folder(dir.path());
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].primary, raw);
+        assert_eq!(pairs[0].analysis.as_ref(), Some(&heic));
+        assert_eq!(pairs[0].companions, vec![heic]);
+    }
+
+    #[test]
     fn raw_embedded_jpeg_preview_classifies_failures() {
         let missing = extract_embedded_jpeg_preview(b"fake raw without preview")
             .expect_err("missing embedded jpeg should fail");

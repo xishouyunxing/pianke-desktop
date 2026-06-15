@@ -559,17 +559,24 @@ pub(crate) fn scan_folder(folder: &Path) -> Vec<ScanPair> {
             .cloned()
             .collect::<Vec<_>>();
         if let Some(primary) = raws.first().cloned() {
+            // 如果一组里只有 RAW、没有任何可解码图（JPG/HEIC），
+            // 整组跳过——这种 RAW 单飞没有分析意义，留着跟随同名 JPG 一起
+            // 走才合理。空组直接 continue 避免后续 process_one 报错。
+            if images.is_empty() && heics.is_empty() {
+                continue;
+            }
             let companions = raws
                 .iter()
                 .skip(1)
                 .chain(images.iter())
+                .chain(heics.iter())
                 .chain(sidecars.iter())
                 .cloned()
                 .collect::<Vec<_>>();
             out.push(ScanPair {
                 primary: primary.clone(),
                 companions,
-                analysis: images.first().cloned().or(Some(primary)),
+                analysis: images.first().cloned().or_else(|| heics.first().cloned()),
             });
         } else if let Some(primary) = images.first().cloned() {
             out.push(ScanPair {
@@ -886,9 +893,9 @@ fn apply_face_quality_flags(quality: &mut QualityInfo) {
 pub(crate) fn process_one(pair: &ScanPair, strength: &str) -> Result<InfoRecord, String> {
     let analysis = pair.analysis.as_ref().ok_or_else(|| {
         if RAW_EXTS.contains(&ext_lower(&pair.primary).as_str()) {
-            "RAW without same-stem JPG could not be queued for analysis".to_string()
+            "已跳过：RAW 文件缺少同名的 JPG/HEIC 配对，无法分析".to_string()
         } else {
-            "HEIC/HEIF could not be queued for analysis".to_string()
+            "已跳过：HEIC/HEIF 无法分析".to_string()
         }
     })?;
     let img = load_fast_analysis_image(analysis)?;
